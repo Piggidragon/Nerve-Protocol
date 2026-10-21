@@ -74,9 +74,12 @@ pub fn home_open(home: &Path) -> Option<u32> {
 /// `nerve-run`, which is held to its folders by its own account alone
 /// there: every file in the home that other accounts may read, when the
 /// home is open to them (`open`, its mode), or when a folder given to it
-/// lies in the home (`below`), as it passes through the home to get there
-/// (crate::acl). `None` where neither is so. With Landlock nothing is said:
-/// it holds every command of `nerve-run` to its own folders.
+/// lies in the home (`below`, the folders the owner named there), as it
+/// passes through the home to get there (crate::acl); `home` itself in
+/// `below` is the home given whole. `None` where neither is so. With
+/// Landlock nothing is said: it holds every command of `nerve-run` to its
+/// own folders. While a folder in the home is given the warning stays,
+/// whatever the modes of the files there, and it says so.
 #[cfg(unix)]
 pub fn home_warning(
     home: &Path,
@@ -90,7 +93,10 @@ pub fn home_warning(
             home.display()
         ));
     }
-    if let Some(first) = below.first() {
+    let whole = below.iter().any(|p| p == home);
+    if whole {
+        why.push("you give it your home itself".to_string());
+    } else if let Some(first) = below.first() {
         why.push(format!(
             "it passes through your home to {}{}",
             first.display(),
@@ -101,9 +107,14 @@ pub fn home_warning(
             }
         ));
     }
+    let advice = if below.is_empty() {
+        LANDLOCK_ADVICE
+    } else {
+        GIVEN_ADVICE
+    };
     (!why.is_empty()).then(|| {
         format!(
-            "Without Landlock, {RUN_USER} can read every file in your home {} that other accounts may read, not only the folders you give it, as {}. {LANDLOCK_ADVICE}",
+            "Without Landlock, {RUN_USER} can read every file in your home {} that other accounts may read, not only the folders you give it, as {}. {advice}",
             home.display(),
             why.join(" and ")
         )
@@ -123,6 +134,11 @@ pub fn no_landlock_warning() -> String {
 #[cfg(unix)]
 const LANDLOCK_ADVICE: &str =
     "Grant folders outside your home, use umask 027, or use a kernel with Landlock.";
+
+/// [`LANDLOCK_ADVICE`] while a folder in the home is given: the modes
+/// narrow what `nerve-run` reads, but the warning stays.
+#[cfg(unix)]
+const GIVEN_ADVICE: &str = "This warning stays while you give it a folder in your home: umask 027 and `chmod -R o-rwx` narrow what it can read there, and only folders outside your home or a kernel with Landlock end it.";
 
 #[cfg(all(test, unix))]
 mod home_tests {
@@ -170,7 +186,20 @@ mod home_tests {
             through.contains("it passes through your home to /home/o/proj and 1 more folders"),
             "{through}"
         );
-        assert!(!through.contains("chmod"), "{through}");
+        assert!(!through.contains("chmod 750"), "{through}");
+        // Only moving the folders or Landlock ends it, and it says so.
+        assert!(through.ends_with(GIVEN_ADVICE), "{through}");
+        assert!(!open.contains("This warning stays"), "{open}");
+        // The home given whole: said so, not as folders it passes to.
+        let whole = home_warning(home, None, &[home.to_path_buf()]).unwrap();
+        assert!(
+            whole.contains("as you give it your home itself.") && whole.ends_with(GIVEN_ADVICE),
+            "{whole}"
+        );
+        assert!(
+            !whole.contains("passes through") && !whole.contains("more folders"),
+            "{whole}"
+        );
         let both = home_warning(home, Some(0o711), &below[..1]).unwrap();
         assert!(
             both.contains("mode 711") && both.contains("to /home/o/proj."),

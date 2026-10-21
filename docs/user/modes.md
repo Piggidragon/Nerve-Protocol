@@ -314,10 +314,13 @@ ways:
 `install` (once, before any folder is given), `nerve-node status` (`warning:
 Without Landlock, nerve-run can read every file in your home …`) and the app
 (**nerve-run can read more of your home**) say so, and say which of the two
-it is. To keep it to its folders: give it folders outside your home (such
-as `/srv/work`), make your files readable by you and your group only (`umask
-027` for new ones, `chmod -R o-rwx` for those there), or use a kernel with
-Landlock.
+it is; where you give it your home itself, it says that. To keep it to its
+folders: give it folders outside your home (such as `/srv/work`), make your
+files readable by you and your group only (`umask 027` for new ones, `chmod
+-R o-rwx` for those there), or use a kernel with Landlock. The warning stays
+as long as you give it a folder in your home: the modes narrow what it can
+read there, but the node cannot tell which of your files are open to others,
+so only folders outside your home or Landlock end it.
 
 ## What a command can reach in `folder` mode (Windows)
 

@@ -111,8 +111,9 @@ one JSON value from stdout:
   `nerve-run` runs) and `"home_warning"` (on a kernel without Landlock,
   `{"home", "mode", "below", "warning"}` when `nerve-run` gets into the
   owner's home: `"mode"` when the home is open to other accounts, else
-  `null`, `"below"` the folders given in it; `null` with Landlock or where
-  neither is so).
+  `null`, `"below"` the folders given in it as you named them, the home
+  itself where you give it whole; `null` with Landlock or where neither is
+  so).
   `service status` has `"installed"`, `"state"` (`"running"`, `"stopped"`,
   `"starting"`, `"stopping"` or `"failed"`; `null` when not installed),
   `"enabled"` (it starts with the machine), `"program"` (where the program

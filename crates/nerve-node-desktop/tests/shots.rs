@@ -540,7 +540,7 @@ fn every_page_light_and_dark() {
     perm.set_stale("".into());
     // A kernel without Landlock, a folder given in the owner's home.
     perm.set_landlock(false);
-    perm.set_home_warning("Without Landlock, nerve-run can read every file in your home /home/alex that other accounts may read, not only the folders you give it, as it passes through your home to /home/alex/project. Grant folders outside your home, use umask 027, or use a kernel with Landlock.".into());
+    perm.set_home_warning("Without Landlock, nerve-run can read every file in your home /home/alex that other accounts may read, not only the folders you give it, as it passes through your home to /home/alex/project. This warning stays while you give it a folder in your home: umask 027 and `chmod -R o-rwx` narrow what it can read there, and only folders outside your home or a kernel with Landlock end it.".into());
     shots.take_full("permissions-nerve-run-without-landlock", 2150);
     perm.set_landlock(true);
     perm.set_home_warning("".into());

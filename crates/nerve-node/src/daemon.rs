@@ -863,12 +863,7 @@ impl Shared {
             // does: the node's user may not look into the owner's home. A
             // node that cannot act as the owner resolves them as itself.
             let _as = crate::account::FsAs::new(&owner).ok();
-            let below: Vec<PathBuf> =
-                crate::acl::wanted(cfg, &self.paths, &owner.home, crate::now_ms())
-                    .into_iter()
-                    .map(|g| g.path)
-                    .filter(|p| *p != owner.home && nerve_policy::paths::within(p, &owner.home))
-                    .collect();
+            let below = given_in_home(cfg, &owner.home);
             match crate::account::home_warning(&owner.home, open, &below) {
                 Some(warning) => json!({
                     "home": owner.home,
@@ -2086,6 +2081,37 @@ fn describe_change(by: &str, version: u64, changes: &[Change]) -> String {
     )
 }
 
+/// The folders in `home` that the pairings whose commands run as
+/// `nerve-run` give it, as the owner named them (resolved, `~` the owner's
+/// home), not as they are split around the protected entries: `home` itself
+/// where it is given whole, also by a folder around it.
+#[cfg(target_os = "linux")]
+fn given_in_home(cfg: &NodeConfig, home: &std::path::Path) -> Vec<PathBuf> {
+    use nerve_policy::paths::within;
+    let now = crate::now_ms();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for c in cfg.centers.iter().filter(|c| !c.policy.runs_as_owner(now)) {
+        for f in &c.policy.folders {
+            let Some(p) = nerve_policy::protected::expand(home, &f.path) else {
+                continue;
+            };
+            let p = std::fs::canonicalize(&p).unwrap_or(p);
+            let p = if within(home, &p) {
+                home.to_path_buf()
+            } else if within(&p, home) {
+                p
+            } else {
+                continue;
+            };
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -2534,6 +2560,27 @@ mod tests {
                 assert_eq!(st["home_warning"]["mode"], Value::Null);
                 let w = st["home_warning"]["warning"].as_str().unwrap();
                 assert!(w.contains("passes through your home"), "{w}");
+                assert!(w.contains("This warning stays while"), "{w}");
+            }
+            // The home given whole, which the sandbox splits around its
+            // protected entries: told as the home, not as the folders it
+            // was split into.
+            std::fs::create_dir_all(home.join(".ssh")).unwrap();
+            std::fs::create_dir_all(home.join("docs")).unwrap();
+            pairings(vec![Folder {
+                path: home.display().to_string(),
+                access: nerve_policy::config::Access::parse("r").unwrap(),
+            }]);
+            let st = daemon.status();
+            assert_eq!(
+                st["home_warning"]["below"] == json!([home]),
+                told,
+                "{what}: {st}"
+            );
+            if told {
+                let w = st["home_warning"]["warning"].as_str().unwrap();
+                assert!(w.contains("as you give it your home itself."), "{w}");
+                assert!(!w.contains("more folders"), "{w}");
             }
             daemon.stop().await;
         }

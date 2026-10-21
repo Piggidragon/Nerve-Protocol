@@ -15,6 +15,15 @@
 //! `NERVE_NODE_REAL=<the nerve-node to install> NERVE_REAL_OWNER=<an account
 //! with a home, the owner> cargo test -p nerve-node --test real_account --
 //! --ignored --nocapture`
+//!
+//! The second test is the other half of issue #135, on a kernel of any age:
+//! the installed node with its keys in the system keyring pairs a center,
+//! starts again with the key it keeps there, and still runs a folder mode
+//! command as `nerve-run`, which reaches neither the node's session bus nor
+//! its keyring folder. It expects the node installed and `setup` done with the
+//! keyring (`.github/scripts/keyring-end-to-end.sh` does both, CI runs it on
+//! Ubuntu 22.04 and 24.04): `NERVE_REAL_KEYRING=1 NERVE_REAL_OWNER=<the owner>
+//! ... --ignored --exact the_installed_node_with_its_keys_in_the_keyring_runs_folder_commands_as_nerve_run`.
 
 #![cfg(target_os = "linux")]
 
@@ -543,5 +552,112 @@ except OSError as e:
             .to_string()
     };
     assert_eq!(uid_of(&base.join("twin-outside")), run_uid);
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// The keys of an installed node whose `setup` moved them into the system
+/// keyring (issue #135): no file holds one, the node starts again with the
+/// key it keeps there, and a folder mode command runs as `nerve-run`, which
+/// is not the node's account and so reaches neither its session bus nor its
+/// keyring folder, on any kernel.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the node installed with its keys in the keyring; NERVE_REAL_KEYRING=1 and NERVE_REAL_OWNER"]
+async fn the_installed_node_with_its_keys_in_the_keyring_runs_folder_commands_as_nerve_run() {
+    let (Some(owner), Some(_)) = (
+        std::env::var("NERVE_REAL_OWNER").ok(),
+        std::env::var_os("NERVE_REAL_KEYRING"),
+    ) else {
+        eprintln!("NERVE_REAL_KEYRING or NERVE_REAL_OWNER is not set");
+        return;
+    };
+    assert_eq!(nerve_transport::net::euid(), 0, "run it as root");
+    let home =
+        sh(Command::new("sh").args(["-c", &format!("getent passwd {owner} | cut -d: -f6")])).1;
+    let home = PathBuf::from(home.trim());
+    assert!(home.is_dir(), "{home:?}");
+    let (_, storage) = as_owner(&owner, &["config", "get", "machine.secret_storage"]);
+    assert!(storage.contains("keyring"), "{storage}");
+    let no_key_files = |when: &str| {
+        let keys: Vec<PathBuf> = std::fs::read_dir("/etc/nerve/keys")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .chain(["/var/lib/nerve/state/config.key".into()])
+            .filter(|p| p.is_file())
+            .collect();
+        assert!(keys.is_empty(), "{when}, key files are left: {keys:?}");
+    };
+    no_key_files("after setup");
+
+    let base = home.join("nerve-real-keyring");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let nerve_uid = sh(Command::new("id").args(["-u", "nerve"])).1;
+    let nerve_uid = nerve_uid.trim();
+    std::fs::write(base.join("who.sh"), "#!/bin/sh\nid -un\n").unwrap();
+    // What a command that wants the keys would try: the node's session bus,
+    // and the folder GNOME Keyring keeps them in.
+    std::fs::write(
+        base.join("reach.py"),
+        format!(
+            r#"import socket
+for what, f in [
+    ("bus", lambda: socket.socket(socket.AF_UNIX).connect("/run/user/{nerve_uid}/bus")),
+    ("keyrings", lambda: open("/var/lib/nerve/.local/share/keyrings/login.keyring").read()),
+]:
+    try:
+        f()
+        print(what, "reached")
+    except OSError as e:
+        print(what, "refused:", e.strerror)
+"#
+        ),
+    )
+    .unwrap();
+    let chmod = |p: &Path, m: &str| assert!(sh(Command::new("chmod").arg(m).arg(p)).0);
+    assert!(
+        sh(Command::new("chown")
+            .args(["-R", &format!("{owner}:{owner}")])
+            .arg(&base))
+        .0
+    );
+    chmod(&base.join("who.sh"), "755");
+
+    // The owner pairs: the node key of the center is made in the keyring.
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let link = center.link().render();
+    let (ok, said) = as_owner(&owner, &["center", "add", &link, "--yes"]);
+    assert!(ok, "{said}");
+    let (ok, said) = as_owner(&owner, &["folder", "add", base.to_str().unwrap(), "+rwx"]);
+    assert!(ok, "{said}");
+    no_key_files("after pairing");
+    let paired = center.paired().expect("paired");
+    let mut inc = center.next_link(WAIT).await.expect("the node dials");
+    fake_center::handshake(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("handshake");
+    drop(inc);
+
+    // The node starts again with the keys it keeps in the keyring: it
+    // dials the center again, and the center knows it by that key.
+    let (ok, said) = sh(Command::new("systemctl").args(["restart", "nerve-node"]));
+    assert!(ok, "{said}");
+    let mut inc = center.next_link(WAIT).await.expect("the node dials again");
+    fake_center::handshake(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("handshake with the key from the keyring");
+    let mut conn = inc.conn;
+    no_key_files("after the restart");
+
+    let r = run(&mut conn, &base, "./who.sh").await.unwrap();
+    assert_eq!(out(&r), "nerve-run\n", "{r}");
+    let r = run(&mut conn, &base, "python3 reach.py").await.unwrap();
+    let said = out(&r);
+    assert!(
+        said.contains("bus refused") && said.contains("keyrings refused"),
+        "{r}"
+    );
+    drop(conn);
     std::fs::remove_dir_all(&base).unwrap();
 }

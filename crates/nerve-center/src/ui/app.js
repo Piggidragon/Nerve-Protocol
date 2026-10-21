@@ -228,7 +228,8 @@ function act(fn) {
 // the item's id and what it does) gets the focus back in a page drawn anew
 // (a save redraws the whole page, the poll redraws a list); a control
 // without one does not. When the key is gone (the item was ended, removed)
-// or is not unique, the focus goes to the heading of the section the
+// or was not unique when the focus was taken or is not now, the focus goes
+// to the heading of the section the
 // control was in, which does nothing on Enter.
 let pendingFocus = null;
 
@@ -236,7 +237,12 @@ function focusSpot(node) {
   const page = $("page");
   if (!node || node === page || !page.contains(node)) return null;
   const sec = node.closest("section[data-focus]");
-  return { node, key: node.dataset.focus || null, section: sec ? sec.dataset.focus : null, page: current() };
+  // A key the page holds twice names no one control: when one of the two is
+  // gone the other would be unique and take the focus, and Enter would act
+  // on an item the user never picked. Such a control counts as one without a
+  // key, so the focus falls back to its section's heading.
+  const key = node.dataset.focus && focusTarget(node.dataset.focus) ? node.dataset.focus : null;
+  return { node, key, section: sec ? sec.dataset.focus : null, page: current() };
 }
 
 // The one element of the page that has this key.
@@ -777,8 +783,10 @@ function auditRow(d, n) {
     const r = await api("POST", "/api/audit/rule", { node_id: d.node_id, list, cap: d.cap, action: d.action, target: d.target || "", wildcard });
     notify(`Added to the ${list === "sudo" ? "sudo allow" : list} list: ${r.rule}`);
   });
+  // A decision has no id; its time, machine and call name it.
+  const auditKey = `audit:${d.ts}:${d.node_id}:${d.cap}.${d.action}`;
   const ruleBtn = (label, kind, list, wildcard, ic) => {
-    const b = btn(label, kind, rule(list, wildcard), ic);
+    const b = btn(label, kind, rule(list, wildcard), ic, `${auditKey}:${label}`);
     if (!write) { b.disabled = true; b.title = why; }
     return b;
   };
@@ -819,6 +827,7 @@ function checkerAuditRow(d, k) {
     : layer === "model" ? (scope === "node" ? " (on by this machine's own setting)" : " (on for every machine)")
       : scope === "node" ? " (this machine's own)" : " (for every machine)";
   const refused = d.decision === "forbidden";
+  const auditKey = `audit:${d.ts}:${d.node_id}:${d.cap}.${d.action}`;
   const byBlocklist = layer === "blocklist";
   const cut = /… \[cut at \d+ of \d+ characters\]$/.test(d.target || "");
   const known = d.cap && d.action && !cut && (d.target || !["exec", "fs"].includes(d.cap));
@@ -835,7 +844,7 @@ function checkerAuditRow(d, k) {
     d.target ? el("code", { class: "target mono" }, d.target) : null,
     detail ? el("p", { class: "meta" }, `${layer === "model" ? "Decision model" : layer === "allow rule" ? "Allow rule" : "Blocklist"}${whose}: ${detail}`) : null,
     refused && !byBlocklist && known ? el("div", { class: "actions" },
-      btn("Allow", "", allow(false), "check"), btn("Allow as wildcard", "", allow(true))) : null,
+      btn("Allow", "", allow(false), "check", `${auditKey}:Allow`), btn("Allow as wildcard", "", allow(true), null, `${auditKey}:Allow as wildcard`)) : null,
     byBlocklist ? el("p", { class: "meta" }, scope === "global"
       ? "On the blocklist for every machine (hard deny). To let it through, switch the entry off for this machine (Per machine) or for every machine on the Action checker page."
       : "On the blocklist (hard deny). Remove or switch off the entry on the Action checker page to let it through.") : null);
@@ -965,10 +974,12 @@ function checkerToggle(field, label, on, apply) {
 // One blocklist entry: its switch, rule, scope (every machine, with the
 // machines it is switched off for, or one machine) and note. `where` is the
 // list it is shown in (the blocklist, or a machine's card), so that its
-// controls are named once on the page; the entry is named by its rule, not
-// by its place in the list.
+// controls are named once on the page; the entry is named by what it is, not
+// by its place in the list: a built-in by its id, so an owner entry with the
+// same rule is never taken for it, an own entry by its rule, scope and note.
+// Entries that are still alike share a key, which focusSpot treats as none.
 function blockRow(cfg, e, i, where) {
-  const key = `block:${where}:${e.rule}|${e.node_id || ""}`;
+  const key = `block:${where}:${e.id ? `id=${e.id}` : `${e.rule}|${e.node_id || ""}|${e.note || ""}`}`;
   const t = el("input", { type: "checkbox", role: "switch", "data-focus": `${key}:switch`, onchange: act(async (ev) => { cfg.blocklist[i].on = ev.currentTarget.checked; await saveChecker(); }) });
   t.checked = e.on;
   const off = e.off_for || [];
@@ -983,8 +994,8 @@ function blockRow(cfg, e, i, where) {
 }
 
 function blocklistCard(cfg, meta) {
-  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:rm -rf /*  or  fs.write:/etc/sudoers", "aria-label": "New blocklist rule" });
-  const noteIn = el("input", { class: "input", placeholder: "What it guards against (optional)", "aria-label": "Note" });
+  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:rm -rf /*  or  fs.write:/etc/sudoers", "aria-label": "New blocklist rule", "data-focus": "blocklist:rule" });
+  const noteIn = el("input", { class: "input", placeholder: "What it guards against (optional)", "aria-label": "Note", "data-focus": "blocklist:note" });
   const items = machineItems();
   let blockNode = "";
   const nodePicker = picker({ label: "For", search: "Search machines", none: "No machine matches.", onpick: (v) => { blockNode = v; nodePicker.set(items, v); } });
@@ -1022,7 +1033,7 @@ function allowRow(cfg, a, i, where) {
 }
 
 function allowCard(cfg) {
-  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:docker exec *", "aria-label": "New allow rule" });
+  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:docker exec *", "aria-label": "New allow rule", "data-focus": "allow:rule" });
   const nodeItems = machineItems();
   let allowNode = "";
   const nodePicker = picker({ label: "For", search: "Search machines", none: "No machine matches.", onpick: (v) => { allowNode = v; nodePicker.set(nodeItems, v); } });
@@ -1108,10 +1119,10 @@ function machineCard(cfg, m) {
   const offRow = ([e]) => el("div", { class: "card entry" },
     el("div", { class: "card-top" },
       el("code", { class: "mono" }, e.rule),
-      el("span", { class: "push" }, btn("Switch on again", "", act(async () => { e.off_for = (e.off_for || []).filter((id) => id !== m.id); await saveChecker(); }), null, `off:${m.id}:${e.rule}:on`))),
+      el("span", { class: "push" }, btn("Switch on again", "", act(async () => { e.off_for = (e.off_for || []).filter((id) => id !== m.id); await saveChecker(); }), null, `off:${m.id}:${e.id ? `id=${e.id}` : `${e.rule}|${e.node_id || ""}|${e.note || ""}`}:on`))),
     e.note ? el("p", { class: "meta" }, e.note) : null);
 
-  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:terraform destroy*", "aria-label": `New blocklist rule for ${m.name}` });
+  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:terraform destroy*", "aria-label": `New blocklist rule for ${m.name}`, "data-focus": `node:${m.id}:rule` });
   const add = act(async () => {
     const rule = ruleIn.value.trim();
     if (!rule) { notify("Enter a rule.", "error"); return; }
@@ -1163,18 +1174,18 @@ function modelCard(cfg, meta) {
   let source = m.source;
   const srcPicker = picker({ label: "Source", search: "Search", none: "No match.", key: "model:source", onpick: (v) => { source = v; srcPicker.set(SOURCES, v); showSource(); } });
   srcPicker.set(SOURCES, source);
-  const endpointUrl = el("input", { class: "input mono", value: m.endpoint_url, placeholder: "https://host:9931" });
-  const endpointModel = el("input", { class: "input mono", value: m.endpoint_model, placeholder: "jev-latest (optional)" });
-  const token = el("input", { class: "input", type: "password", placeholder: meta.has_token ? "a token is set — type to replace" : "optional bearer token", autocomplete: "off" });
-  const threshold = el("input", { class: "input num", type: "number", min: "0", max: "1", step: "0.01", value: m.threshold });
-  const timeout = el("input", { class: "input num", type: "number", min: "100", value: m.timeout_ms });
+  const endpointUrl = el("input", { class: "input mono", value: m.endpoint_url, "data-focus": "model:endpoint_url", placeholder: "https://host:9931" });
+  const endpointModel = el("input", { class: "input mono", value: m.endpoint_model, "data-focus": "model:endpoint_model", placeholder: "jev-latest (optional)" });
+  const token = el("input", { class: "input", type: "password", "data-focus": "model:token", placeholder: meta.has_token ? "a token is set — type to replace" : "optional bearer token", autocomplete: "off" });
+  const threshold = el("input", { class: "input num", type: "number", min: "0", max: "1", step: "0.01", value: m.threshold, "data-focus": "model:threshold" });
+  const timeout = el("input", { class: "input num", type: "number", min: "100", value: m.timeout_ms, "data-focus": "model:timeout" });
   let scope = m.scope;
   const scopePicker = picker({ label: "Which calls the model sees", search: "Search", none: "No match.", key: "model:scope", onpick: (v) => { scope = v; scopePicker.set(SCOPES, v); } });
   scopePicker.set(SCOPES, scope);
   const failClosed = el("input", { type: "checkbox", role: "switch", "data-focus": "switch:fail_closed" }); failClosed.checked = m.fail_closed;
-  const instr = el("textarea", { class: "json", rows: "4" }, m.instructions);
-  const critTrue = el("input", { class: "input", value: m.criteria_true });
-  const critFalse = el("input", { class: "input", value: m.criteria_false });
+  const instr = el("textarea", { class: "json", rows: "4", "data-focus": "model:instructions" }, m.instructions);
+  const critTrue = el("input", { class: "input", value: m.criteria_true, "data-focus": "model:criteria_true" });
+  const critFalse = el("input", { class: "input", value: m.criteria_false, "data-focus": "model:criteria_false" });
   const save = act(async () => {
     // The form's values go into a copy: a refused save leaves the working
     // copy as it was, and the form keeps what was typed.

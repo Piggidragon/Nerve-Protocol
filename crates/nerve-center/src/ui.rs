@@ -1325,12 +1325,60 @@ mod tests {
                 "{label}: {lines:?}"
             );
         }
-        // A blocklist or allow entry is named by its rule and scope, and by
-        // the list it is shown in (a machine's card repeats the entries).
-        assert!(APP_JS.contains("`block:${where}:${e.rule}|${e.node_id || \"\"}`"));
+        // A blocklist or allow entry is named by what it is (a built-in by
+        // its id, an own entry by rule, scope and note), and by the list it
+        // is shown in (a machine's card repeats the entries).
+        assert!(APP_JS.contains("`block:${where}:${e.id ? `id=${e.id}` :"));
         assert!(APP_JS.contains("`allow:${where}:${a.rule}|${a.node_id || \"\"}:remove`"));
+        assert!(APP_JS.contains("`off:${m.id}:${e.id ? `id=${e.id}` :"));
+        // A key the page holds twice (an own entry with a built-in's rule
+        // and note, a rule added twice) names no control: focusSpot drops
+        // it, so removing one of two does not hand the focus, and Enter, to
+        // the other.
+        assert!(spot.contains("focusTarget(node.dataset.focus)"), "{spot}");
+        // The built-in ids the keys rest on are there and differ.
+        let ids: Vec<_> = crate::checker::config::default_blocklist()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(ids.iter().all(|i| !i.is_empty()));
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len());
         // A session's End is named by the session.
         assert!(APP_JS.contains("session:${s.id}:end"));
+    }
+
+    /// The checker's text fields and the Audit page's buttons have a key too,
+    /// so a page drawn anew (the end of a save, the minute turning) keeps the
+    /// focus there and not on `<body>`. (The browser check is part 5 of
+    /// `focus-identity.js` in the review tools.)
+    #[test]
+    fn the_checkers_text_fields_and_audit_buttons_keep_the_focus() {
+        for field in [
+            "\"data-focus\": \"blocklist:rule\"",
+            "\"data-focus\": \"blocklist:note\"",
+            "\"data-focus\": \"allow:rule\"",
+            "\"data-focus\": `node:${m.id}:rule`",
+            "\"data-focus\": \"model:endpoint_url\"",
+            "\"data-focus\": \"model:endpoint_model\"",
+            "\"data-focus\": \"model:token\"",
+            "\"data-focus\": \"model:threshold\"",
+            "\"data-focus\": \"model:timeout\"",
+            "\"data-focus\": \"model:instructions\"",
+            "\"data-focus\": \"model:criteria_true\"",
+            "\"data-focus\": \"model:criteria_false\"",
+        ] {
+            assert!(APP_JS.contains(field), "{field}");
+        }
+        // A decision has no id: its time, machine and call name the buttons.
+        let audit = "`audit:${d.ts}:${d.node_id}:${d.cap}.${d.action}`";
+        assert_eq!(APP_JS.matches(audit).count(), 2);
+        assert!(
+            APP_JS.contains("btn(label, kind, rule(list, wildcard), ic, `${auditKey}:${label}`)")
+        );
+        assert!(APP_JS.contains("`${auditKey}:Allow as wildcard`"));
     }
 
     /// A save in flight pulls the focus back only while the focus is still

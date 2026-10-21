@@ -80,12 +80,23 @@ pub struct Inner {
     rotation_failed: AtomicBool,
     /// The stored state. Code that holds it takes no other lock of the
     /// center or of a session, only ones that take nothing more (a link's
-    /// `status`, the log's): everything else is copied out before it is
-    /// locked. A lock taken under it that is also
+    /// `status`, the log's, `written`): everything else is copied out before
+    /// it is locked. A lock taken under it that is also
     /// held while the state is taken would deadlock two requests, and with
     /// them every runtime worker (issue #150).
     store: Mutex<Store>,
     dirty: AtomicBool,
+    /// The number of the last snapshot of the state taken for its file,
+    /// counted under the state's lock, so the numbers follow the changes.
+    snapshots: AtomicU64,
+    /// The number of the snapshot the file holds. Locked while the file is
+    /// written, so writes go one at a time and an older snapshot never
+    /// replaces a newer one.
+    written: Mutex<u64>,
+    /// How long each write of the state file waits first, for the test of a
+    /// slow disk.
+    #[cfg(test)]
+    save_delay_ms: AtomicU64,
     codes: Mutex<Codes>,
     links: Mutex<BTreeMap<String, Arc<Link>>>,
     changes: broadcast::Sender<Change>,
@@ -121,6 +132,13 @@ pub struct Inner {
     /// them, so no config change starts the server from them meanwhile.
     /// `manage_local_model` holds this lock for its whole run.
     files_held: Mutex<bool>,
+}
+
+/// The state file's text as it was at one moment, numbered in the order
+/// of the changes (see [`Center::update`]).
+struct Snapshot {
+    n: u64,
+    text: std::io::Result<Vec<u8>>,
 }
 
 /// A one-click install running in the background.
@@ -361,6 +379,10 @@ impl Center {
             rotation_failed: AtomicBool::new(false),
             store: Mutex::new(store),
             dirty: AtomicBool::new(false),
+            snapshots: AtomicU64::new(0),
+            written: Mutex::new(0),
+            #[cfg(test)]
+            save_delay_ms: AtomicU64::new(0),
             codes: Mutex::new(Codes::default()),
             links: Mutex::new(BTreeMap::new()),
             changes,
@@ -544,19 +566,50 @@ impl Center {
         let _ = self.changes.send(c);
     }
 
-    /// Runs `f` on the stored state and saves it.
+    /// Runs `f` on the stored state and saves it. The file is written with
+    /// the state unlocked, so a slow disk holds up no reader (issue #150);
+    /// it holds this change, or a later one, when this returns.
     pub fn update<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
-        let mut s = self.store.lock().unwrap();
-        let out = f(&mut s);
-        if let Err(e) = s.save(&self.dir) {
+        let (out, snap) = {
+            let mut s = self.store.lock().unwrap();
+            let out = f(&mut s);
+            self.dirty.store(false, Ordering::SeqCst);
+            (out, self.snapshot(&s))
+        };
+        if let Err(e) = self.write_snapshot(snap) {
             self.log.record(
                 Level::Error,
                 None,
                 &format!("cannot write the state file: {e}"),
             );
         }
-        self.dirty.store(false, Ordering::SeqCst);
         out
+    }
+
+    /// The state file's text for the state `s`, locked by the caller, with
+    /// its number among the snapshots.
+    fn snapshot(&self, s: &Store) -> Snapshot {
+        Snapshot {
+            n: self.snapshots.fetch_add(1, Ordering::SeqCst) + 1,
+            text: s.file_bytes(),
+        }
+    }
+
+    /// Writes `snap` as the state file, unless the file holds a newer
+    /// snapshot already: that one has every change of this one.
+    fn write_snapshot(&self, snap: Snapshot) -> std::io::Result<()> {
+        let text = snap.text?;
+        let mut written = self.written.lock().unwrap();
+        if *written >= snap.n {
+            return Ok(());
+        }
+        #[cfg(test)]
+        std::thread::sleep(Duration::from_millis(
+            self.save_delay_ms.load(Ordering::SeqCst),
+        ));
+        Store::write_file(&self.dir, &text)?;
+        *written = snap.n;
+        Ok(())
     }
 
     /// Runs `f` on the stored state and saves it, all or nothing: when `f`
@@ -575,7 +628,8 @@ impl Center {
                 return Err(e);
             }
         };
-        if let Err(e) = s.save(&self.dir) {
+        // Written under the lock: nobody sees the change before it is kept.
+        if let Err(e) = self.write_snapshot(self.snapshot(&s)) {
             *s = before;
             return Err(format!("the center cannot write its state file: {e}"));
         }
@@ -621,9 +675,12 @@ impl Center {
     /// Writes pending statistics. Called on a timer and on shutdown.
     pub fn flush(&self) {
         if self.dirty.swap(false, Ordering::SeqCst) {
-            let mut s = self.store.lock().unwrap();
-            s.prune_stats(now_ms());
-            if let Err(e) = s.save(&self.dir) {
+            let snap = {
+                let mut s = self.store.lock().unwrap();
+                s.prune_stats(now_ms());
+                self.snapshot(&s)
+            };
+            if let Err(e) = self.write_snapshot(snap) {
                 self.log.record(
                     Level::Error,
                     None,
@@ -922,7 +979,7 @@ impl Center {
             let mut st = self.store.lock().unwrap();
             let before = st.key_rotation.replace(record);
             st.key_rotations += 1;
-            let r = st.save(&self.dir);
+            let r = self.write_snapshot(self.snapshot(&st));
             if r.is_err() {
                 st.key_rotation = before;
                 st.key_rotations -= 1;
@@ -3013,6 +3070,60 @@ mod tests {
             profile: "exec".into(),
             effect: nerve_proto::Effect::Execute,
         }
+    }
+
+    /// A slow write of the state file holds up no reader: the file is
+    /// written with the state unlocked, so a disk that takes seconds (an
+    /// fsync under load) does not stop the web UI from answering (issue
+    /// #150). The file still has the change once the save returns.
+    #[test]
+    fn a_slow_save_holds_up_no_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.save_delay_ms.store(3000, Ordering::SeqCst);
+        let saving = {
+            let c = c.clone();
+            std::thread::spawn(move || c.update(|s| s.center_name = "after".into()))
+        };
+        // The save is under way.
+        std::thread::sleep(Duration::from_millis(300));
+        let t = Instant::now();
+        let name = c.name();
+        let nodes = c.nodes_json();
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "a read waited {:?} for the save",
+            t.elapsed()
+        );
+        assert_eq!(name, "after");
+        assert_eq!(nodes, json!([]));
+        saving.join().unwrap();
+        let back = Store::load(dir.path()).unwrap().unwrap();
+        assert_eq!(back.center_name, "after");
+    }
+
+    /// Saves that finish out of order leave the newest state in the file:
+    /// an older snapshot that comes to be written after a newer one is not.
+    #[test]
+    fn an_older_snapshot_never_replaces_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let snap = |name: &str| {
+            let mut s = c.store.lock().unwrap();
+            s.center_name = name.into();
+            c.snapshot(&s)
+        };
+        let (older, newer) = (snap("older"), snap("newer"));
+        c.write_snapshot(newer).unwrap();
+        c.write_snapshot(older).unwrap();
+        let back = Store::load(dir.path()).unwrap().unwrap();
+        assert_eq!(back.center_name, "newer");
+        // A change after them is written as usual.
+        c.update(|s| s.center_name = "latest".into());
+        assert_eq!(
+            Store::load(dir.path()).unwrap().unwrap().center_name,
+            "latest"
+        );
     }
 
     /// The web UI's node and session lists read at the same time (two

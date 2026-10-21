@@ -59,10 +59,15 @@ fn every_animation_frame_by_frame() {
         screen.advance(Duration::from_secs(1));
         screen.draw();
     };
-    // Draws the frames after `change`, as `<name>-<scheme>-<n>.png`, and
-    // how long each took.
+    // Draws the window before `change`, as `<name>-<scheme>-before.png`,
+    // and the frames after it, as `<name>-<scheme>-<n>.png`; says how long
+    // each of those took.
     let scene = |name: &str, scheme: &str, change: &dyn Fn()| -> Vec<Duration> {
         rest();
+        save(
+            &screen.draw(),
+            &out.join(format!("{name}-{scheme}-before.png")),
+        );
         let mut took = Vec::new();
         change();
         for n in 0..FRAMES {

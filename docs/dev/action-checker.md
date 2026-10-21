@@ -269,10 +269,8 @@ scope applies. Switching taint off clears every mark.
 ## Settings and persistence
 
 `CheckerConfig` (`checker/config.rs`) is a field of the center's `Store`, so it
-is in `state.json` and in a backup. `Store` does not refuse unknown fields, so
-a 0.0.4 center reads a 0.0.5 `state.json` and drops `checker` the next time it
-saves; a `state.json` without it reads as `CheckerConfig::default()`, with the
-blocklist and taint on and the model off.
+is in `state.json` and in a backup. A `state.json` without it reads as
+`CheckerConfig::default()`, with the blocklist and taint on and the model off.
 
 The blocklist in memory is the whole list in force; `state.json` keeps only the
 owner's part (`config::stored`): per built-in, by its stable `id`, what the
@@ -281,14 +279,11 @@ entries:
 `"blocklist": {"builtins": {"nsenter": {"removed": true}}, "own": [...]}`. On
 load the built-ins come from the code with those choices on them, so a later
 release's new or changed built-ins reach an existing center; a choice for an id
-the code no longer has is ignored. A whole list (an array) also reads: the form
-of #130 (built-ins in full with `builtin: true`, mapped to their ids by rule
-text) and what the web UI posts (`CheckerConfig::view`, built-ins with their
-id). A built-in such a list does not hold counts as removed; a stored built-in
-the code does not know is dropped. In a list without ids such an unknown
-built-in may be an older pattern of one the code has, so then no built-in counts
-as removed (they come back on, the safe side). Reset to defaults posts the
-code's list, so it clears every choice and drops the owner's own entries.
+the code no longer has is ignored. A whole list (an array) also reads: what the
+web UI posts (`CheckerConfig::view`, built-ins with their id). A built-in is
+known by its id only: one such a list does not hold counts as removed, and one
+whose id the code does not know is dropped. Reset to defaults posts the code's
+list, so it clears every choice and drops the owner's own entries.
 
 Per node (owner's decision of 2026-10-18): a `BlockEntry` has a `node_id`
 (`None` for every node) and `off_for`, the node ids an entry for every node is
@@ -301,9 +296,8 @@ that scope: of the entry or allow rule that matched, else of the switch that
 had the blocklist or model on, in `Decision`, in the refusal text and in the
 audit marker (`checker: {layer, scope, detail}`). The local model runs while
 `model_wanted` (the center's switch, or any node's `on`); Remove sets a node's
-`on` back to `inherit`. All new fields default and are left out when empty, so
-an old `state.json` reads as before (every entry for every node, every node
-inheriting) and a fresh one looks as before. A block anywhere wins: a center
+`on` back to `inherit`. These fields default and are left out when empty (every
+entry for every node, every node inheriting). A block anywhere wins: a center
 allow rule only skips the model, and the node's policy decides after the
 center. The endpoint token is a secret, so it is
 **not** in `state.json` or the backup: it lives in `checker-model.token` and

@@ -522,11 +522,19 @@ fn the_app_drives_the_cli_end_to_end() {
         st["owner"] = owner.clone();
         st["centers"][0]["account"] = serde_json::json!("nerve-run");
         st["centers"][0]["landlock"] = serde_json::json!(false);
-        st["home_open"] = serde_json::json!({"warning": "your home /home/alice is open to other accounts (mode 755)"});
-        st["folder_grants"] = serde_json::json!({"errors": [
-            format!("{}: Permission denied (os error 13)", root.join("work/closed").display()),
-            "/elsewhere/proj: Permission denied (os error 13)",
-        ]});
+        st["home_warning"] = serde_json::json!({"warning": "Without Landlock, nerve-run can read every file in your home /home/alice that other accounts may read (mode 755)"});
+        // A folder no center has any more whose access did not come off,
+        // and the node's record of them that could not be read: shown on
+        // this center although neither is one of its folders.
+        st["folder_grants"] = serde_json::json!({
+            "errors": [
+                format!("{}: Permission denied (os error 13)", root.join("work/closed").display()),
+                "/elsewhere/proj: Permission denied (os error 13)",
+                "/removed/folder/sub: Permission denied (os error 13)",
+                "/var/lib/nerve/state/acl.json: expected value at line 1 column 1",
+            ],
+            "stale": ["/removed/folder", "/var/lib/nerve/state/acl.json"],
+        });
         ctl.show_status(Ok(st));
         if cfg!(target_os = "linux") {
             assert!(perm.get_separate(), "{owner}");
@@ -538,8 +546,13 @@ fn the_app_drives_the_cli_end_to_end() {
             let errors = perm.get_grant_errors();
             assert!(errors.contains("work/closed"), "{errors}");
             assert!(!errors.contains("/elsewhere"), "{errors}");
+            assert!(!errors.contains("/removed"), "{errors}");
+            let stale = perm.get_stale();
+            assert!(stale.contains("/removed/folder/sub"), "{stale}");
+            assert!(stale.contains("acl.json: expected value"), "{stale}");
+            assert!(!stale.contains("work/closed"), "{stale}");
             assert!(!perm.get_landlock());
-            assert!(perm.get_home_open().contains("mode 755"));
+            assert!(perm.get_home_warning().contains("mode 755"));
         } else {
             assert!(!perm.get_separate());
             assert_eq!(perm.get_built_in(), "");
@@ -547,7 +560,7 @@ fn the_app_drives_the_cli_end_to_end() {
     }
     ctl.refresh_status();
     until(&ctl, "the node's own status", || {
-        perm.get_landlock() && perm.get_home_open() == ""
+        perm.get_landlock() && perm.get_home_warning() == "" && perm.get_stale() == ""
     });
     perm.invoke_folder_remove(path);
     assert!(config(&paths).centers[0].policy.folders.is_empty());

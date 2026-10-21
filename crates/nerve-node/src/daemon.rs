@@ -48,6 +48,10 @@ pub struct NodeOptions {
     /// How commands can be confined, instead of asking the kernel. A test
     /// sets it, to stand for a kernel it does not run on.
     pub confinement: Option<Confinement>,
+    /// Whether this is the installed service, instead of asking where its
+    /// folders are (crate::service::is_service_node). A test sets it, to
+    /// stand for the installed node.
+    pub service: Option<bool>,
     /// Where commands are held to their limits, or why they are not,
     /// instead of looking for the process's cgroup (crate::cgroup), which
     /// moves the process. A test sets it.
@@ -91,6 +95,7 @@ impl NodeOptions {
             log: nerve_transport::log::global(),
             full_rights: None,
             confinement: None,
+            service: None,
             cgroups: None,
             resume_grace: resume::GRACE,
             aside: None,
@@ -651,22 +656,24 @@ impl Shared {
         }
     }
 
+    /// The account `name`, looked up at most every [`ACCOUNT_FRESH`].
+    fn account_named(&self, name: &str) -> Result<Option<crate::service::Account>, String> {
+        if let Some((at, a)) = lock(&self.account_cache).get(name)
+            && at.elapsed() < ACCOUNT_FRESH
+        {
+            return Ok(a.clone());
+        }
+        let a = crate::account::lookup(name)?;
+        lock(&self.account_cache).insert(name.to_string(), (std::time::Instant::now(), a.clone()));
+        Ok(a)
+    }
+
     fn account_as(
         &self,
         cfg: &NodeConfig,
         as_owner: bool,
     ) -> Result<Option<crate::service::Account>, String> {
-        let cached = |name: &str| {
-            if let Some((at, a)) = lock(&self.account_cache).get(name)
-                && at.elapsed() < ACCOUNT_FRESH
-            {
-                return Ok(a.clone());
-            }
-            let a = crate::account::lookup(name)?;
-            lock(&self.account_cache)
-                .insert(name.to_string(), (std::time::Instant::now(), a.clone()));
-            Ok(a)
-        };
+        let cached = |name: &str| self.account_named(name);
         crate::account::for_commands(
             as_owner,
             self.owner_name(cfg).as_deref(),
@@ -833,27 +840,37 @@ impl Shared {
                 || self.separate(policy))
     }
 
-    /// The owner's home when other accounts may list or enter it, with its
-    /// mode and what the node says of it (crate::account::home_open), on the
-    /// installed Linux node: `nerve-run` is such an account.
-    pub fn home_open(&self, cfg: &NodeConfig) -> Value {
+    /// What `nerve-run` may read of the owner's home beyond its folders on
+    /// the installed Linux node without Landlock
+    /// (crate::account::home_warning): the home, its mode when others may
+    /// look into it, the folders given in it, and what the node says. Null
+    /// with Landlock, which holds it to its folders, and where neither lets
+    /// it into the home.
+    pub fn home_warning(&self, cfg: &NodeConfig) -> Value {
         #[cfg(target_os = "linux")]
         {
-            if !self.service {
+            if !self.service || self.confinement.landlock_abi.is_some() {
                 return Value::Null;
             }
-            let Ok(Some(owner)) = self.owner_account(cfg) else {
+            let Some(name) = self.owner_name(cfg) else {
                 return Value::Null;
             };
-            match crate::account::home_open(&owner.home) {
-                Some(mode) => json!({
+            let Ok(Some(owner)) = self.account_named(&name) else {
+                return Value::Null;
+            };
+            let open = crate::account::home_open(&owner.home);
+            let below: Vec<PathBuf> =
+                crate::acl::wanted(cfg, &self.paths, &owner.home, crate::now_ms())
+                    .into_iter()
+                    .map(|g| g.path)
+                    .filter(|p| *p != owner.home && nerve_policy::paths::within(p, &owner.home))
+                    .collect();
+            match crate::account::home_warning(&owner.home, open, &below) {
+                Some(warning) => json!({
                     "home": owner.home,
-                    "mode": format!("{mode:o}"),
-                    "warning": crate::account::home_open_warning(
-                        &owner.home,
-                        mode,
-                        self.confinement.landlock_abi.is_some(),
-                    ),
+                    "mode": open.map(|m| format!("{m:o}")),
+                    "below": below,
+                    "warning": warning,
                 }),
                 None => Value::Null,
             }
@@ -1045,8 +1062,8 @@ impl Shared {
             "command_limits": crate::cgroup::status(&cfg.limits.command, &self.cgroups),
             "providers": self.providers.status(),
             "folder_grants": grants,
-            // The owner's home, when other accounts may look into it.
-            "home_open": self.home_open(&cfg),
+            // What nerve-run may read of the owner's home without Landlock.
+            "home_warning": self.home_warning(&cfg),
             "centers": centers,
             "relay": self.relay.status(&cfg),
         })
@@ -1245,7 +1262,9 @@ impl Daemon {
         }
         let (changed, _) = watch::channel(0);
         let (stop, _) = watch::channel(false);
-        let service = crate::service::is_service_node(&paths);
+        let service = opts
+            .service
+            .unwrap_or_else(|| crate::service::is_service_node(&paths));
         #[cfg(unix)]
         if service && nerve_transport::net::euid() != 0 && !crate::account::can_switch() {
             tracing::warn!(
@@ -2406,6 +2425,114 @@ mod tests {
         write(&storage(SecretStorage::Keyring));
         assert_eq!(told(), 2);
         daemon.stop().await;
+    }
+
+    /// The status says of each pairing whether Landlock holds its commands,
+    /// and on the installed Linux node without Landlock what nerve-run may
+    /// read of the owner's home beyond its folders: with the home open to
+    /// others, or a folder given in it. Nothing of the home with Landlock,
+    /// nor on a node run by hand (#142).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_status_tells_landlock_and_what_the_home_leaves_open() {
+        use nerve_policy::config::{CenterPolicy, Folder, Mode};
+        use std::os::unix::fs::PermissionsExt;
+        for (service, landlock) in [(true, false), (true, true), (false, false)] {
+            let log = Log::new(Level::Info);
+            let d = tempfile::tempdir().unwrap();
+            let home = std::fs::canonicalize(d.path()).unwrap().join("alice");
+            std::fs::create_dir_all(home.join("proj")).unwrap();
+            let chmod =
+                |m| std::fs::set_permissions(&home, std::fs::Permissions::from_mode(m)).unwrap();
+            chmod(0o750);
+            let mut o = options(&d, &log);
+            o.full_rights = Some(false);
+            o.exe = Some("/bin/true".into());
+            o.service = Some(service);
+            o.owner = Some("alice".into());
+            o.confinement = Some(Confinement {
+                landlock_abi: landlock.then_some(6),
+                appcontainer: false,
+            });
+            let daemon = Daemon::start(o).await.unwrap();
+            let s = daemon.shared.clone();
+            // The owner as the account database has her.
+            lock(&s.account_cache).insert(
+                "alice".into(),
+                (
+                    std::time::Instant::now(),
+                    Some(crate::service::Account {
+                        name: "alice".into(),
+                        uid: 4242,
+                        gid: 4242,
+                        comment: String::new(),
+                        home: home.clone(),
+                        groups: vec![4242],
+                    }),
+                ),
+            );
+            let pairings = |folders: Vec<Folder>| {
+                let mut cfg = s.config();
+                cfg.centers = [("f", Mode::Folder), ("u", Mode::User)]
+                    .into_iter()
+                    .map(|(name, mode)| nerve_policy::CenterEntry {
+                        name: name.into(),
+                        url: "https://center.example".into(),
+                        pin: None,
+                        center_id: "c".into(),
+                        node_id: name.into(),
+                        settings: Default::default(),
+                        paused: false,
+                        revoked: false,
+                        unknown: false,
+                        public_key: None,
+                        key_rotations: 0,
+                        pin_rotations: 0,
+                        old_pin: None,
+                        policy: CenterPolicy {
+                            mode,
+                            folders: folders.clone(),
+                            ..Default::default()
+                        },
+                    })
+                    .collect();
+                let r = control(
+                    &s,
+                    "config.write",
+                    json!({"config": cfg.to_toml(), "if_version": cfg.version}),
+                    None,
+                );
+                assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
+            };
+            pairings(Vec::new());
+            let st = daemon.status();
+            let what = format!("service {service}, landlock {landlock}");
+            assert_eq!(st["centers"][0]["landlock"], landlock, "{what}");
+            assert_eq!(st["centers"][1]["landlock"], false, "{what}: user mode");
+            // Closed, and no folder in it: nothing to say.
+            assert_eq!(st["home_warning"], Value::Null, "{what}");
+            chmod(0o755);
+            let st = daemon.status();
+            let told = service && !landlock;
+            assert_eq!(st["home_warning"]["mode"] == "755", told, "{what}: {st}");
+            chmod(0o750);
+            pairings(vec![Folder {
+                path: home.join("proj").display().to_string(),
+                access: nerve_policy::config::Access::parse("rw").unwrap(),
+            }]);
+            let st = daemon.status();
+            assert_eq!(
+                st["home_warning"]["below"] == json!([home.join("proj")]),
+                told,
+                "{what}: {st}"
+            );
+            if told {
+                assert_eq!(st["home_warning"]["mode"], Value::Null);
+                let w = st["home_warning"]["warning"].as_str().unwrap();
+                assert!(w.contains("passes through your home"), "{w}");
+            }
+            daemon.stop().await;
+        }
     }
 
     /// A job of a command, as the pipe asks it: the processes it holds.

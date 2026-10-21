@@ -81,21 +81,31 @@ impl Ctl {
         } else {
             String::new()
         };
-        // The failed grants of this center's folders: the node's list is
-        // for all of them.
-        let errors: Vec<&str> = st["folder_grants"]["errors"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
+        // Access nerve-run keeps although it should have lost it, which
+        // stops every command of it, goes on every center that runs as it;
+        // the failed grants of this center's folders on this one alone: the
+        // node's lists are for all of them.
+        let texts = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        };
+        let errors = texts(&st["folder_grants"]["errors"]);
+        let stale = texts(&st["folder_grants"]["stale"]);
+        let (stale, errors) = view::stale_grants(&stale, &errors);
         let folders: Vec<String> = self
             .with_perm(|p| p.get_folders().iter().map(|f| f.path.to_string()).collect())
             .unwrap_or_default();
-        let errors = if account == run {
-            view::grant_errors_for(&errors, &folders, &nerve_node::paths::home_dir())
+        let (stale, errors) = if account == run {
+            (
+                stale,
+                view::grant_errors_for(&errors, &folders, &nerve_node::paths::home_dir()),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         self.with_perm(|p| {
             p.set_mode(c["mode"].as_str().unwrap_or_default().into());
@@ -105,11 +115,12 @@ impl Ctl {
             p.set_as_owner(c["as_owner"] == true);
             p.set_built_in(built_in.as_str().into());
             p.set_grant_errors(errors.join("\n").into());
+            p.set_stale(stale.join("\n").into());
             // A pairing of the installed Linux node that runs as nerve-run
             // says whether Landlock holds it; any other shows nothing.
             p.set_landlock(c["landlock"] != false);
-            p.set_home_open(
-                st["home_open"]["warning"]
+            p.set_home_warning(
+                st["home_warning"]["warning"]
                     .as_str()
                     .unwrap_or_default()
                     .into(),

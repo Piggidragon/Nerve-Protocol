@@ -305,7 +305,7 @@ pub fn folders(v: &Value) -> Vec<FolderRow> {
 /// `folders`, a center's (`~` the owner's `home`): a path inside one of
 /// them, or above it on the way. One that names no path is the node's and
 /// concerns every center.
-pub fn grant_errors_for(errors: &[&str], folders: &[String], home: &Path) -> Vec<String> {
+pub fn grant_errors_for(errors: &[String], folders: &[String], home: &Path) -> Vec<String> {
     use nerve_policy::paths::within;
     let folders: Vec<PathBuf> = folders
         .iter()
@@ -326,6 +326,38 @@ pub fn grant_errors_for(errors: &[&str], folders: &[String], home: &Path) -> Vec
         })
         .map(|e| e.to_string())
         .collect()
+}
+
+/// The node's folder-grant errors (`status`'s `folder_grants`) split by
+/// whether they are about access `nerve-run` keeps although it should have
+/// lost it (`stale`: folders whose entries could not be taken off, or the
+/// node's record of them). Those, with the path itself where no error names
+/// it, go on every center whose commands run as `nerve-run`, as none of
+/// them runs while one is left, also when the folder is no center's any
+/// more; the others are for the centers whose folders they concern
+/// ([`grant_errors_for`]).
+pub fn stale_grants(stale: &[String], errors: &[String]) -> (Vec<String>, Vec<String>) {
+    use nerve_policy::paths::within;
+    let about = |e: &str, s: &str| match e.split_once(": ") {
+        Some((p, _)) => within(Path::new(p), Path::new(s)),
+        None => false,
+    };
+    let mut kept = Vec::new();
+    for s in stale {
+        let why: Vec<String> = errors.iter().filter(|e| about(e, s)).cloned().collect();
+        if why.is_empty() {
+            kept.push(s.clone());
+        } else {
+            kept.extend(why);
+        }
+    }
+    kept.dedup();
+    let rest = errors
+        .iter()
+        .filter(|e| !stale.iter().any(|s| about(e, s)))
+        .cloned()
+        .collect();
+    (kept, rest)
 }
 
 /// The rights `folder set` takes for a folder: `=rwx`, the letters that
@@ -1814,14 +1846,45 @@ mod tests {
             "/home/o/other: its file system does not support POSIX ACLs",
             "cannot act as o: Operation not permitted",
         ];
+        let errors = errors.map(String::from);
         let got = grant_errors_for(&errors, &["~/proj".into()], Path::new("/home/o"));
         assert_eq!(
             got,
-            [errors[0], errors[1], errors[2], errors[4]].map(String::from)
+            [&errors[0], &errors[1], &errors[2], &errors[4]].map(String::clone)
         );
         assert_eq!(
             grant_errors_for(&errors, &["/home/o/other".into()], Path::new("/x")),
-            [errors[2], errors[3], errors[4]].map(String::from)
+            [&errors[2], &errors[3], &errors[4]].map(String::clone)
+        );
+    }
+
+    /// Access nerve-run should have lost is told apart from the failed
+    /// grants: a folder removed from every center whose entries did not
+    /// come off, and the node's record that could not be read, with their
+    /// errors; a stale path no error names is told as it is (#142).
+    #[test]
+    fn access_that_should_have_gone_is_told_apart() {
+        let stale = [
+            "/home/o/gone",
+            "/var/lib/nerve/state/acl.json",
+            "/home/o/quiet",
+        ]
+        .map(String::from);
+        let errors = [
+            "/home/o/gone/sub: Permission denied (os error 13)",
+            "/var/lib/nerve/state/acl.json: expected value at line 1 column 1",
+            "/home/o/proj: Permission denied (os error 13)",
+            "/home/o/gonetoo: not this one",
+        ]
+        .map(String::from);
+        let (kept, rest) = stale_grants(&stale, &errors);
+        assert_eq!(kept, [&errors[0], &errors[1], &stale[2]].map(String::clone));
+        assert_eq!(rest, [&errors[2], &errors[3]].map(String::clone));
+        // Neither is in a center's list: the per-center filter alone would
+        // show their errors nowhere.
+        assert_eq!(
+            grant_errors_for(&errors, &["~/proj".into()], Path::new("/home/o")),
+            [&errors[2]].map(String::clone)
         );
     }
 }

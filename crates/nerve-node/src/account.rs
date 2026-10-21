@@ -10,7 +10,7 @@
 //! the account the service keeps CAP_SETUID and CAP_SETGID, the one
 //! privilege it has, and every command it starts drops both before it runs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nerve_policy::config::{Access, Folder};
 
@@ -61,8 +61,6 @@ pub const NO_OWNER: &str = "this node runs commands as its owner's account, and 
 /// commands on Windows; the desktop app says it in its own words.
 pub const NO_ACCOUNT_INSTALL: &str = "`nerve-node install` asks again";
 
-/// Looks `name` up in the system's account database. `getent` and `id` ask
-/// it through NSS, which the static program cannot do itself.
 /// The mode of `home` when other accounts may list or enter it (`o+r` or
 /// `o+x`): `nerve-run` is another account, and reads there what anyone may.
 #[cfg(unix)]
@@ -72,20 +70,55 @@ pub fn home_open(home: &Path) -> Option<u32> {
     (mode & 0o005 != 0).then_some(mode)
 }
 
-/// What the node says of a home open to other accounts ([`home_open`]),
-/// with or without Landlock on this machine.
+/// What a machine without Landlock leaves open of the owner's `home` to
+/// `nerve-run`, which is held to its folders by its own account alone
+/// there: every file in the home that other accounts may read, when the
+/// home is open to them (`open`, its mode), or when a folder given to it
+/// lies in the home (`below`), as it passes through the home to get there
+/// (crate::acl). `None` where neither is so. With Landlock nothing is said:
+/// it holds every command of `nerve-run` to its own folders.
 #[cfg(unix)]
-pub fn home_open_warning(home: &Path, mode: u32, landlock: bool) -> String {
-    let held = if landlock {
-        "where Landlock does not hold it to its folders"
-    } else {
-        "as this machine has no Landlock to hold it to its folders"
-    };
+pub fn home_warning(home: &Path, open: Option<u32>, below: &[PathBuf]) -> Option<String> {
+    let mut why = Vec::new();
+    if let Some(mode) = open {
+        why.push(format!(
+            "your home is open to other accounts (mode {mode:o}; `chmod 750 {}` closes it)",
+            home.display()
+        ));
+    }
+    if let Some(first) = below.first() {
+        why.push(format!(
+            "it passes through your home to {}{}",
+            first.display(),
+            if below.len() > 1 {
+                format!(" and {} more folders you give it there", below.len() - 1)
+            } else {
+                String::new()
+            }
+        ));
+    }
+    (!why.is_empty()).then(|| {
+        format!(
+            "Without Landlock, {RUN_USER} can read every file in your home {} that other accounts may read, not only the folders you give it, as {}. {LANDLOCK_ADVICE}",
+            home.display(),
+            why.join(" and ")
+        )
+    })
+}
+
+/// What `install` says on a machine without Landlock, before any folder
+/// was given: what giving one in the home leaves open ([`home_warning`]).
+#[cfg(unix)]
+pub fn no_landlock_warning() -> String {
     format!(
-        "your home {home} is open to other accounts (mode {mode:o}): {RUN_USER}, which runs the commands of folder mode, may read there what any account may, {held}; `chmod 750 {home}` (or 700) closes it",
-        home = home.display()
+        "this kernel has no Landlock, so the commands of {RUN_USER} run without it: once you give it a folder in your home, it can read every file in your home that other accounts may read, not only that folder. {LANDLOCK_ADVICE}"
     )
 }
+
+/// What closes the reach of [`home_warning`].
+#[cfg(unix)]
+const LANDLOCK_ADVICE: &str =
+    "Grant folders outside your home, use umask 027, or use a kernel with Landlock.";
 
 #[cfg(all(test, unix))]
 mod home_tests {
@@ -108,13 +141,39 @@ mod home_tests {
             std::fs::set_permissions(home, std::fs::Permissions::from_mode(mode)).unwrap();
             assert_eq!(home_open(home), open.then_some(mode), "{mode:o}");
         }
-        let text = home_open_warning(home, 0o755, false);
+    }
+
+    /// Without Landlock the warning names both ways into the home: a home
+    /// open to others, and a folder given in the home that `nerve-run`
+    /// passes through to (owner's decision of 2026-10-21); with neither it
+    /// says nothing.
+    #[test]
+    fn the_home_warning_names_what_lets_nerve_run_in() {
+        let home = Path::new("/home/o");
+        let open = home_warning(home, Some(0o755), &[]).unwrap();
         assert!(
-            text.contains("mode 755") && text.contains("chmod 750"),
-            "{text}"
+            open.starts_with("Without Landlock, nerve-run can read every file in your home /home/o that other accounts may read, not only the folders you give it"),
+            "{open}"
         );
-        assert!(text.contains("no Landlock"), "{text}");
-        assert!(!home_open_warning(home, 0o755, true).contains("no Landlock"));
+        assert!(
+            open.contains("mode 755; `chmod 750 /home/o` closes it"),
+            "{open}"
+        );
+        assert!(open.ends_with(LANDLOCK_ADVICE), "{open}");
+        let below = [home.join("proj"), home.join("docs")];
+        let through = home_warning(home, None, &below).unwrap();
+        assert!(
+            through.contains("it passes through your home to /home/o/proj and 1 more folders"),
+            "{through}"
+        );
+        assert!(!through.contains("chmod"), "{through}");
+        let both = home_warning(home, Some(0o711), &below[..1]).unwrap();
+        assert!(
+            both.contains("mode 711") && both.contains("to /home/o/proj."),
+            "{both}"
+        );
+        assert_eq!(home_warning(home, None, &[]), None);
+        assert!(no_landlock_warning().contains("umask 027"));
     }
 }
 
@@ -137,6 +196,8 @@ pub fn root() -> Account {
     }
 }
 
+/// Looks `name` up in the system's account database. `getent` and `id` ask
+/// it through NSS, which the static program cannot do itself.
 pub fn lookup(name: &str) -> Result<Option<Account>, String> {
     #[cfg(windows)]
     return crate::win_user::lookup(name);

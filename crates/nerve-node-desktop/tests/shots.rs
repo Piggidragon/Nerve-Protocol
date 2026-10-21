@@ -534,12 +534,16 @@ fn every_page_light_and_dark() {
     perm.set_grant_errors("/home/alex/usb-stick: its file system does not support POSIX ACLs, so nerve-run cannot be given it; give a folder on another file system (ext4, xfs, btrfs and tmpfs have them)".into());
     shots.take("permissions-grant-errors");
     perm.set_grant_errors("".into());
-    // A kernel without Landlock, and an owner's home open to others.
+    // Access nerve-run should have lost: none of its commands runs.
+    perm.set_stale("/home/alex/old-project/build: Permission denied (os error 13)".into());
+    shots.take("permissions-stale-grants");
+    perm.set_stale("".into());
+    // A kernel without Landlock, a folder given in the owner's home.
     perm.set_landlock(false);
-    perm.set_home_open("your home /home/alex is open to other accounts (mode 755): nerve-run, which runs the commands of folder mode, may read there what any account may, as this machine has no Landlock to hold it to its folders; `chmod 750 /home/alex` (or 700) closes it".into());
+    perm.set_home_warning("Without Landlock, nerve-run can read every file in your home /home/alex that other accounts may read, not only the folders you give it, as it passes through your home to /home/alex/project. Grant folders outside your home, use umask 027, or use a kernel with Landlock.".into());
     shots.take_full("permissions-nerve-run-without-landlock", 2150);
     perm.set_landlock(true);
-    perm.set_home_open("".into());
+    perm.set_home_warning("".into());
     perm.set_mode("allowlist".into());
     perm.set_as_owner(true);
     shots.take("permissions-allowlist-as-owner");

@@ -135,20 +135,20 @@ component ModeSection inherits Section {
             Banner {
                 tone: Tone.neutral;
                 title: "Without Landlock";
-                text: "This machine has no Landlock: nerve-run is held to the folders you give it by its own account alone.";
+                text: "This machine has no Landlock: only nerve-run's own account holds its commands back.";
             }
         }
     }
     Reveal {
-        shown: Perm.account == "nerve-run" && Perm.home-open != "";
+        shown: Perm.account == "nerve-run" && Perm.home-warning != "";
         HorizontalLayout {
             padding-left: Space.xl;
             padding-right: Space.xl;
             padding-bottom: Space.lg;
             Banner {
                 tone: Tone.warn;
-                title: "Your home is open to other accounts";
-                text: Perm.home-open;
+                title: "nerve-run can read more of your home";
+                text: Perm.home-warning;
             }
         }
     }
@@ -169,6 +169,21 @@ component FolderSection inherits Section {
             Banner {
                 tone: Tone.neutral;
                 text: "Folders do not count in this mode.";
+            }
+        }
+    }
+    // Access nerve-run should have lost stops every command of it, on
+    // every center that runs as it.
+    Reveal {
+        shown: Perm.account == "nerve-run" && Perm.stale != "";
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.md;
+            Banner {
+                tone: Tone.warn;
+                title: "nerve-run keeps access it should have lost";
+                text: "None of its commands runs until this is fixed.\n" + Perm.stale;
             }
         }
     }

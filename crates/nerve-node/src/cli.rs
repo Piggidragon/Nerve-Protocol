@@ -1869,87 +1869,8 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Status => {
             // On Windows the node answers over its control pipe.
             if let Some(v) = live_status(&paths).await? {
-                w(
-                    out,
-                    format!(
-                        "daemon: running (confinement {})",
-                        v["confinement"].as_str().unwrap_or("?")
-                    ),
-                );
-                if let Some(why) = v["folder_commands_off"].as_str() {
-                    w(out, format!("folder mode runs no command: {why}"));
-                }
-                for line in limits_lines(&v["command_limits"]) {
+                for line in status_lines(&v) {
                     w(out, line);
-                }
-                if v["locked"] == true {
-                    w(
-                        out,
-                        "LOCKED (panic): nothing runs until `nerve-node unlock`".into(),
-                    );
-                }
-                if let Some(o) = v["owner"].as_str() {
-                    w(out, format!("owner: {o}"));
-                }
-                if let Some(h) = v["home_open"]["warning"].as_str() {
-                    w(out, format!("warning: {h}"));
-                }
-                for e in v["folder_grants"]["errors"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                {
-                    w(
-                        out,
-                        format!("folder grant: {}", e.as_str().unwrap_or_default()),
-                    );
-                }
-                for c in v["centers"].as_array().into_iter().flatten() {
-                    // The installed node says as whom its commands run.
-                    // Where Landlock is missing nerve-run runs without it.
-                    let whom = match c["account"].as_str() {
-                        Some(a) if a == crate::account::RUN_USER && c["landlock"] == false => {
-                            format!(", as {a}, without Landlock")
-                        }
-                        Some(a) => format!(", as {a}"),
-                        None => String::new(),
-                    };
-                    w(
-                        out,
-                        format!(
-                            "{}  {}  mode {}{whom}",
-                            c["name"].as_str().unwrap_or_default(),
-                            c["status"].as_str().unwrap_or_default(),
-                            c["mode"].as_str().unwrap_or_default(),
-                        ),
-                    );
-                }
-                for p in v["providers"].as_array().into_iter().flatten() {
-                    let caps: Vec<&str> = p["capabilities"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect();
-                    w(
-                        out,
-                        format!(
-                            "provider {} attached: {}",
-                            p["name"].as_str().unwrap_or_default(),
-                            caps.join(", ")
-                        ),
-                    );
-                }
-                let relay = &v["relay"];
-                if relay["listen"].is_string() {
-                    let tunnels = relay["tunnels"].as_array().map_or(0, Vec::len);
-                    w(
-                        out,
-                        format!(
-                            "relay: {}, {tunnels} tunnels open (`nerve-node relay ls` names them)",
-                            relay["status"].as_str().unwrap_or_default()
-                        ),
-                    );
                 }
                 return Ok(());
             }
@@ -2320,6 +2241,120 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             crate::service::uninstall(&layout, &Host, purge, out)
         }
     }
+}
+
+/// What `status` says of a running node, from its `status` answer `v`, a
+/// line each.
+fn status_lines(v: &Value) -> Vec<String> {
+    let mut lines = vec![format!(
+        "daemon: running (confinement {})",
+        v["confinement"].as_str().unwrap_or("?")
+    )];
+    if let Some(why) = v["folder_commands_off"].as_str() {
+        lines.push(format!("folder mode runs no command: {why}"));
+    }
+    lines.extend(limits_lines(&v["command_limits"]));
+    if v["locked"] == true {
+        lines.push("LOCKED (panic): nothing runs until `nerve-node unlock`".into());
+    }
+    if let Some(o) = v["owner"].as_str() {
+        lines.push(format!("owner: {o}"));
+    }
+    if let Some(h) = v["home_warning"]["warning"].as_str() {
+        lines.push(format!("warning: {h}"));
+    }
+    lines.extend(
+        grant_lines(&v["folder_grants"])
+            .into_iter()
+            .map(|l| format!("warning: {l}")),
+    );
+    for c in v["centers"].as_array().into_iter().flatten() {
+        // The installed node says as whom its commands run. Where Landlock
+        // is missing nerve-run runs without it.
+        let whom = match c["account"].as_str() {
+            Some(a) if a == crate::account::RUN_USER && c["landlock"] == false => {
+                format!(", as {a}, without Landlock")
+            }
+            Some(a) => format!(", as {a}"),
+            None => String::new(),
+        };
+        lines.push(format!(
+            "{}  {}  mode {}{whom}",
+            c["name"].as_str().unwrap_or_default(),
+            c["status"].as_str().unwrap_or_default(),
+            c["mode"].as_str().unwrap_or_default(),
+        ));
+    }
+    for p in v["providers"].as_array().into_iter().flatten() {
+        let caps: Vec<&str> = p["capabilities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        lines.push(format!(
+            "provider {} attached: {}",
+            p["name"].as_str().unwrap_or_default(),
+            caps.join(", ")
+        ));
+    }
+    let relay = &v["relay"];
+    if relay["listen"].is_string() {
+        let tunnels = relay["tunnels"].as_array().map_or(0, Vec::len);
+        lines.push(format!(
+            "relay: {}, {tunnels} tunnels open (`nerve-node relay ls` names them)",
+            relay["status"].as_str().unwrap_or_default()
+        ));
+    }
+    lines
+}
+
+/// The texts of `v`, a list of strings.
+fn texts(v: &Value) -> Vec<&str> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+/// Whether the error `e` of a folder grant (`<path>: <why>`) is about
+/// `path` or something below it.
+fn error_about(e: &str, path: &str) -> bool {
+    e.strip_prefix(path)
+        .is_some_and(|rest| rest.starts_with(':') || rest.starts_with('/'))
+}
+
+/// What the node's folder grants (`status`'s `folder_grants`, the answer of
+/// `folder.grants`) say, a line each. Access `nerve-run` keeps although it
+/// should have lost it (`stale`) comes first, as no command of it runs
+/// until it is off; then the grants it did not get whole.
+fn grant_lines(g: &Value) -> Vec<String> {
+    let stale = texts(&g["stale"]);
+    let errors = texts(&g["errors"]);
+    let mut lines = Vec::new();
+    for p in &stale {
+        let why: Vec<&str> = errors
+            .iter()
+            .copied()
+            .filter(|e| error_about(e, p))
+            .collect();
+        lines.push(format!(
+            "nerve-run keeps its access to {p}, which it should have lost; no command of nerve-run runs until it is taken off{}",
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", why.join("; "))
+            }
+        ));
+    }
+    for e in errors
+        .iter()
+        .filter(|e| !stale.iter().any(|p| error_about(e, p)))
+    {
+        lines.push(format!("nerve-run did not get every folder: {e}"));
+    }
+    lines
 }
 
 /// `setup`: the first-run steps in the terminal: the node's name, where it
@@ -2763,27 +2798,29 @@ async fn add_folder(
 /// answers. Nothing without such a node.
 async fn tell_grants(paths: &NodePaths, out: &mut dyn Write) {
     #[cfg(target_os = "linux")]
+    if let Ok(v) = nerve_transport::ctl::call(&paths.ctl_socket(), "folder.grants", json!({})).await
     {
-        let Ok(v) =
-            nerve_transport::ctl::call(&paths.ctl_socket(), "folder.grants", json!({})).await
-        else {
-            return;
-        };
-        let errors: Vec<&str> = v["errors"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        for e in &errors {
-            let _ = writeln!(out, "warning: nerve-run did not get every folder: {e}");
-        }
-        if !errors.is_empty() {
-            json::also("grant_errors", json!(errors));
-        }
+        tell_grants_of(&v, out);
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (paths, out);
+}
+
+/// What [`tell_grants`] says of the node's answer `v`, and adds to `--json`:
+/// `grant_errors` and `grant_stale`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn tell_grants_of(v: &Value, out: &mut dyn Write) {
+    for line in grant_lines(v) {
+        let _ = writeln!(out, "warning: {line}");
+    }
+    let errors = texts(&v["errors"]);
+    if !errors.is_empty() {
+        json::also("grant_errors", json!(errors));
+    }
+    let stale = texts(&v["stale"]);
+    if !stale.is_empty() {
+        json::also("grant_stale", json!(stale));
+    }
 }
 
 /// Whether two folder paths name one place.
@@ -5577,6 +5614,107 @@ mod tests {
             paths, machine, keyring, &mut input, terminal, &mut out,
         ));
         (r, String::from_utf8(out).unwrap())
+    }
+
+    /// `status` of a running node: as whom each pairing runs and whether
+    /// without Landlock, what nerve-run may read of the owner's home, and
+    /// the folder grants, access nerve-run should have lost worded as such
+    /// (#142).
+    #[test]
+    fn the_status_says_landlock_the_home_and_the_grants() {
+        let v = json!({
+            "confinement": "landlock abi 6",
+            "owner": "alice",
+            "home_warning": {"warning": "Without Landlock, nerve-run can read every file in your home /home/alice"},
+            "folder_grants": {
+                "stale": ["/home/alice/gone", "/var/lib/nerve/state/acl.json"],
+                "errors": [
+                    "/home/alice/gone/x: Permission denied (os error 13)",
+                    "/var/lib/nerve/state/acl.json: expected value at line 1",
+                    "/home/alice/usb: its file system does not support POSIX ACLs",
+                ],
+            },
+            "centers": [
+                {"name": "a", "status": "connected", "mode": "folder", "account": "nerve-run", "landlock": false},
+                {"name": "b", "status": "connected", "mode": "folder", "account": "nerve-run", "landlock": true},
+                {"name": "c", "status": "connected", "mode": "user", "account": "alice", "landlock": false},
+                {"name": "d", "status": "connected", "mode": "folder"},
+            ],
+        });
+        let lines = status_lines(&v);
+        let has = |l: &str| lines.iter().any(|x| x == l);
+        assert!(has("owner: alice"), "{lines:#?}");
+        assert!(
+            has(
+                "warning: Without Landlock, nerve-run can read every file in your home /home/alice"
+            ),
+            "{lines:#?}"
+        );
+        assert!(
+            has("a  connected  mode folder, as nerve-run, without Landlock"),
+            "{lines:#?}"
+        );
+        assert!(has("b  connected  mode folder, as nerve-run"), "{lines:#?}");
+        assert!(has("c  connected  mode user, as alice"), "{lines:#?}");
+        assert!(has("d  connected  mode folder"), "{lines:#?}");
+        assert!(
+            has(
+                "warning: nerve-run keeps its access to /home/alice/gone, which it should have lost; no command of nerve-run runs until it is taken off: /home/alice/gone/x: Permission denied (os error 13)"
+            ),
+            "{lines:#?}"
+        );
+        assert!(
+            has(
+                "warning: nerve-run keeps its access to /var/lib/nerve/state/acl.json, which it should have lost; no command of nerve-run runs until it is taken off: /var/lib/nerve/state/acl.json: expected value at line 1"
+            ),
+            "{lines:#?}"
+        );
+        assert!(
+            has(
+                "warning: nerve-run did not get every folder: /home/alice/usb: its file system does not support POSIX ACLs"
+            ),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("did not get")).count(),
+            1,
+            "{lines:#?}"
+        );
+        // Nothing of the kind on a node that has none of it.
+        let plain = status_lines(&json!({"confinement": "landlock abi 6"})).join("\n");
+        assert!(
+            !plain.contains("warning") && !plain.contains("Landlock,"),
+            "{plain}"
+        );
+    }
+
+    /// After a change of the folders the CLI says what the node's sync
+    /// left: access that should have gone as such, a grant not given whole
+    /// as that (#142).
+    #[test]
+    fn a_folder_change_tells_what_the_grants_left() {
+        let mut out = Vec::new();
+        tell_grants_of(
+            &json!({
+                "stale": ["/home/alice/old"],
+                "errors": [
+                    "/home/alice/old: Permission denied (os error 13)",
+                    "/home/alice/older: not this one",
+                    "/home/alice/new: Operation not supported",
+                ],
+            }),
+            &mut out,
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out,
+            "warning: nerve-run keeps its access to /home/alice/old, which it should have lost; no command of nerve-run runs until it is taken off: /home/alice/old: Permission denied (os error 13)\n\
+             warning: nerve-run did not get every folder: /home/alice/older: not this one\n\
+             warning: nerve-run did not get every folder: /home/alice/new: Operation not supported\n"
+        );
+        let mut out = Vec::new();
+        tell_grants_of(&json!({"stale": [], "errors": []}), &mut out);
+        assert!(out.is_empty());
     }
 
     /// Setup's folder step gives a folder commands can work in where the

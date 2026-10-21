@@ -442,6 +442,11 @@ pub trait System {
     fn end_session(&self, _name: &str) -> Result<bool, String> {
         Ok(false)
     }
+    /// Whether the kernel has Landlock, which holds each command of
+    /// `nerve-run` to its own folders.
+    fn landlock(&self) -> bool {
+        nerve_sandbox::Confinement::detect().landlock_abi.is_some()
+    }
     /// What polkit takes here; the rules go to `rule`'s folder.
     fn polkit(&self, _rule: &Path) -> Polkit {
         Polkit::Missing
@@ -1065,20 +1070,19 @@ fn owner_of_install(
         "{name} is the owner of the node: `{}` changes its settings and starts and stops it without sudo, and user mode runs commands as {name}",
         layout.edition.program
     ));
-    // nerve-run is another account: what the owner's home shows others, it
-    // sees, and without Landlock nothing else keeps it from that.
-    let landlock = nerve_sandbox::Confinement::detect().landlock_abi.is_some();
-    if !landlock {
-        steps.did(
-            "this kernel has no Landlock: the commands of nerve-run run without it, held to the folders you give it by its own account alone".to_string(),
-        );
-    }
+    // nerve-run is another account: without Landlock only that keeps it
+    // from the owner's files, so it reads in the owner's home what others
+    // may, once it may enter the home. With Landlock nothing is said.
     #[cfg(unix)]
-    if let Some(mode) = crate::account::home_open(&account.home) {
+    if !sys.landlock() {
         steps.did(format!(
             "Warning: {}",
-            crate::account::home_open_warning(&account.home, mode, landlock)
+            crate::account::no_landlock_warning()
         ));
+        let open = crate::account::home_open(&account.home);
+        if let Some(w) = crate::account::home_warning(&account.home, open, &[]) {
+            steps.did(format!("Warning: {w}"));
+        }
     }
     #[cfg(not(unix))]
     let _ = account;
@@ -2216,6 +2220,8 @@ pub(crate) mod tests {
         /// Whether the command runs as root, and whether pkexec is there.
         pub(crate) root: std::cell::Cell<bool>,
         pub(crate) pkexec_here: std::cell::Cell<bool>,
+        /// Whether the kernel has Landlock.
+        pub(crate) landlock: std::cell::Cell<bool>,
     }
 
     impl Fake {
@@ -2230,6 +2236,7 @@ pub(crate) mod tests {
                 polkit: std::cell::Cell::new(Polkit::Rules),
                 root: std::cell::Cell::new(true),
                 pkexec_here: std::cell::Cell::new(true),
+                landlock: std::cell::Cell::new(true),
             }
         }
 
@@ -2266,6 +2273,9 @@ pub(crate) mod tests {
     impl System for Fake {
         fn is_root(&self) -> bool {
             self.root.get()
+        }
+        fn landlock(&self) -> bool {
+            self.landlock.get()
         }
         fn has_pkexec(&self) -> bool {
             self.pkexec_here.get()
@@ -2418,6 +2428,47 @@ pub(crate) mod tests {
     fn mode(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Without Landlock `install` says what nerve-run may read of the
+    /// owner's home: what others may, once it is given a folder there, and
+    /// at once where the home is open to others. With Landlock it says
+    /// nothing of it (owner's decision of 2026-10-21).
+    #[test]
+    fn install_warns_of_the_home_only_without_landlock() {
+        use std::os::unix::fs::PermissionsExt;
+        for landlock in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let sys = Fake::new();
+            sys.landlock.set(landlock);
+            let home = d.path().join("alice");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+            sys.others.borrow_mut()[0].home = home.clone();
+            let l = layout(d.path());
+            let exe = d.path().join("nerve-node");
+            std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
+            let mut out = Vec::new();
+            install(&l, &sys, &exe, "alice", &mut out).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("alice is the owner of the node"), "{out}");
+            assert_eq!(
+                out.contains(
+                    "this kernel has no Landlock, so the commands of nerve-run run without it"
+                ),
+                !landlock,
+                "{out}"
+            );
+            assert_eq!(
+                out.contains(&format!(
+                    "Without Landlock, nerve-run can read every file in your home {}",
+                    home.display()
+                )) && out.contains("mode 755"),
+                !landlock,
+                "{out}"
+            );
+            assert!(landlock || out.contains("umask 027"), "{out}");
+        }
     }
 
     #[test]

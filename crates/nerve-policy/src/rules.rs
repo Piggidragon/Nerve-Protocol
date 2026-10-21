@@ -288,13 +288,123 @@ pub fn rule_for(cap: &str, action: &str, target: &str, wildcard: bool) -> Result
     }
 }
 
+/// A letter as a class of both cases, for the Windows commands: PowerShell
+/// and cmd ignore case, and a rule's glob does not. Each macro is one word.
+macro_rules! sc {
+    () => {
+        "[Ss][Cc]"
+    };
+}
+macro_rules! net {
+    () => {
+        "[Nn][Ee][Tt]"
+    };
+}
+macro_rules! exe {
+    () => {
+        "[Ee][Xx][Ee]"
+    };
+}
+macro_rules! stop {
+    () => {
+        "[Ss][Tt][Oo][Pp]"
+    };
+}
+macro_rules! config {
+    () => {
+        "[Cc][Oo][Nn][Ff][Ii][Gg]"
+    };
+}
+macro_rules! delete {
+    () => {
+        "[Dd][Ee][Ll][Ee][Tt][Ee]"
+    };
+}
+macro_rules! restart {
+    () => {
+        "[Rr][Ee][Ss][Tt][Aa][Rr][Tt]"
+    };
+}
+macro_rules! set {
+    () => {
+        "[Ss][Ee][Tt]"
+    };
+}
+macro_rules! remove {
+    () => {
+        "[Rr][Ee][Mm][Oo][Vv][Ee]"
+    };
+}
+macro_rules! service {
+    () => {
+        "[Ss][Ee][Rr][Vv][Ii][Cc][Ee]"
+    };
+}
+macro_rules! process {
+    () => {
+        "[Pp][Rr][Oo][Cc][Ee][Ss][Ss]"
+    };
+}
+macro_rules! taskkill {
+    () => {
+        "[Tt][Aa][Ss][Kk][Kk][Ii][Ll][Ll]"
+    };
+}
+macro_rules! desktop {
+    () => {
+        "[Dd][Ee][Ss][Kk][Tt][Oo][Pp]"
+    };
+}
+macro_rules! node {
+    () => {
+        "[Nn][Ee][Rr][Vv][Ee]-[Nn][Oo][Dd][Ee]"
+    };
+}
+
+/// Up to eight spaces, tabs or line breaks: the indent of a line in a script.
+macro_rules! ws {
+    () => {
+        concat!(
+            "{,[ \t\r\n]}{,[ \t\r\n]}{,[ \t\r\n]}{,[ \t\r\n]}",
+            "{,[ \t\r\n]}{,[ \t\r\n]}{,[ \t\r\n]}{,[ \t\r\n]}"
+        )
+    };
+}
+
+/// The scope and where a command of the service rules starts: the line's
+/// start or after `;`, `&`, `|`, `(` or a line break, then `sudo` and its
+/// flags if the command begins with it. `sudo` counts only at a command's
+/// start, so a quoted mention (`git commit -m "run sudo systemctl stop
+/// nerve-node"`) runs.
+macro_rules! command {
+    () => {
+        concat!("exec.run:{,*[;&|(\r\n]}", ws!(), "{,sudo ,sudo * }")
+    };
+}
+
+/// What ends a name: the line's end, or a space, tab, line break, quote, `)`
+/// or a character that chains the next command.
+macro_rules! end {
+    () => {
+        "{,[ \t\r\n\"');&|]*}"
+    };
+}
+
+/// [`end!`], and a comma, which ends a name in a PowerShell list.
+macro_rules! end_ps {
+    () => {
+        "{,[ \t\r\n\"');,&|]*}"
+    };
+}
+
 /// The deny rules every new pairing gets, the guard against an agent that
 /// changes the node it runs on (owner's decision of 2026-10-20): a command
 /// that runs the node's programs (at the start of a command, after `sudo`,
 /// or by a path, `.exe` too), names its socket and pipes (all named
 /// `nerve-node…`) or its config and state folders, and a write into those
 /// folders, and a command that stops, restarts, disables or kills the node's
-/// service by its name (`systemctl stop nerve-node`, `sc stop nerve-node`,
+/// service or process by its name (`systemctl stop nerve-node`,
+/// `service nerve-node restart`, `pkill nerve-node`, `sc stop nerve-node`,
 /// `taskkill /im nerve-node.exe`). Only running or stopping it counts, not
 /// its name anywhere: `cargo build -p nerve-node`, `journalctl -u nerve-node`
 /// and `systemctl status nerve-node` stay allowed. They
@@ -319,17 +429,125 @@ pub const GUARD: &[&str] = &[
     // `C:\ProgramData\Nerve`, `%ProgramData%\Nerve`, `$env:ProgramData\Nerve`:
     // the line's `\` is matched as `/` on Windows.
     "exec.run:*[Pp]rogram[Dd]ata*/[Nn]erve{,/*,[ \"']*}",
-    // Stopping, restarting, disabling or killing the node's service, by the
-    // service's name, with the same line starts (and the program's path).
+    // Stopping, restarting, disabling or killing the node's service or
+    // process, by its name, with the same line starts (and the program's path).
     // Reading it stays allowed: `systemctl status`, `sc query`, `Get-Service`.
-    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }{,*[/\\]}systemctl{, *} {stop,restart,try-restart,reload-or-restart,disable,kill,mask} {,*[ \"']}nerve-node{,.service}{,[ \"');&|]*}",
-    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }{,*[/\\]}sc{,.exe} {,*[ ]}{stop,config,delete} {,*[ \"']}nerve-node{,[ \"');&|]*}",
-    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }{,*[/\\]}net{,.exe} stop {,*[ \"']}nerve-node{,[ \"');&|]*}",
-    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }{[Ss]top,[Rr]estart,[Ss]et,[Rr]emove}-[Ss]ervice{, *}[ \"':=,]nerve-node{,[ \"');,|&]*}",
-    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }{,*[/\\]}taskkill{,.exe} *[ \"':=]nerve-node{,-desktop}{,.exe}{,[ \"');&|]*}",
-    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }[Ss]top-[Pp]rocess{, *}[ \"':=,]nerve-node{,-desktop}{,.exe}{,[ \"');,|&]*}",
+    concat!(
+        command!(),
+        "{,*[/\\]}systemctl{, *} {stop,restart,try-restart,reload-or-restart,disable,kill,mask} {,*[ \"']}nerve-node{,.service}",
+        end!()
+    ),
+    concat!(
+        command!(),
+        "{,*[/\\]}",
+        sc!(),
+        "{,.",
+        exe!(),
+        "} {,*[ ]}{",
+        stop!(),
+        ",",
+        config!(),
+        ",",
+        delete!(),
+        "} {,*[ \"']}",
+        node!(),
+        end!()
+    ),
+    concat!(
+        command!(),
+        "{,*[/\\]}",
+        net!(),
+        "{,.",
+        exe!(),
+        "} ",
+        stop!(),
+        " {,*[ \"']}",
+        node!(),
+        end!()
+    ),
+    concat!(
+        command!(),
+        "{",
+        stop!(),
+        ",",
+        restart!(),
+        ",",
+        set!(),
+        ",",
+        remove!(),
+        "}-",
+        service!(),
+        "{, *}[ \"':=,]",
+        node!(),
+        end_ps!()
+    ),
+    concat!(
+        command!(),
+        "{,*[/\\]}",
+        taskkill!(),
+        "{,.",
+        exe!(),
+        "} *[ \"':=]",
+        node!(),
+        "{,-",
+        desktop!(),
+        "}{,.",
+        exe!(),
+        "}",
+        end!()
+    ),
+    concat!(
+        command!(),
+        stop!(),
+        "-",
+        process!(),
+        "{, *}[ \"':=,]",
+        node!(),
+        "{,-",
+        desktop!(),
+        "}{,.",
+        exe!(),
+        "}",
+        end_ps!()
+    ),
     // The same through a pipe: `Get-Service nerve-node | Stop-Service`.
-    "exec.run:*[ \"'(,:=]nerve-node{,-desktop}{,.exe}*|{,[ ]}{[Ss]top,[Rr]estart,[Ss]et,[Rr]emove}-{[Ss]ervice,[Pp]rocess}{,[ \"');,|&]*}",
+    concat!(
+        "exec.run:*[ \"'(,:=]",
+        node!(),
+        "{,-",
+        desktop!(),
+        "}{,.",
+        exe!(),
+        "}*|",
+        ws!(),
+        "{",
+        stop!(),
+        ",",
+        restart!(),
+        ",",
+        set!(),
+        ",",
+        remove!(),
+        "}-{",
+        service!(),
+        ",",
+        process!(),
+        "}",
+        end_ps!()
+    ),
+    // The SysV wrapper, `service nerve-node stop` (it calls systemctl).
+    concat!(
+        command!(),
+        "{,*[/\\]}service {,*[ \"']}nerve-node{,.service}{,[\"']} {stop,restart,try-restart,force-reload,condrestart}",
+        end!()
+    ),
+    // By the process's name: `pkill nerve-node`, `killall -9 nerve-node`,
+    // `pkill -f '^/usr/bin/nerve-node'`. `pgrep` and `ps` stay allowed.
+    concat!(
+        command!(),
+        "{,*[/\\]}{pkill,killall} {,-* }{,[\"']}{,^}{,*/}nerve-node{,-desktop}{,[$\"']}",
+        end!()
+    ),
     "fs.write:~/.config/nerve/*",
     "fs.write:~/.local/state/nerve/*",
     "fs.write:/etc/nerve/*",
@@ -537,6 +755,9 @@ mod tests {
     fn the_guard_refuses_stopping_the_service() {
         // The rules before the service rules: they alone refuse none of these.
         const BEFORE: usize = 9;
+        // The service rules after them: the fs.write rules follow.
+        const SERVICE_RULES: usize = 9;
+        assert!(GUARD[BEFORE + SERVICE_RULES].starts_with("fs.write"));
         let rules = |g: &[&str]| g.iter().map(|g| g.to_string()).collect::<Vec<_>>();
         let home = Path::new("/home/alice");
         let all = RuleSet::new(&rules(GUARD), home);
@@ -607,6 +828,70 @@ mod tests {
             "Get-Process nerve-node | Stop-Process",
             "Get-Process nerve-node-desktop | Stop-Process -Force",
             "Get-Process | Where-Object Name -eq nerve-node | Stop-Process",
+            // A line break or a tab ends a command and its name like a space.
+            "sudo systemctl restart nerve-node\necho done",
+            "sudo systemctl restart nerve-node\n",
+            "sudo systemctl restart nerve-node\t",
+            "systemctl stop nerve-node\r\nsleep 1",
+            "cd /srv\nsystemctl restart nerve-node",
+            "cd /srv\r\nsystemctl restart nerve-node",
+            "echo hi\n    systemctl stop nerve-node",
+            "echo hi\n\tsudo systemctl stop nerve-node",
+            "echo hi\n\n  sudo -n systemctl disable nerve-node.service",
+            "sc stop nerve-node\nsc query nerve-node",
+            "Stop-Service nerve-node\nStart-Sleep 2",
+            "Stop-Service nerve-node\r\nStart-Sleep 2",
+            "Start-Sleep 1\nStop-Service nerve-node",
+            "Get-Service nerve-node |\n  Stop-Service",
+            "taskkill /im nerve-node.exe\ntasklist",
+            "Stop-Process -Name nerve-node\n",
+            // sudo counts at a command's start, with its flags.
+            "sudo -u root systemctl stop nerve-node",
+            "cd x && sudo -u root systemctl restart nerve-node",
+            "echo ok | sudo -n systemctl stop nerve-node",
+            // The SysV wrapper calls systemctl.
+            "service nerve-node stop",
+            "sudo service nerve-node restart",
+            "sudo -n service nerve-node.service try-restart",
+            "/usr/sbin/service nerve-node force-reload",
+            "service \"nerve-node\" stop",
+            "service nerve-node condrestart; true",
+            "service nerve-node stop\necho done",
+            "cd /srv && service nerve-node restart",
+            // Killing the process by its name.
+            "pkill nerve-node",
+            "sudo pkill nerve-node",
+            "sudo killall nerve-node",
+            "sudo pkill -f nerve-node",
+            "pkill -9 -f 'nerve-node --config x'",
+            "pkill -x \"nerve-node\"",
+            "killall -s KILL nerve-node-desktop",
+            "killall -9 nerve-node && echo gone",
+            "pkill -u nerve -x nerve-node",
+            "pkill '^nerve-node$'",
+            "pkill -f nerve-node\nsleep 1",
+            "/usr/bin/pkill nerve-node",
+            "sudo -n killall -9 nerve-node; true",
+            // The Windows commands ignore case.
+            "STOP-SERVICE nerve-node",
+            "Stop-service nerve-node",
+            "RESTART-SERVICE -Name NERVE-NODE",
+            "SET-SERVICE Nerve-Node -StartupType Disabled",
+            "SC STOP nerve-node",
+            "sc stop Nerve-Node",
+            "SC.EXE CONFIG nerve-node start= disabled",
+            "Sc Delete NERVE-NODE",
+            "NET STOP nerve-node",
+            "Net Stop NERVE-NODE",
+            "NET.EXE STOP \"Nerve-Node\"",
+            "TASKKILL /IM NERVE-NODE.EXE /F",
+            "Taskkill /F /IM nerve-node-desktop.EXE",
+            "taskkill /im Nerve-Node-Desktop.exe",
+            "STOP-PROCESS -Name NERVE-NODE",
+            "stop-process -name nerve-node-desktop -force",
+            "get-service nerve-node | stop-service",
+            "GET-SERVICE NERVE-NODE | STOP-SERVICE",
+            "Get-Process Nerve-Node | Stop-Process",
         ] {
             let found = all.find("exec", "run", c);
             let Some(rule) = found else {
@@ -619,7 +904,7 @@ mod tests {
             caught.insert(rule.to_string());
         }
         // Every service rule refuses a line of its own, so none can go dead.
-        for g in &GUARD[BEFORE..BEFORE + 7] {
+        for g in &GUARD[BEFORE..BEFORE + SERVICE_RULES] {
             assert!(caught.contains(*g), "no case for {g}");
         }
         let run = |c: &str| all.find("exec", "run", c).is_some();
@@ -665,8 +950,46 @@ mod tests {
             "git commit -m 'Stop-Service nerve-node'",
             "echo systemctl stop nerve-node",
             "grep -r 'systemctl stop nerve-node' docs/",
+            // A quoted mention that holds `sudo` is not a command: sudo has to
+            // begin the command.
+            "git commit -m \"Refuse sudo systemctl stop nerve-node in the guard\"",
+            "echo \"then run: sudo systemctl restart nerve-node\"",
+            "grep -rn \"sudo systemctl stop nerve-node\" docs/",
+            "grep -rn 'sudo service nerve-node restart' docs/",
+            "git commit -m 'Docs: sudo pkill nerve-node'",
+            "git commit -m 'run sudo Stop-Service nerve-node'",
+            // Reading the service, a process or a log, in one line or several.
+            "systemctl status nerve-node\nsleep 1",
+            "sudo systemctl status nerve-node\r\nsystemctl is-active nerve-node",
+            "echo ok\nsystemctl stop sshd",
+            "Get-Service nerve-node\nGet-Process nerve-node",
+            "SC QUERY nerve-node",
+            "NET START nerve-node",
+            "TASKLIST /FI \"IMAGENAME eq nerve-node.exe\"",
+            "STOP-SERVICE spooler",
+            "TASKKILL /IM NOTEPAD.EXE",
+            "service nerve-node status",
+            "sudo service nerve-node-extra stop",
+            "service sshd restart",
+            "sudo service ssh restart",
+            "pgrep nerve-node",
+            "pgrep -a nerve-node",
+            "ps aux | grep nerve-node",
+            "pkill sshd",
+            "pkill -f nginx",
+            "sudo killall nginx",
+            "pkill nerve-node-extra",
+            "pkill -f my-nerve-node",
+            "pkill -u nerve sshd",
         ] {
             assert!(!run(c), "should stay allowed: {c}");
+        }
+        // Refused by the rules for the program's path already.
+        for c in [
+            "pkill -f /usr/local/bin/nerve-node",
+            "/etc/init.d/nerve-node stop",
+        ] {
+            assert!(all.find("exec", "run", c).is_some(), "{c}");
         }
     }
 

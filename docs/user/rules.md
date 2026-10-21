@@ -42,19 +42,29 @@ the start of a command, after `sudo`, or by a path, `.exe` too), a command
 line that names the node's socket or pipes or its config and state folders
 (`/etc/nerve`, `/var/lib/nerve`, `~/.config/nerve`, `~/.local/state/nerve`,
 `%ProgramData%\Nerve`), a write into those folders, and a command that
-stops the node's service by its name, as the node's own `service stop` would.
+stops, restarts, disables or kills the node's service or process by its name, as the node's own `service stop` would.
 The name alone is not refused: `cargo build -p nerve-node` and
 `journalctl -u nerve-node` run. `rule ls deny` shows them; remove any you do
 not want.
 
 | | Refused | Still runs |
 |---|---|---|
-| Linux | `systemctl stop`, `restart`, `try-restart`, `reload-or-restart`, `disable`, `kill` or `mask` on `nerve-node` (or `nerve-node.service`), with or without `sudo`, a path to `systemctl` or flags such as `--now` | `systemctl status`, `is-active`, `show`, `cat` on it, `journalctl -u nerve-node` |
+| Linux | `systemctl stop`, `restart`, `try-restart`, `reload-or-restart`, `disable`, `kill` or `mask` on `nerve-node` (or `nerve-node.service`); `service nerve-node stop`, `restart`, `try-restart`, `force-reload` or `condrestart`; `pkill` or `killall` on `nerve-node` or `nerve-node-desktop`, with flags such as `-9`, `-f` or `-x`. With or without `sudo`, a path to the program, or flags such as `--now` | `systemctl status`, `is-active`, `show`, `cat` on it, `service nerve-node status`, `journalctl -u nerve-node`, `pgrep`, `ps` |
 | Windows | `sc stop`, `config` or `delete`; `net stop`; `Stop-Service`, `Restart-Service`, `Set-Service` or `Remove-Service`; `Stop-Process -Name`; `taskkill` with `nerve-node.exe` or `nerve-node-desktop.exe`; `Get-Service` or `Get-Process` on the node piped into one of the cmdlets | `sc query`, `sc qc`, `Get-Service nerve-node`, `Get-Process nerve-node` |
 
-A line that stops some other service and names `nerve-node` later is refused
-too, since the rules match the whole line. On Windows the cmdlets match in the
-spellings `Stop-Service` and `stop-service`.
+The Windows commands match in any case (`STOP-SERVICE`, `NET STOP`,
+`sc stop Nerve-Node`, `taskkill /IM NERVE-NODE.EXE`), as Windows reads them.
+The rules see a line break or a tab after a name or before a command as they
+see a space or `;`, so the second line of a script counts, with its indent.
+
+The rules match the whole line, so some lines are refused that only mention
+the node: a line that stops some other service and names `nerve-node` later,
+and a quoted text with `;`, `|` or `(` in front of a command's words
+(`git commit -m "Docs (Stop-Service nerve-node)"`). A quoted mention is
+otherwise left alone: `sudo` counts only at a command's start, so
+`git commit -m "run sudo systemctl stop nerve-node"` runs. The rules do not
+read `kill` with a process id (`kill $(pidof nerve-node)`), `pkill nerve` as
+a part of the name, or `sudo` behind another program (`env X=1 sudo ...`).
 
 ```sh
 nerve-node rule guard --center lab   # puts back the ones a pairing lacks

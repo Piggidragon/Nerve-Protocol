@@ -232,7 +232,9 @@ and no other groups; `uninstall` removes both.
   home](#your-home-and-other-accounts)). Files you put into such a folder later get its entry from the
   folder's default entries. `uninstall` takes every entry off, also those,
   and gives what `nerve-run` made in your folders to you, as its account
-  goes.
+  goes. A file of it there with more than one name (a hard link) is left
+  as it is, since another name may lie outside your folders: `uninstall`
+  says how many, and they keep its old uid.
 - A grant that fails (a folder below it closed to you, a file system without
   ACLs) is named by `folder add` and `folder set` and in `nerve-node status`,
   also after a restart, and is tried again: at the node's start, with the

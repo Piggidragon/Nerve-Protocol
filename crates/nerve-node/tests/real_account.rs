@@ -498,11 +498,21 @@ except OSError as e:
             .to_string()
     };
     assert_eq!(user_of(&proj.join("made-dir/in.txt")), "nerve-run");
+    // A file of nerve-run's with a second name outside the folders is left
+    // as it is: ownership goes with the file, not the name.
+    let twin = proj.join("twin.txt");
+    std::fs::write(&twin, "t").unwrap();
+    std::fs::hard_link(&twin, base.join("twin-outside")).unwrap();
+    assert!(sh(Command::new("chown").arg("nerve-run:nerve-run").arg(&twin)).0);
 
     // Uninstall: the account, its home and every entry go.
     let (ok, said) = sh(Command::new(BIN).args(["uninstall", "--purge"]));
     assert!(ok, "{said}");
     assert!(said.contains("removed the account nerve-run"), "{said}");
+    assert!(
+        said.contains("but not 1 file with more than one name"),
+        "{said}"
+    );
     assert!(!sh(Command::new("id").arg("nerve-run")).0);
     assert!(!run_home.exists());
     // Also on what nerve-run made, which was its own.
@@ -526,5 +536,12 @@ except OSError as e:
     ] {
         assert_eq!(user_of(&p), owner, "{p:?}");
     }
+    let uid_of = |p: &Path| {
+        sh(Command::new("stat").args(["-c", "%u"]).arg(p))
+            .1
+            .trim()
+            .to_string()
+    };
+    assert_eq!(uid_of(&base.join("twin-outside")), run_uid);
     std::fs::remove_dir_all(&base).unwrap();
 }

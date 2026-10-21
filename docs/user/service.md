@@ -212,7 +212,8 @@ sudo nerve-node uninstall --purge   # deletes them too
 
 `uninstall` stops and disables the service, removes the unit, takes every
 ACL entry of `nerve-run` off your folders, gives what `nerve-run` made in
-them to you, removes `nerve-run` with its home, the polkit files and the helper, the user `nerve` and
+them to you (not a file with more than one name, which may also lie
+outside them; it says how many it left), removes `nerve-run` with its home, the polkit files and the helper, the user `nerve` and
 `/usr/local/bin/nerve-node`. If an ACL entry cannot be taken off, it stops
 before it removes anything and says which: a uid nobody has must not keep
 them. A session that a keyring gave `nerve` is ended first. Without

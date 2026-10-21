@@ -343,6 +343,11 @@ pub struct Report {
     /// Files and folders left as they are: another account's, with a
     /// second name, or on another file system.
     pub skipped: usize,
+    /// Of those at `uninstall`: what `nerve-run` owns there that is no
+    /// folder and has a second name, which may lie outside every grant. It
+    /// is not given to the owner, as ownership goes with the file and not
+    /// the name, so it keeps `nerve-run`'s uid (crate::service says so).
+    pub not_given: usize,
 }
 
 impl Report {
@@ -784,13 +789,19 @@ fn walk(
             }
         };
         let ft = o.m.file_type();
+        // What is no folder and has a second name may lie outside every
+        // grant, as for its entries below: it is not given away either.
+        let twin = !ft.is_dir() && o.m.nlink() > 1;
         if let Some(to) = everyone
             && o.m.uid() == who.run
             && o.m.dev() == dev
-            && let Err(e) = give(&o, to)
         {
-            report.errors.push(failed(&path, &e));
-            whole = false;
+            if twin {
+                report.not_given += 1;
+            } else if let Err(e) = give(&o, to) {
+                report.errors.push(failed(&path, &e));
+                whole = false;
+            }
         }
         if ft.is_symlink() || o.m.dev() != dev || !(ft.is_dir() || ft.is_file()) {
             if ft.is_dir() {
@@ -805,7 +816,6 @@ fn walk(
         if mine || everyone.is_some() {
             // A file with a second name may lie outside the grant: it gets
             // no entry, and one it has comes off.
-            let twin = ft.is_file() && o.m.nlink() > 1;
             let a = if twin || !mine {
                 Access::NONE
             } else {
@@ -1731,6 +1741,59 @@ mod tests {
         }
         // The owner's own stay as they were.
         assert_eq!(std::fs::metadata(&mine).unwrap().uid(), uid());
+    }
+
+    /// `uninstall` gives nothing of `nerve-run`'s that is no folder and has
+    /// a second name: ownership goes with the file, and the other name may
+    /// lie outside every grant, here in a folder open to all. Such a file
+    /// is counted, and what has one name is given as before (#142). Root in
+    /// a namespace of its own, to own files as other accounts.
+    #[test]
+    fn remove_all_gives_no_file_with_a_second_name() {
+        if !in_a_namespace("remove_all_gives_no_file_with_a_second_name") {
+            return;
+        }
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let open = root.join("open");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let file = root.join("acl.json");
+        assert!(
+            sync(&file, &[grant(&work, "rw")], who(), &none)
+                .errors
+                .is_empty()
+        );
+        // As if nerve-run made them: a file and a link, each also named in
+        // the open folder outside the grant, and a file with one name.
+        std::fs::write(open.join("f"), "f").unwrap();
+        std::os::unix::fs::symlink("f", open.join("l")).unwrap();
+        std::fs::hard_link(open.join("f"), work.join("f")).unwrap();
+        std::fs::hard_link(open.join("l"), work.join("l")).unwrap();
+        std::fs::write(work.join("one"), "1").unwrap();
+        for p in [open.join("f"), open.join("l"), work.join("one")] {
+            std::os::unix::fs::lchown(&p, Some(RUN), Some(RUN)).unwrap();
+        }
+        let heir = (RUN + 1, RUN + 2);
+        let r = remove_all(&file, &|_| heir);
+        assert!(r.errors.is_empty() && r.stale.is_empty(), "{r:?}");
+        assert_eq!(r.not_given, 2, "{r:?}");
+        assert!(r.skipped >= 2, "{r:?}");
+        let owner = |p: &Path| {
+            let m = std::fs::symlink_metadata(p).unwrap();
+            (m.uid(), m.gid())
+        };
+        for p in [
+            open.join("f"),
+            open.join("l"),
+            work.join("f"),
+            work.join("l"),
+        ] {
+            assert_eq!(owner(&p), (RUN, RUN), "{p:?}");
+        }
+        assert_eq!(owner(&work.join("one")), heir);
     }
 
     /// A grant that failed (a folder below it closed) stays failed in the

@@ -1336,7 +1336,9 @@ The call is refused while an entry that should have come off is left
 (`stale`), for every pairing of `nerve-run`. `uninstall` takes every
 recorded entry off as root before it removes `nerve-run`, outer grants
 first (an outer walk counts for the grants inside only as above), gives what `nerve-run` owns below the grants to the owner (to root
-when the owner's account is gone), and stops if an entry stays.
+when the owner's account is gone) but for what is no folder and has more
+than one name (it may lie outside every grant, and ownership goes with the
+file; counted, and `uninstall` says how many), and stops if an entry stays.
 
 ## 6. Audit log
 

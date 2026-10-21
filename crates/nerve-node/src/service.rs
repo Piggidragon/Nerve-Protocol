@@ -1229,6 +1229,27 @@ pub fn uninstall(
     r
 }
 
+/// What `uninstall` says once nerve-run's access to its folders is off:
+/// that what it made there is the owner's now, but for `not_given` files
+/// with a second name (crate::acl::Report::not_given), which keep its uid.
+#[cfg(target_os = "linux")]
+fn gave_to_owner(not_given: usize) -> String {
+    let done = "took nerve-run's access to the folders given to it off again, and gave what it made there to the owner";
+    match not_given {
+        0 => done.to_string(),
+        n => {
+            let (files, them) = if n == 1 {
+                ("file", "it")
+            } else {
+                ("files", "them")
+            };
+            format!(
+                "{done}, but not {n} {files} with more than one name: one may lie outside those folders, so nerve-run's uid stays on {them}, which no account has once nerve-run is removed (`sudo find <folder> -nouser` lists such files then)"
+            )
+        }
+    }
+}
+
 fn uninstall_steps(
     layout: &Layout,
     sys: &dyn System,
@@ -1266,9 +1287,7 @@ fn uninstall_steps(
                     r.errors.join("; ")
                 ));
             }
-            steps.did(
-                "took nerve-run's access to the folders given to it off again, and gave what it made there to the owner",
-            );
+            steps.did(gave_to_owner(r.not_given));
         }
     }
     let folders = [
@@ -2968,6 +2987,24 @@ pub(crate) mod tests {
         // it is not refused for want of root here.
         let e = control(&l, &NotRoot, ServiceAction::Stop, &mut Vec::new()).unwrap_err();
         assert!(e.contains("not installed as a service"), "{e}");
+    }
+
+    /// `uninstall` says so where it left files of nerve-run's with more
+    /// than one name as they were (crate::acl::Report::not_given).
+    #[test]
+    fn uninstall_tells_the_files_it_did_not_give_the_owner() {
+        let done = gave_to_owner(0);
+        assert!(
+            done.ends_with("gave what it made there to the owner"),
+            "{done}"
+        );
+        for (n, what) in [(1, "not 1 file with"), (3, "not 3 files with")] {
+            let said = gave_to_owner(n);
+            assert!(said.starts_with(&done), "{said}");
+            assert!(said.contains(what), "{said}");
+            assert!(said.contains("may lie outside those folders"), "{said}");
+            assert!(said.contains("-nouser"), "{said}");
+        }
     }
 
     #[test]

@@ -137,6 +137,23 @@ async fn folder_mode_runs_as_nerve_run_on_this_machine() {
     assert!(home.is_dir(), "{home:?}");
     let chmod = |p: &Path, m: &str| assert!(sh(Command::new("chmod").arg(m).arg(p)).0);
     let landlock = nerve_sandbox::Confinement::detect().landlock_abi.is_some();
+    // The owner has a password and sudo from the start, as a real owner
+    // does: the node keeps the accounts it looked up for a few seconds.
+    let pw = |p: &str| {
+        let mut c = Command::new("chpasswd");
+        c.stdin(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{owner}:{p}\n").as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    };
+    pw("first-pass-142");
+    assert!(sh(Command::new("usermod").args(["-aG", "sudo", &owner])).0);
 
     // Install, as the owner's sudo would: the owner is named, nerve-run is
     // made with its home. Without Landlock a home open to other accounts is
@@ -363,21 +380,6 @@ except OSError as e:
     // through the owner's sudo: it still works after the owner's password
     // changed. One the sudo
     // list does not name is refused.
-    let pw = |p: &str| {
-        let mut c = Command::new("chpasswd");
-        c.stdin(std::process::Stdio::piped());
-        let mut child = c.spawn().unwrap();
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(format!("{owner}:{p}\n").as_bytes())
-            .unwrap();
-        assert!(child.wait().unwrap().success());
-    };
-    pw("first-pass-142");
-    assert!(sh(Command::new("usermod").args(["-aG", "sudo", &owner])).0);
     let (ok, said) = typing(Command::new(BIN).args(["sudo", "on"]), "first-pass-142\n");
     assert!(ok, "{said}");
     let (ok, said) = as_owner(&owner, &["rule", "add", "sudo", "id -un"]);

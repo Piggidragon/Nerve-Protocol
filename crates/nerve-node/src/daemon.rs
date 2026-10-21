@@ -449,6 +449,13 @@ fn confinement_for(detected: Confinement, service: bool) -> Confinement {
 /// How long a looked-up account is used before it is looked up again.
 const ACCOUNT_FRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How often a folder grant that failed is tried again, at most: by a
+/// command of `nerve-run` or a change of the config, and at once at the
+/// node's start. The owner may have fixed what stopped it (a closed folder
+/// opened) without changing the config.
+#[cfg(target_os = "linux")]
+const ACL_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(crate) struct Shared {
     pub paths: NodePaths,
     /// Whether this is the installed service (crate::service::is_service_node).
@@ -507,6 +514,10 @@ pub(crate) struct Shared {
     /// (crate::acl); held while one runs, so that two never run at once.
     #[cfg(target_os = "linux")]
     pub acl: Mutex<crate::acl::Report>,
+    /// Linux: when a sync of the ACLs last ran, for trying a grant that
+    /// failed again ([`ACL_RETRY`]).
+    #[cfg(target_os = "linux")]
+    pub acl_tried: Mutex<Option<std::time::Instant>>,
 }
 
 impl Shared {
@@ -580,8 +591,9 @@ impl Shared {
     }
 
     /// Brings the folders' ACLs in line with `cfg` (crate::acl), when the
-    /// record is behind it or `always`; blocks while it walks. What it left
-    /// is logged and kept for the commands and `status`.
+    /// record is behind it, a grant failed and was not tried for
+    /// [`ACL_RETRY`], or `always`; blocks while it walks. What it left is
+    /// logged and kept for the commands and `status`.
     #[cfg(target_os = "linux")]
     pub fn sync_acls(&self, cfg: &NodeConfig, always: bool) {
         let Some((who, owner)) = self.acl_accounts(cfg) else {
@@ -591,16 +603,19 @@ impl Shared {
         // The folders are resolved as the owner sees them: the node's user
         // may not look into the owner's home.
         let want = match crate::account::FsAs::new(&owner) {
-            Ok(_as) => crate::acl::wanted(cfg, &self.paths, &owner.home),
+            Ok(_as) => crate::acl::wanted(cfg, &self.paths, &owner.home, crate::now_ms()),
             Err(e) => {
                 tracing::warn!("folder grants: cannot act as {}: {e}", owner.name);
                 return;
             }
         };
         let mut last = lock(&self.acl);
-        if !always && !crate::acl::behind(&file, &want, who) {
+        let mut tried = lock(&self.acl_tried);
+        let retry = tried.is_none_or(|t| t.elapsed() >= ACL_RETRY);
+        if !always && !crate::acl::behind(&file, &want, who, retry) {
             return;
         }
+        *tried = Some(std::time::Instant::now());
         let act_as = || {
             crate::account::FsAs::new(&owner)
                 .map(Some)
@@ -723,10 +738,15 @@ impl Shared {
             })
             .map_err(|e| e.to_string())?;
         self.bump();
+        let counts = self.config().center(center).is_some_and(|c| {
+            c.policy.mode_at(crate::now_ms()) == nerve_policy::Mode::Folder
+                || self.separate(&c.policy)
+        });
         Ok(AddedFolder {
             stored,
             recorded,
             mode: applied.expect("applied when update succeeds").mode,
+            counts,
         })
     }
 
@@ -913,21 +933,28 @@ impl Shared {
         }
     }
 
-    pub fn status(&self) -> Value {
-        let cfg = self.config();
-        // What the last sync of the folders' ACLs left, on the installed
-        // Linux node (crate::acl).
+    /// What the last sync of the folders' ACLs left, on the installed Linux
+    /// node (crate::acl): `status`'s `folder_grants`.
+    pub fn folder_grants(&self) -> Value {
         #[cfg(target_os = "linux")]
-        let grants = {
+        {
             let r = lock(&self.acl);
             json!({
                 "errors": r.errors,
                 "stale": r.stale,
+                "failed": r.failed,
                 "skipped": r.skipped,
             })
-        };
+        }
         #[cfg(not(target_os = "linux"))]
-        let grants = Value::Null;
+        Value::Null
+    }
+
+    pub fn status(&self) -> Value {
+        let cfg = self.config();
+        // What the last sync of the folders' ACLs left, on the installed
+        // Linux node (crate::acl).
+        let grants = self.folder_grants();
         let now = crate::now_ms();
         let centers: Vec<Value> = cfg
             .centers
@@ -1194,6 +1221,8 @@ impl Daemon {
             owner: opts.owner,
             #[cfg(target_os = "linux")]
             acl: Mutex::default(),
+            #[cfg(target_os = "linux")]
+            acl_tried: Mutex::default(),
         });
         shared.tell_confinement(&cfg);
         // A file that says on starts off: on Linux the password lives in
@@ -1536,9 +1565,11 @@ pub struct AddedFolder {
     pub stored: String,
     /// Whether it is recorded at its real place (`CenterPolicy::places`).
     pub recorded: bool,
-    /// The center's mode, for the CLI's note on folders counting in folder
-    /// mode only.
+    /// The center's mode, for the CLI's note on folders that do not count.
     pub mode: nerve_policy::Mode,
+    /// Whether the center's folders hold its commands now: in folder mode,
+    /// and in every mode whose commands run as `nerve-run`.
+    pub counts: bool,
 }
 
 /// The message of a refused `folder add`, for the CLI and the node alike.
@@ -1690,6 +1721,25 @@ async fn answer(
             }
             rotate_key(shared, &req.params).await
         }
+        // The folders' ACLs brought in line with the config now, also a
+        // grant that failed before, and what that left: the CLI tells the
+        // owner after a change of the folders (crate::acl).
+        "folder.grants" => {
+            if shared.below_command(peer.pid) {
+                return nerve_transport::ctl::Reply::Err(FROM_A_COMMAND.into());
+            }
+            let s = shared.clone();
+            let r = tokio::task::spawn_blocking(move || {
+                #[cfg(target_os = "linux")]
+                s.sync_acls(&s.config(), true);
+                s.folder_grants()
+            })
+            .await;
+            match r {
+                Ok(v) => nerve_transport::ctl::Reply::Ok(v),
+                Err(e) => nerve_transport::ctl::Reply::Err(e.to_string()),
+            }
+        }
         // A capability provider attaches; its connection stays
         // (crate::provider).
         "hello" => {
@@ -1803,6 +1853,7 @@ pub(crate) fn control(
                     "stored": a.stored,
                     "recorded": a.recorded,
                     "mode": a.mode.as_str(),
+                    "counts": a.counts,
                 })),
                 Err(e) => Reply::Err(e),
             }

@@ -15,8 +15,25 @@
 //! entry that lets `nerve-run` pass through it and nothing more. The node
 //! changes only what the owner owns, acting with the owner's file system
 //! ids (crate::account::FsAs): a file of anyone else's is left as it is, and
-//! so is a file with a second name, which may lie outside the folder, a
-//! link, and what lies on another file system below a grant.
+//! so is a link and what lies on another file system below a grant. A file
+//! with a second name, which may lie outside the folder, gets no entry, and
+//! one it has comes off.
+//!
+//! A command of `nerve-run` may change the folders it may write while the
+//! node walks them, and put a link where a folder was. So the walk never
+//! goes by a path twice: it opens each entry once, without following a
+//! link, from the descriptor of the folder it lies in, and reads and writes
+//! the entries through that descriptor. A link on the way to a granted
+//! folder, which its real path (crate::exec::folder_sets) did not have, makes
+//! that grant fail.
+//!
+//! What `nerve-run` made in a granted folder is its own, and keeps the
+//! entries it got there from the folder's default entries after the grant
+//! went: the owner may not change another account's files, and `nerve-run`
+//! has every right on its own files whatever their entries say. What keeps
+//! it from them then is that it can no longer get there, through the
+//! owner's folders above that lost its entries. `uninstall`, as root, takes
+//! the entries off them too, before the account's uid is freed.
 //!
 //! The node keeps a record of what it gave (`acl.json` in its state
 //! folder), so that it takes the entries off again after the config
@@ -31,10 +48,12 @@
 //! of that folder fails with that reason.
 
 use std::collections::BTreeMap;
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::{CStr, CString, OsString};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 use nerve_policy::config::{Access, NodeConfig};
 use nerve_policy::paths::within;
@@ -221,6 +240,10 @@ pub struct Record {
     /// The folders above them it may pass through.
     #[serde(default)]
     pub traverse: Vec<PathBuf>,
+    /// The granted folders whose entries could not all be put on: tried
+    /// again, also after the node started again (crate::daemon).
+    #[serde(default)]
+    pub failed: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,14 +275,20 @@ fn write_record(file: &Path, r: &Record) -> Result<(), String> {
 }
 
 /// The folders the config gives the account, with the union of their flags
-/// over every pairing: each pairing's folders as its sandbox has them
-/// (crate::exec::container_grants), its protected entries and the node's own
-/// folders left out, `~` the owner's `home`.
-pub fn wanted(cfg: &NodeConfig, paths: &NodePaths, home: &Path) -> Vec<Granted> {
+/// over every pairing whose commands run as it at `now_ms`: each pairing's
+/// folders as its sandbox has them (crate::exec::container_grants), its
+/// protected entries and the node's own folders left out, `~` the owner's
+/// `home`. A pairing whose commands run as the owner (user mode, allowlist
+/// mode as the owner) gives `nerve-run` none of its folders.
+pub fn wanted(cfg: &NodeConfig, paths: &NodePaths, home: &Path, now_ms: u64) -> Vec<Granted> {
     let own = paths.own();
     let writable = crate::exec::write_folders(cfg, home);
     let mut by_path: BTreeMap<PathBuf, Access> = BTreeMap::new();
-    for c in &cfg.centers {
+    for c in cfg
+        .centers
+        .iter()
+        .filter(|c| !c.policy.runs_as_owner(now_ms))
+    {
         for (path, a) in
             crate::exec::container_grants(&c.policy, home, &own, &Platform::Unix, &writable)
         {
@@ -285,6 +314,9 @@ pub struct Report {
     /// `nerve-run` may still reach there. No command of it runs while one
     /// is left.
     pub stale: Vec<PathBuf>,
+    /// Granted folders whose entries could not all be put on: `nerve-run`
+    /// may not reach all of them. Tried again (crate::daemon).
+    pub failed: Vec<PathBuf>,
     /// Files and folders left as they are: another account's, with a
     /// second name, or on another file system.
     pub skipped: usize,
@@ -307,15 +339,16 @@ impl Report {
     }
 }
 
-/// The ACL of `path` (access or default), `None` where it has none.
-fn get(path: &CString, name: &str) -> std::io::Result<Option<Acl>> {
+/// The ACL of the file `at` leads to (access or default), `None` where it
+/// has none. `at` is the path of an open descriptor ([`Opened::at`]).
+fn get(at: &CStr, name: &str) -> std::io::Result<Option<Acl>> {
     let name = CString::new(name).expect("no NUL");
     let mut buf = vec![0u8; 512];
     loop {
         // SAFETY: a NUL-terminated path and name, and a buffer of its length.
         let n = unsafe {
-            libc::lgetxattr(
-                path.as_ptr(),
+            libc::getxattr(
+                at.as_ptr(),
                 name.as_ptr(),
                 buf.as_mut_ptr().cast(),
                 buf.len(),
@@ -334,11 +367,11 @@ fn get(path: &CString, name: &str) -> std::io::Result<Option<Acl>> {
     }
 }
 
-fn set(path: &CString, name: &str, acl: &Acl) -> std::io::Result<()> {
+fn set(at: &CStr, name: &str, acl: &Acl) -> std::io::Result<()> {
     let name = CString::new(name).expect("no NUL");
     let b = acl.bytes();
     // SAFETY: a NUL-terminated path and name, and the bytes with their length.
-    let r = unsafe { libc::lsetxattr(path.as_ptr(), name.as_ptr(), b.as_ptr().cast(), b.len(), 0) };
+    let r = unsafe { libc::setxattr(at.as_ptr(), name.as_ptr(), b.as_ptr().cast(), b.len(), 0) };
     if r == 0 {
         Ok(())
     } else {
@@ -346,10 +379,10 @@ fn set(path: &CString, name: &str, acl: &Acl) -> std::io::Result<()> {
     }
 }
 
-fn remove(path: &CString, name: &str) -> std::io::Result<()> {
+fn remove(at: &CStr, name: &str) -> std::io::Result<()> {
     let name = CString::new(name).expect("no NUL");
     // SAFETY: a NUL-terminated path and name.
-    let r = unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) };
+    let r = unsafe { libc::removexattr(at.as_ptr(), name.as_ptr()) };
     if r == 0 {
         return Ok(());
     }
@@ -360,6 +393,83 @@ fn remove(path: &CString, name: &str) -> std::io::Result<()> {
     Err(e)
 }
 
+/// A file or folder opened without following it (`O_PATH`), and what it
+/// was when it was opened.
+struct Opened {
+    file: std::fs::File,
+    m: std::fs::Metadata,
+}
+
+impl Opened {
+    /// A path that leads to this very file, whatever is done to its own
+    /// path meanwhile.
+    fn path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    fn at(&self) -> CString {
+        CString::new(self.path().into_os_string().into_vec()).expect("no NUL")
+    }
+
+    /// The names in the folder.
+    fn names(&self) -> std::io::Result<Vec<OsString>> {
+        std::fs::read_dir(self.path())?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect()
+    }
+}
+
+/// Opens the entry `name` of the folder `dir` without following it.
+fn open_in(dir: libc::c_int, name: &CStr) -> std::io::Result<Opened> {
+    // Through libc, not `OpenOptions`: on musl the standard library takes
+    // O_PATH out of the flags (crate::service's `chown_entry` says more).
+    // SAFETY: a NUL-terminated name; the new descriptor is owned below.
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh descriptor nothing else owns.
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let m = file.metadata()?;
+    Ok(Opened { file, m })
+}
+
+/// Opens the absolute path `p` a folder at a time, following no link on
+/// the way. The grants' paths are real ones (crate::exec::folder_sets), so a
+/// link on the way came later, and a command may have put it there. The
+/// last part is opened as it is: a link there is the caller's to see.
+fn open_path(p: &Path) -> std::io::Result<Opened> {
+    let bad = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, why.to_string());
+    let mut parts = p.components();
+    if parts.next() != Some(Component::RootDir) {
+        return Err(bad("not an absolute path"));
+    }
+    let mut at = open_in(libc::AT_FDCWD, c"/")?;
+    let mut so_far = PathBuf::from("/");
+    for part in parts {
+        let Component::Normal(name) = part else {
+            return Err(bad("not a plain path"));
+        };
+        if !at.m.is_dir() {
+            return Err(std::io::Error::other(format!(
+                "{} is a link or a file now, which it was not when the folder was given; nothing below it was changed",
+                so_far.display()
+            )));
+        }
+        let name = CString::new(name.as_bytes()).map_err(|_| bad("a NUL in the path"))?;
+        at = open_in(at.file.as_raw_fd(), &name)?;
+        so_far.push(part);
+    }
+    Ok(at)
+}
+
+#[cfg(test)]
 fn c_path(p: &Path) -> std::io::Result<CString> {
     CString::new(p.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a NUL in the path"))
@@ -387,30 +497,34 @@ pub struct Who {
     pub owner: u32,
 }
 
-/// Gives `who.run` on `path` the access entry `perm` (`None` takes it off),
-/// and on a folder the default entries for it and the owner. A file that
-/// is not the owner's is left alone. Says whether it changed anything.
-fn put(path: &Path, m: &std::fs::Metadata, who: Who, perm: Option<u16>) -> std::io::Result<bool> {
-    let c = c_path(path)?;
+/// Gives `who.run` on the opened `o` the access entry `perm` (`None` takes
+/// it off), and on a folder the default entries for it and the owner. On a
+/// folder that is not the owner's (`mine`), only taken off, the owner's
+/// default entry stays: it came from the default entries above. Says
+/// whether it changed anything.
+fn put(o: &Opened, who: Who, perm: Option<u16>, mine: bool) -> std::io::Result<bool> {
+    let at = o.at();
     let mut changed = false;
-    let mut acl = get(&c, ACCESS)?.unwrap_or_else(|| Acl::of_mode(m.mode()));
+    let mut acl = get(&at, ACCESS)?.unwrap_or_else(|| Acl::of_mode(o.m.mode()));
     if acl.user(who.run) != perm {
         acl.set_user(who.run, perm);
-        set(&c, ACCESS, &acl)?;
+        set(&at, ACCESS, &acl)?;
         changed = true;
     }
-    if m.is_dir() {
-        let before = get(&c, DEFAULT)?;
-        let mut d = before.clone().unwrap_or_else(|| Acl::of_mode(m.mode()));
+    if o.m.is_dir() {
+        let before = get(&at, DEFAULT)?;
+        let mut d = before.clone().unwrap_or_else(|| Acl::of_mode(o.m.mode()));
         d.set_user(who.run, perm);
-        d.set_user(who.owner, perm.map(|_| R | W | X));
+        if mine {
+            d.set_user(who.owner, perm.map(|_| R | W | X));
+        }
         if !d.has_named() {
             if before.is_some() {
-                remove(&c, DEFAULT)?;
+                remove(&at, DEFAULT)?;
                 changed = true;
             }
         } else if before.as_ref() != Some(&d) {
-            set(&c, DEFAULT, &d)?;
+            set(&at, DEFAULT, &d)?;
             changed = true;
         }
     }
@@ -419,13 +533,19 @@ fn put(path: &Path, m: &std::fs::Metadata, who: Who, perm: Option<u16>) -> std::
 
 /// Gives or takes the pass-through entry (`--x`) of a folder above a grant.
 fn pass(path: &Path, who: Who, on: bool) -> std::io::Result<()> {
-    let c = c_path(path)?;
-    let m = std::fs::symlink_metadata(path)?;
-    let mut acl = get(&c, ACCESS)?.unwrap_or_else(|| Acl::of_mode(m.mode()));
+    let o = open_path(path)?;
+    if !o.m.is_dir() {
+        return Err(std::io::Error::other("it is no folder now"));
+    }
+    if on && o.m.uid() != who.owner {
+        return Err(std::io::Error::other("it is not yours now"));
+    }
+    let at = o.at();
+    let mut acl = get(&at, ACCESS)?.unwrap_or_else(|| Acl::of_mode(o.m.mode()));
     let want = on.then_some(X);
     if acl.user(who.run) != want {
         acl.set_user(who.run, want);
-        set(&c, ACCESS, &acl)?;
+        set(&at, ACCESS, &acl)?;
     }
     Ok(())
 }
@@ -441,36 +561,83 @@ fn covering(all: &[Granted], path: &Path) -> Access {
     a
 }
 
+#[cfg(test)]
+type Hook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs in [`walk`] after an entry was changed and before its folder is
+    /// read: a test changes the tree there, as a command may meanwhile.
+    static CHANGED: std::cell::RefCell<Option<Hook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Brings the entries below `root` in line with `all` (what every grant now
 /// gives there), walking it without following links or leaving its file
-/// system. Errors go to `report`; the walk goes on.
-fn walk(root: &Path, all: &[Granted], who: Who, report: &mut Report) -> bool {
-    let top = match std::fs::symlink_metadata(root) {
-        Ok(m) => m,
+/// system. Only the owner's files are changed; with `everyone` (root at
+/// `uninstall`, `all` empty) the entries of `who.run` come off anyone's.
+/// Errors go to `report`; the walk goes on. Says whether all went well.
+fn walk(root: &Path, all: &[Granted], who: Who, everyone: bool, report: &mut Report) -> bool {
+    let top = match open_path(root) {
+        Ok(o) => o,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
         Err(e) => {
             report.errors.push(failed(root, &e));
             return false;
         }
     };
-    let dev = top.dev();
+    let dev = top.m.dev();
     let mut whole = true;
-    let mut stack = vec![(root.to_path_buf(), top)];
-    while let Some((path, m)) = stack.pop() {
-        let ft = m.file_type();
-        if ft.is_symlink() || m.dev() != dev || !(ft.is_dir() || ft.is_file()) {
+    // The entries of a folder are opened when their turn comes, from the
+    // folder's descriptor, so only the folders on the way are held open.
+    let mut stack: Vec<(Rc<Opened>, OsString, PathBuf)> = Vec::new();
+    let mut next = Some((root.to_path_buf(), top));
+    loop {
+        let (path, o) = match next.take() {
+            Some(n) => n,
+            None => {
+                let Some((dir, name, path)) = stack.pop() else {
+                    break;
+                };
+                let Ok(c) = CString::new(name.as_bytes()) else {
+                    continue;
+                };
+                match open_in(dir.file.as_raw_fd(), &c) {
+                    Ok(o) => (path, o),
+                    // Gone meanwhile.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        report.errors.push(failed(&path, &e));
+                        whole = false;
+                        continue;
+                    }
+                }
+            }
+        };
+        let ft = o.m.file_type();
+        if ft.is_symlink() || o.m.dev() != dev || !(ft.is_dir() || ft.is_file()) {
             report.skipped += 1;
             continue;
         }
-        let mine = m.uid() == who.owner;
-        if mine && !(ft.is_file() && m.nlink() > 1) {
-            let a = covering(all, &path);
+        let mine = o.m.uid() == who.owner;
+        if mine || everyone {
+            // A file with a second name may lie outside the grant: it gets
+            // no entry, and one it has comes off.
+            let twin = ft.is_file() && o.m.nlink() > 1;
+            let a = if twin || !mine {
+                Access::NONE
+            } else {
+                covering(all, &path)
+            };
             let perm = if ft.is_dir() {
                 dir_perm(a)
             } else {
-                file_perm(a, m.mode())
+                file_perm(a, o.m.mode())
             };
-            if let Err(e) = put(&path, &m, who, (perm != 0).then_some(perm)) {
+            if twin {
+                report.skipped += 1;
+            }
+            if let Err(e) = put(&o, who, (perm != 0).then_some(perm), mine) {
                 report.errors.push(failed(&path, &e));
                 whole = false;
                 if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
@@ -480,17 +647,23 @@ fn walk(root: &Path, all: &[Granted], who: Who, report: &mut Report) -> bool {
         } else {
             report.skipped += 1;
         }
+        #[cfg(test)]
+        CHANGED.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f(&path)
+            }
+        });
         if ft.is_dir() {
-            match std::fs::read_dir(&path) {
-                Ok(entries) => {
-                    for e in entries.flatten() {
-                        if let Ok(em) = e.metadata() {
-                            stack.push((e.path(), em));
-                        }
+            match o.names() {
+                Ok(names) => {
+                    let dir = Rc::new(o);
+                    for n in names {
+                        let p = path.join(&n);
+                        stack.push((dir.clone(), n, p));
                     }
                 }
                 // Another account's folder the owner may not read.
-                Err(_) if !mine => {}
+                Err(_) if !mine && !everyone => {}
                 Err(e) => {
                     report.errors.push(failed(&path, &e));
                     whole = false;
@@ -503,8 +676,13 @@ fn walk(root: &Path, all: &[Granted], who: Who, report: &mut Report) -> bool {
 
 /// The folders above the grants of `all` that `who.run` must pass through:
 /// the owner's that others may not enter and that no grant covers. A folder
-/// of anyone else's that it cannot enter makes its grant fail.
-fn traverse(all: &[Granted], who: Who, report: &mut Report) -> Vec<PathBuf> {
+/// of anyone else's that it cannot enter makes its grant fail (`missed`).
+fn traverse(
+    all: &[Granted],
+    who: Who,
+    report: &mut Report,
+    missed: &mut Vec<PathBuf>,
+) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for g in all {
         for dir in g.path.ancestors().skip(1) {
@@ -514,13 +692,14 @@ fn traverse(all: &[Granted], who: Who, report: &mut Report) -> Vec<PathBuf> {
             if all.iter().any(|o| within(dir, &o.path)) || out.iter().any(|d| d == dir) {
                 continue;
             }
-            let Ok(m) = std::fs::metadata(dir) else {
+            // A link on the way makes the grant's own walk fail.
+            let Ok(o) = open_path(dir) else {
                 continue;
             };
-            if m.mode() & 0o001 != 0 {
+            if !o.m.is_dir() || o.m.mode() & 0o001 != 0 {
                 continue;
             }
-            if m.uid() == who.owner {
+            if o.m.uid() == who.owner {
                 out.push(dir.to_path_buf());
             } else {
                 report.errors.push(format!(
@@ -528,6 +707,7 @@ fn traverse(all: &[Granted], who: Who, report: &mut Report) -> Vec<PathBuf> {
                     g.path.display(),
                     dir.display()
                 ));
+                missed.push(g.path.clone());
             }
         }
     }
@@ -536,11 +716,12 @@ fn traverse(all: &[Granted], who: Who, report: &mut Report) -> Vec<PathBuf> {
 }
 
 /// Brings the entries of `who.run` in line with `want`, after the record in
-/// `file`: the grants that changed are walked again, the ones that went are
-/// taken off, the pass-through folders follow. The record is written
-/// last, with what is on now, so a sync that stopped half way is done again
-/// next time. Runs as the owner (crate::account::FsAs), but for the record,
-/// which `write` writes as the node.
+/// `file`: the grants that changed are walked again, and so are the ones
+/// that failed last time, the ones that went are taken off, the
+/// pass-through folders follow. The record is written last, with what is on
+/// now, so a sync that stopped half way is done again next time. Runs as the
+/// owner (crate::account::FsAs), but for the record, which `write` writes as
+/// the node.
 pub fn sync(
     file: &Path,
     want: &[Granted],
@@ -563,9 +744,9 @@ pub fn sync(
     let mut kept = Record {
         uid: who.run,
         owner: who.owner,
-        grants: Vec::new(),
-        traverse: Vec::new(),
+        ..Record::default()
     };
+    let mut missed: Vec<PathBuf> = Vec::new();
     {
         let _as = match act_as() {
             Ok(a) => a,
@@ -583,7 +764,7 @@ pub fn sync(
                 owner: before.owner,
             };
             for g in &before.grants {
-                if !walk(&g.path, &[], gone, &mut report) {
+                if !walk(&g.path, &[], gone, false, &mut report) {
                     report.stale.push(g.path.clone());
                 }
             }
@@ -596,17 +777,26 @@ pub fn sync(
             }
         }
         let had = if old_uid { &[][..] } else { &before.grants[..] };
-        // A grant is walked when it is new, changed or gone.
+        let retry = if old_uid { &[][..] } else { &before.failed[..] };
+        // A grant is walked when it is new, changed, failed last time or
+        // gone.
         let mut roots: Vec<&Path> = Vec::new();
-        for g in want.iter().filter(|g| !had.contains(g)) {
+        for g in want
+            .iter()
+            .filter(|g| !had.contains(g) || retry.contains(&g.path))
+        {
             roots.push(&g.path);
         }
         for g in had.iter().filter(|g| !want.contains(g)) {
             roots.push(&g.path);
         }
         for root in roots {
-            let ok = walk(root, want, who, &mut report);
-            if !ok && !want.iter().any(|g| g.path == root) {
+            if walk(root, want, who, false, &mut report) {
+                continue;
+            }
+            if want.iter().any(|g| g.path == root) {
+                missed.push(root.to_path_buf());
+            } else {
                 report.stale.push(root.to_path_buf());
             }
         }
@@ -620,15 +810,29 @@ pub fn sync(
                 });
             }
         }
-        let now = traverse(want, who, &mut report);
+        let now = traverse(want, who, &mut report, &mut missed);
         let had_pass = if old_uid {
             &[][..]
         } else {
             &before.traverse[..]
         };
-        for d in now.iter().filter(|d| !had_pass.contains(d)) {
-            if let Err(e) = pass(d, who, true) {
-                report.errors.push(failed(d, &e));
+        for d in &now {
+            if had_pass.contains(d) {
+                kept.traverse.push(d.clone());
+                continue;
+            }
+            match pass(d, who, true) {
+                Ok(()) => kept.traverse.push(d.clone()),
+                Err(e) => {
+                    report.errors.push(failed(d, &e));
+                    // The grants below it are out of reach; it is tried
+                    // again with them.
+                    missed.extend(
+                        want.iter()
+                            .filter(|g| within(&g.path, d))
+                            .map(|g| g.path.clone()),
+                    );
+                }
             }
         }
         for d in had_pass.iter().filter(|d| !now.contains(d)) {
@@ -645,8 +849,11 @@ pub fn sync(
                 }
             }
         }
-        kept.traverse.extend(now);
     }
+    missed.sort();
+    missed.dedup();
+    kept.failed = missed.clone();
+    report.failed = missed;
     if let Err(e) = write_record(file, &kept) {
         report.errors.push(e);
     }
@@ -654,17 +861,25 @@ pub fn sync(
 }
 
 /// Whether the record in `file` is behind `want`: a sync has something to
-/// do. Cheap: it reads the record, nothing else.
-pub fn behind(file: &Path, want: &[Granted], who: Who) -> bool {
+/// do. With `retry`, a grant that failed last time counts too. Cheap: it
+/// reads the record, nothing else.
+pub fn behind(file: &Path, want: &[Granted], who: Who, retry: bool) -> bool {
     match read_record(file) {
-        Ok(Some(r)) => r.uid != who.run || r.owner != who.owner || r.grants != want,
+        Ok(Some(r)) => {
+            r.uid != who.run
+                || r.owner != who.owner
+                || r.grants != want
+                || (retry && !r.failed.is_empty())
+        }
         Ok(None) => !want.is_empty(),
         Err(_) => true,
     }
 }
 
 /// Takes every entry the record in `file` names off again: `uninstall`, as
-/// root, which may change any file. The record goes once all are off.
+/// root, which may change any file. Also those on files `nerve-run` made
+/// there, which are its own: its uid is freed next, and the next account to
+/// get it must not have them. The record goes once all are off.
 pub fn remove_all(file: &Path) -> Report {
     let mut report = Report::default();
     let r = match read_record(file) {
@@ -680,7 +895,7 @@ pub fn remove_all(file: &Path) -> Report {
         owner: r.owner,
     };
     for g in &r.grants {
-        if !walk(&g.path, &[], who, &mut report) {
+        if !walk(&g.path, &[], who, true, &mut report) {
             report.stale.push(g.path.clone());
         }
     }
@@ -821,10 +1036,10 @@ mod tests {
             .unwrap();
         let file = root.join("acl.json");
         let want = [grant(&work, "rw")];
-        assert!(behind(&file, &want, who()));
+        assert!(behind(&file, &want, who(), false));
         let r = sync(&file, &want, who(), &none);
         assert_eq!(r.errors, Vec::<String>::new());
-        assert!(!behind(&file, &want, who()));
+        assert!(!behind(&file, &want, who(), false));
         assert_eq!(rights(&work, RUN), Some(R | W | X));
         assert_eq!(rights(&work.join("sub"), RUN), Some(R | W | X));
         assert_eq!(rights(&work.join("a.txt"), RUN), Some(R | W));
@@ -854,7 +1069,7 @@ mod tests {
         assert_eq!(acl_of(&work, DEFAULT), None);
         assert_eq!(acl_of(&work.join("a.txt"), ACCESS), None);
         assert_eq!(mode(&work.join("a.txt")), 0o640);
-        assert!(!behind(&file, &[], who()));
+        assert!(!behind(&file, &[], who(), false));
     }
 
     /// A folder two pairings share keeps the account's entry while one
@@ -962,9 +1177,220 @@ mod tests {
             run: RUN + 1,
             ..who()
         };
-        assert!(behind(&file, &want, next));
+        assert!(behind(&file, &want, next, false));
         assert!(sync(&file, &want, next, &none).errors.is_empty());
         assert_eq!(rights(&work, RUN), None);
         assert_eq!(rights(&work, RUN + 1), Some(R | X));
+    }
+
+    /// A folder that a command swaps for a link while the walk is in it is
+    /// not followed: what the link leads to gets no entry.
+    #[test]
+    fn a_folder_swapped_for_a_link_during_the_walk_is_not_followed() {
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::create_dir_all(outside.join("deeper")).unwrap();
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        let sub = work.join("sub");
+        let (at, to) = (sub.clone(), outside.clone());
+        CHANGED.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |p: &Path| {
+                if p == at {
+                    std::fs::rename(&at, at.with_file_name("sub.old")).unwrap();
+                    std::os::unix::fs::symlink(&to, &at).unwrap();
+                }
+            }))
+        });
+        let file = root.join("acl.json");
+        let r = sync(&file, &[grant(&work, "rw")], who(), &none);
+        CHANGED.with(|h| *h.borrow_mut() = None);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert!(std::fs::symlink_metadata(&sub).unwrap().is_symlink());
+        for p in [&outside, &outside.join("secret"), &outside.join("deeper")] {
+            assert_eq!(rights(p, RUN), None, "{p:?}");
+            assert_eq!(acl_of(p, DEFAULT), None, "{p:?}");
+        }
+        // The folder itself, moved within the grant, has its entry.
+        assert_eq!(rights(&work.join("sub.old"), RUN), Some(R | W | X));
+    }
+
+    /// A link put on the way to a granted folder since it was given (inside
+    /// another grant a command may write) makes its grant fail, and what it
+    /// leads to gets no entry.
+    #[test]
+    fn a_link_on_the_way_to_a_grant_is_not_followed() {
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let deep = work.join("inner/deep");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::write(outside.join("deep/secret"), "s").unwrap();
+        let file = root.join("acl.json");
+        let r = sync(&file, &[grant(&work, "r"), grant(&deep, "r")], who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        std::fs::rename(work.join("inner"), work.join("inner.old")).unwrap();
+        std::os::unix::fs::symlink(&outside, work.join("inner")).unwrap();
+        // The inner grant changes, so it is walked again.
+        let want = [grant(&work, "r"), grant(&deep, "rw")];
+        let r = sync(&file, &want, who(), &none);
+        assert_eq!(r.failed, vec![deep.clone()], "{r:?}");
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("is a link or a file now")),
+            "{r:?}"
+        );
+        for p in [
+            &outside,
+            &outside.join("deep"),
+            &outside.join("deep/secret"),
+        ] {
+            assert_eq!(rights(p, RUN), None, "{p:?}");
+            assert_eq!(acl_of(p, DEFAULT), None, "{p:?}");
+        }
+    }
+
+    /// A file that got a second name after it had its entry (a command may
+    /// link a file it may write to a place outside the grant) loses the
+    /// entry when the grant goes.
+    #[test]
+    fn a_revoke_takes_the_entry_off_a_file_with_a_second_name() {
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(work.join("f"), "f").unwrap();
+        let file = root.join("acl.json");
+        assert!(
+            sync(&file, &[grant(&work, "rw")], who(), &none)
+                .errors
+                .is_empty()
+        );
+        assert_eq!(rights(&work.join("f"), RUN), Some(R | W));
+        std::fs::hard_link(work.join("f"), outside.join("twin")).unwrap();
+        let r = sync(&file, &[], who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert_eq!(rights(&outside.join("twin"), RUN), None);
+    }
+
+    /// `uninstall` takes the entries off the files `nerve-run` made in a
+    /// grant as well, which are not the owner's: here the test's own files
+    /// stand for them, under a record that names another owner.
+    #[test]
+    fn remove_all_takes_the_entries_off_what_nerve_run_made() {
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let file = root.join("acl.json");
+        assert!(
+            sync(&file, &[grant(&work, "rw")], who(), &none)
+                .errors
+                .is_empty()
+        );
+        // Made below the grant: the default entries give it the account's.
+        let made = work.join("made");
+        std::fs::create_dir(&made).unwrap();
+        std::fs::write(made.join("f"), "f").unwrap();
+        assert!(rights(&made, RUN).is_some());
+        assert!(acl_of(&made, DEFAULT).and_then(|a| a.user(RUN)).is_some());
+        // The owner is someone else now: these files are another account's.
+        let mut rec = read_record(&file).unwrap().unwrap();
+        rec.owner = uid() + 1;
+        write_record(&file, &rec).unwrap();
+        let r = remove_all(&file);
+        assert!(r.errors.is_empty() && r.stale.is_empty(), "{r:?}");
+        for p in [&work, &made, &made.join("f")] {
+            assert_eq!(rights(p, RUN), None, "{p:?}");
+        }
+        assert_eq!(acl_of(&made, DEFAULT).and_then(|a| a.user(RUN)), None);
+        // The default entry of the owner it came with stays on the folder.
+        assert!(acl_of(&made, DEFAULT).and_then(|a| a.user(uid())).is_some());
+        assert!(!file.exists());
+    }
+
+    /// A grant that failed (a folder below it closed) stays failed in the
+    /// record, so it is tried again without a change to the config, and
+    /// gets its entries once the folder is open.
+    #[test]
+    fn a_failed_grant_is_tried_again() {
+        if uid() == 0 {
+            return;
+        }
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let closed = work.join("closed");
+        std::fs::create_dir_all(&closed).unwrap();
+        std::fs::write(closed.join("f"), "f").unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let file = root.join("acl.json");
+        let want = [grant(&work, "r")];
+        let r = sync(&file, &want, who(), &none);
+        assert_eq!(r.failed, vec![work.clone()], "{r:?}");
+        assert!(!r.errors.is_empty());
+        // Nothing changed, but the grant is behind when it is time to try.
+        assert!(!behind(&file, &want, who(), false));
+        assert!(behind(&file, &want, who(), true));
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = sync(&file, &want, who(), &none);
+        assert!(r.errors.is_empty() && r.failed.is_empty(), "{r:?}");
+        assert_eq!(rights(&closed.join("f"), RUN), Some(R));
+        assert!(!behind(&file, &want, who(), true));
+    }
+
+    /// Only the pairings whose commands run as `nerve-run` give it their
+    /// folders: not user mode, nor allowlist mode as the owner.
+    #[test]
+    fn the_folders_of_pairings_that_run_as_the_owner_are_not_given() {
+        use nerve_policy::config::{CenterPolicy, Folder, Mode};
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let paths = NodePaths::new(root.join("config"), root.join("state"));
+        let mut cfg = NodeConfig::default();
+        let mut add = |name: &str, mode: Mode, as_owner: bool| {
+            let path = root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            cfg.centers.push(nerve_policy::CenterEntry {
+                name: name.into(),
+                url: "https://center.example".into(),
+                pin: None,
+                center_id: "c".into(),
+                node_id: name.into(),
+                settings: Default::default(),
+                paused: false,
+                revoked: false,
+                unknown: false,
+                public_key: None,
+                key_rotations: 0,
+                pin_rotations: 0,
+                old_pin: None,
+                policy: CenterPolicy {
+                    mode,
+                    as_owner,
+                    folders: vec![Folder {
+                        path: path.display().to_string(),
+                        access: Access::parse("rw").unwrap(),
+                    }],
+                    ..Default::default()
+                },
+            });
+        };
+        add("folder", Mode::Folder, false);
+        add("allow", Mode::Allowlist, false);
+        add("user", Mode::User, false);
+        add("owner", Mode::Allowlist, true);
+        let got: Vec<PathBuf> = wanted(&cfg, &paths, &root, 0)
+            .into_iter()
+            .map(|g| g.path)
+            .collect();
+        assert_eq!(got, vec![root.join("allow"), root.join("folder")]);
     }
 }

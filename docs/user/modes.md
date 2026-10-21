@@ -214,10 +214,23 @@ and no other groups; `uninstall` removes both.
   everything below it, with the rights of its flags, and a default entry, so
   that what it makes there stays yours to use as well. A folder of yours
   above a grant that others may not enter gets an entry that lets it pass
-  through and nothing more. Removing the grant takes the entries off again.
-  `ls -l` shows a `+` on such files, and their group bits show the ACL's
-  mask. The account is one for all pairings, so its entries are the union of
-  every pairing's folders; Landlock holds each command to its own pairing's.
+  through and nothing more. Removing the grant takes the entries off your
+  files again. `ls -l` shows a `+` on such files, and their group bits show
+  the ACL's mask. The account is one for all pairings, so its entries are the
+  union of the folders of every pairing whose commands run as `nerve-run`;
+  Landlock holds each command to its own pairing's. A pairing in `user` mode,
+  or in `allowlist` mode as you, gives `nerve-run` none of its folders.
+- What `nerve-run` made in a granted folder is its own, and keeps its entries
+  when you remove the grant: you cannot change another account's files, and
+  `nerve-run` may do anything with its own files whatever their entries say.
+  It can no longer get to them through your folders above, which lost its
+  entry, unless those folders are open to everyone (see `chmod 750 ~`
+  below). Files you put into such a folder later get its entry from the
+  folder's default entries. `uninstall` takes every entry off, also those.
+- A grant that fails (a folder below it closed to you, a file system without
+  ACLs) is named by `folder add` and `folder set` and in `nerve-node status`,
+  also after a restart, and is tried again: at the node's start, with the
+  next change of the folders, and at most once a minute before a command.
 - It always has `/tmp`, `/var/tmp` and its home, to read, write and run
   programs in. Its tools keep their caches and configs in its home: `HOME`
   and the `XDG_*` folders point there.
@@ -229,9 +242,13 @@ and no other groups; `uninstall` removes both.
   are not on its way. Install them system-wide, grant their folder with `r`
   and `x`, or install them for `nerve-run` in its home.
 - The node changes only your own files: a file of another account below a
-  grant, a file with a second name (a hard link), a link, and what lies on
-  another file system below the grant get no entry. A file system without
-  ACLs refuses them, and `nerve-node status` names the folder.
+  grant, a link, and what lies on another file system below the grant get no
+  entry. A file with a second name (a hard link) gets none either, and loses
+  one it had. A file system without ACLs refuses them, and `nerve-node
+  status` names the folder.
+- A link that is put on the way to a granted folder after you gave it, or in
+  place of a folder below it, is not followed: that grant fails until its
+  path is a plain folder again.
 - A file a command makes private (mode 0600 or 0700) stays its own: the ACL
   mask hides your entry then. If you narrow a file's group bits later
   (`chmod g-w`), `nerve-run` loses that right too.

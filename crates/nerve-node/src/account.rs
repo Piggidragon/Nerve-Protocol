@@ -4,8 +4,8 @@
 //! of `folder` mode, and of `allowlist` mode unless the pairing says
 //! otherwise, runs as [`RUN_USER`], an account of its own that `install`
 //! makes, with a home of its own and the folders the owner grants it
-//! (crate::acl); a command of `user` mode runs as the owner
-//! (`machine.owner`, the account that ran `install`). On Windows every
+//! (crate::acl); a command of `user` mode runs as the owner (the account
+//! that ran `install`, which the service unit names). On Windows every
 //! command runs as the owner, folder mode in an AppContainer. To switch to
 //! the account the service keeps CAP_SETUID and CAP_SETGID, the one
 //! privilege it has, and every command it starts drops both before it runs.
@@ -51,11 +51,11 @@ pub fn built_in(home: &Path) -> Vec<Folder> {
 /// What a command of the installed node gets that would run as the owner
 /// while the node has none.
 #[cfg(not(windows))]
-pub const NO_OWNER: &str = "this node has no owner (machine.owner), as `install` ran as root and not through sudo: commands of user mode, and of allowlist mode as the owner, run as the owner, so none runs; run `sudo nerve-node install` again from the owner's own account";
+pub const NO_OWNER: &str = "this node has no owner, as `install` ran as root and not through sudo: commands of user mode, and of allowlist mode as the owner, run as the owner, so none runs; run `sudo nerve-node install` again from the owner's own account";
 /// What a command of the installed node gets while it has no owner: on
 /// Windows `install` takes it, with its password.
 #[cfg(windows)]
-pub const NO_OWNER: &str = "this node runs commands as its owner's account, and has none: `nerve-node install`, run again as administrator by that account, sets it (machine.owner)";
+pub const NO_OWNER: &str = "this node runs commands as its owner's account, and has none: `nerve-node install`, run again as administrator by that account, sets it (machine.user)";
 
 /// How `install` ends the line saying that it set no account for the
 /// commands on Windows; the desktop app says it in its own words.
@@ -174,7 +174,8 @@ fn plain(program: &str) -> std::process::Command {
 
 /// The account a pairing's command runs as on the node: `as_owner` for one
 /// that runs as the owner (crate::daemon::Shared::command_account), with
-/// `owner` the node's `machine.owner`. `None` runs it as the node's own
+/// `owner` the node's owner (on Linux the account the service unit names,
+/// on Windows `machine.user`). `None` runs it as the node's own
 /// user, as a node that a person runs does with every command. The
 /// installed service (`service`: its folders or its user, however it was
 /// started) runs none as itself, since it owns the keys, and none at all
@@ -209,7 +210,13 @@ pub fn for_commands(
     };
     let a = lookup(name)?.ok_or_else(|| {
         if as_owner {
-            format!("the owner's account {name} (machine.owner) does not exist on this machine")
+            if cfg!(windows) {
+                format!("the owner's account {name} (machine.user) does not exist on this machine")
+            } else {
+                format!(
+                    "the owner's account {name}, which the service unit names (NERVE_NODE_OWNER), does not exist on this machine; run `sudo nerve-node install` again from the owner's own account"
+                )
+            }
         } else {
             format!(
                 "the account {name} that commands run as does not exist on this machine; `sudo nerve-node install` makes it again"

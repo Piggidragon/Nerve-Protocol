@@ -881,12 +881,12 @@ pub fn install_asking(
     let r = install_steps(layout, sys, keyring, input, exe, invoker, &mut steps);
     audit(&layout.paths, "install", &steps.done, &r, steps.out);
     r?;
-    let _ = writeln!(
-        steps.out,
-        "Next: `nerve-node center add '<link>'` pairs the node with a center, and `nerve-node folder add <folder> +rw` gives it a folder."
-    );
+    let _ = writeln!(steps.out, "{NEXT}");
     Ok(())
 }
+
+/// What `install` says to do next: the headless way to a working pairing.
+const NEXT: &str = "Next: `nerve-node center add '<link>'` pairs the node with a center, and `nerve-node folder add <folder> +rwx` gives it a folder to read, write and run commands in.";
 
 fn install_steps(
     layout: &Layout,
@@ -3692,5 +3692,23 @@ pub(crate) mod tests {
         let s = unit_state_of("ActiveState=activating\n");
         assert_eq!((s.state.as_str(), s.enabled), ("starting", None));
         assert_eq!(unit_state_of("ActiveState=inactive").state, "stopped");
+    }
+
+    /// The folder `install` says to give is one the center's commands can
+    /// run in: folder mode needs `x` on a command's working folder.
+    #[test]
+    fn the_folder_install_suggests_lets_commands_run() {
+        let rights: Vec<String> = NEXT
+            .split("folder add <folder> ")
+            .nth(1)
+            .unwrap()
+            .split('`')
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let a = crate::folder_change::FolderChange::new_rights(&rights).unwrap();
+        assert!(a.read && a.write && a.execute, "{a:?}");
     }
 }

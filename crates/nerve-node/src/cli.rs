@@ -118,7 +118,7 @@ pub enum Cmd {
     Panic,
     /// Let the node work again after `panic`.
     Unlock,
-    /// Install the node as a service that starts with the machine and runs under a user of its own (Linux as root, Windows as administrator).
+    /// Install the node as a service that starts with the machine and runs under a user of its own, make the account nerve-run for its commands and take you as the owner (Linux with sudo from your own account, Windows as administrator).
     Install,
     /// Name the node, choose where it keeps its keys, pair the first center and choose its mode and folder, one question at a time.
     Setup,
@@ -131,7 +131,7 @@ pub enum Cmd {
     /// Start, stop or restart the installed service, or show its state.
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// Stop and remove the service, its user and the program; the config and state folders stay.
+    /// Stop and remove the service, nerve-run and its entries on your folders, the node's user and the program; the config and state folders stay.
     Uninstall {
         /// Delete the config and state folders too: the keys, the pairings and the audit log.
         #[arg(long)]
@@ -319,7 +319,7 @@ pub enum CapCmd {
 
 #[derive(Debug, Subcommand, Clone, Copy)]
 pub enum ServiceCmd {
-    /// Start the installed service; an owner of the node needs no root or administrator for it.
+    /// Start the installed service; the owner needs no root or administrator for it.
     Start,
     /// Stop it: the node ends its links and runs nothing until it starts again, at the latest with the machine.
     Stop,
@@ -2001,6 +2001,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                         .into(),
                 );
             }
+            tell_grants(&paths, out).await;
             Ok(())
         }
         Cmd::Folder(FolderCmd::Rm { path, center }) => {
@@ -2010,6 +2011,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             })
             .await?;
             w(out, format!("{}: removed {}", a.center, a.path));
+            tell_grants(&paths, out).await;
             Ok(())
         }
         Cmd::Folder(FolderCmd::Ls { center }) => {
@@ -2666,14 +2668,15 @@ async fn add_folder(
                 v["stored"].as_str().unwrap_or(&given).to_string(),
                 v["recorded"] == true,
                 v["mode"].as_str().map(str::to_string),
+                v["counts"].as_bool(),
             )),
             Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
             Err(e) => return Err(e),
         }
     };
     #[cfg(not(unix))]
-    let asked: Option<(String, bool, Option<String>)> = None;
-    let (stored, recorded, mode) = match asked {
+    let asked: Option<(String, bool, Option<String>, Option<bool>)> = None;
+    let (stored, recorded, mode, counts) = match asked {
         Some(a) => a,
         None => {
             // No node to ask (on Windows the node's pipe takes the change but
@@ -2692,7 +2695,7 @@ async fn add_folder(
                 recorded,
             };
             let a = change_folder(paths, center, &change).await?;
-            (stored, recorded, Some(a.mode.as_str().to_string()))
+            (stored, recorded, Some(a.mode.as_str().to_string()), None)
         }
     };
     w(
@@ -2712,15 +2715,49 @@ async fn add_folder(
             format!("note: {given} leads to {stored}; the folder is stored there"),
         );
     }
-    if let Some(mode) = mode.filter(|m| m != Mode::Folder.as_str()) {
+    // The running node says whether the folders hold the center's commands
+    // (also allowlist mode as nerve-run); without one, folder mode alone is
+    // sure to.
+    let counts = counts.unwrap_or_else(|| mode.as_deref() == Some(Mode::Folder.as_str()));
+    if let Some(mode) = mode.filter(|_| !counts) {
         w(
             out,
             format!(
-                "note: folders count in folder mode; {name} is in {mode} mode (`nerve-node mode set folder`)"
+                "note: folders do not count here: {name} is in {mode} mode, whose commands are not held to them (`nerve-node mode set folder`)"
             ),
         );
     }
+    tell_grants(paths, out).await;
     Ok(())
+}
+
+/// Tells what the running installed Linux node did not manage after a
+/// change of the folders: a grant `nerve-run` did not get, or an entry that
+/// did not come off (crate::acl). The node brings them in line before it
+/// answers. Nothing without such a node.
+async fn tell_grants(paths: &NodePaths, out: &mut dyn Write) {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(v) =
+            nerve_transport::ctl::call(&paths.ctl_socket(), "folder.grants", json!({})).await
+        else {
+            return;
+        };
+        let errors: Vec<&str> = v["errors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        for e in &errors {
+            let _ = writeln!(out, "warning: nerve-run did not get every folder: {e}");
+        }
+        if !errors.is_empty() {
+            json::also("grant_errors", json!(errors));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (paths, out);
 }
 
 /// Whether two folder paths name one place.
@@ -4730,7 +4767,7 @@ mod tests {
             &["folder", "add", folder.to_str().unwrap(), "+rw", "+x"],
         )
         .unwrap();
-        assert!(note.contains("folders count in folder mode"), "{note}");
+        assert!(note.contains("folders do not count here"), "{note}");
         run(&paths, &["cap", "set", "exec.run", "off"]).unwrap();
         run(&paths, &["center", "grant", "settings", "write"]).unwrap();
         run(

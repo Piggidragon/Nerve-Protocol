@@ -16,7 +16,9 @@
 //! it does there; without, `nerve-run` reaches through it whatever below is
 //! open to others, which the node tells (crate::account::home_warning). A
 //! default ACL of the owner's own on a folder below a grant keeps its plain
-//! entries when the grant goes ([`Record::defaults`]). The node
+//! entries and the owner's own entry when the grant goes
+//! ([`Record::defaults`], [`Record::own_entries`]); one the node made goes
+//! ([`Record::made_defaults`]). The node
 //! changes only what the owner owns, acting with the owner's file system
 //! ids (crate::account::FsAs): a file of anyone else's is left as it is, and
 //! so is a link and what lies on another file system below a grant. A file
@@ -254,6 +256,17 @@ pub struct Record {
     /// keeps it too.
     #[serde(default)]
     pub defaults: Vec<PathBuf>,
+    /// The folders among `defaults` whose default ACL had a named entry for
+    /// the owner of the owner's own: the node leaves it as it is, and it
+    /// stays when the grant goes. A folder made later below one of them got
+    /// it from there.
+    #[serde(default)]
+    pub own_entries: Vec<PathBuf>,
+    /// The folders below one of `defaults` that had no default ACL before
+    /// the grant: the one the node made goes again with it, and so does the
+    /// one a folder made later below them got from there.
+    #[serde(default)]
+    pub made_defaults: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,6 +520,24 @@ pub struct Who {
     pub owner: u32,
 }
 
+/// What a folder's default ACL holds of the owner's own, besides the
+/// node's entries: its plain entries (`plain`), and a named entry for the
+/// owner (`entry`). Both stay when the node's entries come off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Own {
+    plain: bool,
+    entry: bool,
+}
+
+/// What [`put`] found and did on a folder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Put {
+    /// What of its default ACL is the owner's own now.
+    own: Own,
+    /// It had no default ACL, and the node made one.
+    made: bool,
+}
+
 /// Gives `who.run` on the opened `o` the access entry `perm` (`None` takes
 /// it off), and on a folder the default entries for it and the owner. On a
 /// folder that is not the owner's (`mine`), only taken off, the owner's
@@ -514,11 +545,11 @@ pub struct Who {
 ///
 /// A default ACL without an entry of `who.run` is not the node's, and is
 /// left as it is where nothing is to be given. Where the node's entries come
-/// off, what is left of it stays if it was the owner's own before (`keep`),
-/// as a default ACL of the plain entries still sets the rights new files
-/// get; one the node made goes. Says whether the folder has a default ACL
-/// of the owner's own ([`Record::defaults`]).
-fn put(o: &Opened, who: Who, perm: Option<u16>, mine: bool, keep: bool) -> std::io::Result<bool> {
+/// off, what is left of it stays as far as it was the owner's own before
+/// (`keep`, [`Own`]), as a default ACL of the plain entries still sets the
+/// rights new files get; one the node made goes. A named entry the owner had
+/// for itself is never changed.
+fn put(o: &Opened, who: Who, perm: Option<u16>, mine: bool, keep: Own) -> std::io::Result<Put> {
     let at = o.at();
     let mut acl = get(&at, ACCESS)?.unwrap_or_else(|| Acl::of_mode(o.m.mode()));
     if acl.user(who.run) != perm {
@@ -526,26 +557,40 @@ fn put(o: &Opened, who: Who, perm: Option<u16>, mine: bool, keep: bool) -> std::
         set(&at, ACCESS, &acl)?;
     }
     if !o.m.is_dir() {
-        return Ok(false);
+        return Ok(Put::default());
     }
     let before = get(&at, DEFAULT)?;
     let theirs = before.as_ref().is_some_and(|b| b.user(who.run).is_none());
+    let own = match &before {
+        Some(b) if theirs => Own {
+            plain: true,
+            entry: b.user(who.owner).is_some(),
+        },
+        Some(_) => keep,
+        None => Own::default(),
+    };
+    let done = Put { own, made: false };
     if perm.is_none() && (before.is_none() || theirs) {
-        return Ok(theirs);
+        return Ok(done);
     }
     let mut d = before.clone().unwrap_or_else(|| Acl::of_mode(o.m.mode()));
     d.set_user(who.run, perm);
-    if mine {
+    if mine && !own.entry {
         d.set_user(who.owner, perm.map(|_| R | W | X));
     }
-    if !d.has_named() && !keep {
+    if !d.has_named() && !own.plain {
         if before.is_some() {
             remove(&at, DEFAULT)?;
         }
     } else if before.as_ref() != Some(&d) {
         set(&at, DEFAULT, &d)?;
     }
-    Ok(theirs || (keep && before.is_some()))
+    // Only below a default ACL of the owner's is that worth a note: else
+    // nothing of it is kept anyway.
+    Ok(Put {
+        made: before.is_none() && perm.is_some() && keep.plain,
+        ..done
+    })
 }
 
 /// Gives the opened `o`, which `who.run` owns, to `to` (uid, gid): what
@@ -613,48 +658,121 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// What the walks know of the folders' default ACLs, kept in the record
+/// ([`Record::defaults`], [`Record::own_entries`], [`Record::made_defaults`]).
+#[derive(Debug, Default)]
+struct Defaults {
+    own: BTreeSet<PathBuf>,
+    entries: BTreeSet<PathBuf>,
+    made: BTreeSet<PathBuf>,
+}
+
+impl Defaults {
+    fn of(r: &Record) -> Defaults {
+        let set = |v: &[PathBuf]| v.iter().cloned().collect();
+        Defaults {
+            own: set(&r.defaults),
+            entries: set(&r.own_entries),
+            made: set(&r.made_defaults),
+        }
+    }
+
+    /// What of the default ACL of `path` is the owner's: as the record
+    /// knows it, else as it came from the folder above (`above`).
+    fn keep(&self, path: &Path, above: Own) -> Own {
+        if self.own.contains(path) {
+            Own {
+                plain: true,
+                entry: self.entries.contains(path),
+            }
+        } else if self.made.contains(path) {
+            Own::default()
+        } else {
+            above
+        }
+    }
+
+    /// What `put` found on `path`, taken in.
+    fn note(&mut self, path: &Path, p: Put, revoked: bool) {
+        let flag = |set: &mut BTreeSet<PathBuf>, on: bool| {
+            if on {
+                set.insert(path.to_path_buf());
+            } else {
+                set.remove(path);
+            }
+        };
+        flag(&mut self.own, p.own.plain);
+        flag(&mut self.entries, p.own.plain && p.own.entry);
+        if p.made {
+            self.made.insert(path.to_path_buf());
+        } else if revoked || p.own.plain {
+            self.made.remove(path);
+        }
+    }
+}
+
+/// How a [`walk`] went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Walked {
+    /// Every change it tried went through.
+    whole: bool,
+    /// It saw everything below its root: it skipped no folder on another
+    /// file system and none the owner may not list. Only then does it stand
+    /// for a grant inside, whose entries could lie there.
+    seen_all: bool,
+}
+
 /// Brings the entries below `root` in line with `all` (what every grant now
 /// gives there), walking it without following links or leaving its file
 /// system. Only the owner's files are changed. With `everyone` (root at
 /// `uninstall`, `all` empty) the entries of `who.run` come off anyone's, and
-/// what `who.run` owns goes to `everyone` (uid, gid). `own` is the set of
-/// [`Record::defaults`], kept up to date. Errors go to `report`; the walk
-/// goes on. Says whether all went well.
+/// what `who.run` owns goes to `everyone` (uid, gid). `defaults` is what is
+/// known of the default ACLs, kept up to date. Errors go to `report`; the
+/// walk goes on.
 fn walk(
     root: &Path,
     all: &[Granted],
     who: Who,
     everyone: Option<(u32, u32)>,
-    own: &mut BTreeSet<PathBuf>,
+    defaults: &mut Defaults,
     report: &mut Report,
-) -> bool {
+) -> Walked {
     let top = match open_path(root) {
         Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Walked {
+                whole: true,
+                seen_all: true,
+            };
+        }
         Err(e) => {
             report.errors.push(failed(root, &e));
-            return false;
+            return Walked {
+                whole: false,
+                seen_all: false,
+            };
         }
     };
     let dev = top.m.dev();
     let mut whole = true;
+    let mut seen_all = true;
     // The entries of a folder are opened when their turn comes, from the
     // folder's descriptor, so only the folders on the way are held open.
-    // With each goes whether its folder kept a default ACL of the owner's.
-    let mut stack: Vec<(Rc<Opened>, OsString, PathBuf, bool)> = Vec::new();
-    let mut next = Some((root.to_path_buf(), top, false));
+    // With each goes what of its folder's default ACL was the owner's.
+    let mut stack: Vec<(Rc<Opened>, OsString, PathBuf, Own)> = Vec::new();
+    let mut next = Some((root.to_path_buf(), top, Own::default()));
     loop {
-        let (path, o, above_own) = match next.take() {
+        let (path, o, above) = match next.take() {
             Some(n) => n,
             None => {
-                let Some((dir, name, path, above_own)) = stack.pop() else {
+                let Some((dir, name, path, above)) = stack.pop() else {
                     break;
                 };
                 let Ok(c) = CString::new(name.as_bytes()) else {
                     continue;
                 };
                 match open_in(dir.file.as_raw_fd(), &c) {
-                    Ok(o) => (path, o, above_own),
+                    Ok(o) => (path, o, above),
                     // Gone meanwhile.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => {
@@ -675,11 +793,14 @@ fn walk(
             whole = false;
         }
         if ft.is_symlink() || o.m.dev() != dev || !(ft.is_dir() || ft.is_file()) {
+            if ft.is_dir() {
+                seen_all = false;
+            }
             report.skipped += 1;
             continue;
         }
         let mine = o.m.uid() == who.owner;
-        let keep = above_own || own.contains(&path);
+        let keep = defaults.keep(&path, above);
         let mut own_here = keep;
         if mine || everyone.is_some() {
             // A file with a second name may lie outside the grant: it gets
@@ -699,20 +820,19 @@ fn walk(
                 report.skipped += 1;
             }
             match put(&o, who, (perm != 0).then_some(perm), mine, keep) {
-                Ok(theirs) if ft.is_dir() => {
-                    own_here = theirs;
-                    if theirs {
-                        own.insert(path.clone());
-                    } else {
-                        own.remove(&path);
-                    }
+                Ok(p) if ft.is_dir() => {
+                    own_here = p.own;
+                    defaults.note(&path, p, perm == 0);
                 }
                 Ok(_) => {}
                 Err(e) => {
                     report.errors.push(failed(&path, &e));
                     whole = false;
                     if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
-                        return false;
+                        return Walked {
+                            whole: false,
+                            seen_all: false,
+                        };
                     }
                 }
             }
@@ -735,15 +855,16 @@ fn walk(
                     }
                 }
                 // Another account's folder the owner may not read.
-                Err(_) if !mine && everyone.is_none() => {}
+                Err(_) if !mine && everyone.is_none() => seen_all = false,
                 Err(e) => {
                     report.errors.push(failed(&path, &e));
                     whole = false;
+                    seen_all = false;
                 }
             }
         }
     }
-    whole
+    Walked { whole, seen_all }
 }
 
 /// The grant among `all` nearest above `path`, which is no grant itself.
@@ -827,7 +948,7 @@ pub fn sync(
         ..Record::default()
     };
     let mut missed: Vec<PathBuf> = Vec::new();
-    let mut own: BTreeSet<PathBuf> = before.defaults.iter().cloned().collect();
+    let mut defaults = Defaults::of(&before);
     {
         let _as = match act_as() {
             Ok(a) => a,
@@ -845,7 +966,7 @@ pub fn sync(
                 owner: before.owner,
             };
             for g in &before.grants {
-                if !walk(&g.path, &[], gone, None, &mut own, &mut report) {
+                if !walk(&g.path, &[], gone, None, &mut defaults, &mut report).whole {
                     report.stale.push(g.path.clone());
                 }
             }
@@ -874,7 +995,7 @@ pub fn sync(
         let mut walked_above: Vec<&Path> = Vec::new();
         for root in roots {
             let errors = report.errors.len();
-            if walk(root, want, who, None, &mut own, &mut report) {
+            if walk(root, want, who, None, &mut defaults, &mut report).whole {
                 continue;
             }
             if want.iter().any(|g| g.path == root) {
@@ -885,9 +1006,14 @@ pub fn sync(
             // out of reach by its path: a command may have put a link on
             // the way there. The folder it was is inside the grant above,
             // wherever it lies now, and a walk of that whole grant gives it
-            // that grant's entries and no more.
+            // that grant's entries and no more, if it saw all of it: on
+            // another file system, or below a folder the owner may not
+            // list, it is left stale.
             if let Some(up) = granted_above(want, root)
-                && (walked_above.contains(&up) || walk(up, want, who, None, &mut own, &mut report))
+                && (walked_above.contains(&up) || {
+                    let w = walk(up, want, who, None, &mut defaults, &mut report);
+                    w.whole && w.seen_all
+                })
             {
                 report.errors.truncate(errors);
                 walked_above.push(up);
@@ -947,10 +1073,14 @@ pub fn sync(
     }
     missed.sort();
     missed.dedup();
-    kept.defaults = own
-        .into_iter()
-        .filter(|p| kept.grants.iter().any(|g| within(p, &g.path)))
-        .collect();
+    let below = |set: BTreeSet<PathBuf>| -> Vec<PathBuf> {
+        set.into_iter()
+            .filter(|p| kept.grants.iter().any(|g| within(p, &g.path)))
+            .collect()
+    };
+    kept.defaults = below(defaults.own);
+    kept.own_entries = below(defaults.entries);
+    kept.made_defaults = below(defaults.made);
     kept.failed = missed.clone();
     report.failed = missed;
     if let Err(e) = write_record(file, &kept) {
@@ -995,16 +1125,20 @@ pub fn remove_all(file: &Path, heir: &dyn Fn(u32) -> (u32, u32)) -> Report {
         owner: r.owner,
     };
     let heir = heir(r.owner);
-    let mut own: BTreeSet<PathBuf> = r.defaults.iter().cloned().collect();
-    // The outer grants first: a grant inside one that came off whole is
-    // done even where a link on its way keeps its own walk out.
+    let mut defaults = Defaults::of(&r);
+    // The outer grants first: a grant inside one that came off whole, and
+    // whose walk saw all of it, is done even where a link on its way keeps
+    // its own walk out.
     let mut grants: Vec<&Granted> = r.grants.iter().collect();
     grants.sort_by_key(|g| g.path.components().count());
     let mut done: Vec<&Path> = Vec::new();
     for g in grants {
         let errors = report.errors.len();
-        if walk(&g.path, &[], who, Some(heir), &mut own, &mut report) {
-            done.push(&g.path);
+        let w = walk(&g.path, &[], who, Some(heir), &mut defaults, &mut report);
+        if w.whole {
+            if w.seen_all {
+                done.push(&g.path);
+            }
         } else if done.iter().any(|d| within(&g.path, d)) {
             report.errors.truncate(errors);
         } else {
@@ -1675,5 +1809,274 @@ mod tests {
             .map(|g| g.path)
             .collect();
         assert_eq!(got, vec![root.join("allow"), root.join("folder")]);
+    }
+
+    /// The default ACL of `p` but its mask, which a grant only grows.
+    fn default_but_mask(p: &Path) -> Option<Vec<Entry>> {
+        acl_of(p, DEFAULT).map(|a| a.0.into_iter().filter(|e| e.tag != MASK).collect())
+    }
+
+    /// A folder that was there before the grant without a default ACL, below
+    /// one with a default ACL of the owner's own, has none again after a
+    /// revoke, and neither has one made below it meanwhile (#142).
+    #[test]
+    fn a_folder_that_had_no_default_acl_has_none_after_a_revoke() {
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let private = work.join("private");
+        let old = private.join("old");
+        let deeper = old.join("deeper");
+        std::fs::create_dir_all(&deeper).unwrap();
+        set_default(&private, "u:rwx,g:rx,o:");
+        let theirs = acl_of(&private, DEFAULT).unwrap();
+        let file = root.join("acl.json");
+        let r = sync(&file, &[grant(&work, "rw")], who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert_eq!(acl_of(&old, DEFAULT).unwrap().user(RUN), Some(R | W | X));
+        // Made during the grant below `old`: it got the node's default.
+        let later = old.join("later");
+        std::fs::create_dir(&later).unwrap();
+        // Another walk while given, with other flags.
+        let r = sync(&file, &[grant(&work, "r")], who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        let r = sync(&file, &[], who(), &none);
+        assert!(r.errors.is_empty() && r.stale.is_empty(), "{r:?}");
+        assert_eq!(acl_of(&private, DEFAULT), Some(theirs));
+        for p in [&old, &deeper, &later] {
+            assert_eq!(acl_of(p, DEFAULT), None, "{p:?}");
+        }
+    }
+
+    /// The owner's own named entry in a default ACL stays as the owner set
+    /// it, during a grant and after its revoke, also on a folder made below
+    /// it meanwhile, which got it from there (#142).
+    #[test]
+    fn the_owners_own_default_entry_stays() {
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let shared = work.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        set_default(&shared, "u:rwx,g:rx,o:");
+        let mut a = acl_of(&shared, DEFAULT).unwrap();
+        a.set_user(uid(), Some(R | X));
+        set(&c_path(&shared).unwrap(), DEFAULT, &a).unwrap();
+        let theirs = default_but_mask(&shared).unwrap();
+        let file = root.join("acl.json");
+        let r = sync(&file, &[grant(&work, "rw")], who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        let during = acl_of(&shared, DEFAULT).unwrap();
+        assert_eq!(during.user(RUN), Some(R | W | X));
+        assert_eq!(during.user(uid()), Some(R | X), "as the owner set it");
+        let later = shared.join("later");
+        std::fs::create_dir(&later).unwrap();
+        let r = sync(&file, &[grant(&work, "r")], who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        let r = sync(&file, &[], who(), &none);
+        assert!(r.errors.is_empty() && r.stale.is_empty(), "{r:?}");
+        for p in [&shared, &later] {
+            assert_eq!(default_but_mask(p), Some(theirs.clone()), "{p:?}");
+        }
+        // Where the node put the owner's entry itself, it goes again.
+        assert_eq!(acl_of(&work, DEFAULT), None);
+    }
+
+    /// Runs the test `name` again as root in a mount namespace of its own
+    /// (in a user namespace too, unless it is root already), where it may
+    /// mount a file system and own files as other accounts. False where
+    /// that is done, or not possible here: the caller returns then.
+    fn in_a_namespace(name: &str) -> bool {
+        use std::process::Command;
+        if std::env::var_os("NERVE_TEST_IN_NS").is_some() {
+            assert_eq!(uid(), 0, "not root in the namespace");
+            return true;
+        }
+        let args: &[&str] = if uid() == 0 {
+            &["--mount"]
+        } else {
+            &["--map-root-user", "--map-auto", "--mount"]
+        };
+        let probe = Command::new("unshare")
+            .args(args)
+            .args([
+                "sh",
+                "-c",
+                r#"d=$(mktemp -d) || exit 1; mount -t tmpfs none "$d" && chown 4303 "$d"; r=$?; umount "$d" 2>/dev/null; rmdir "$d"; exit $r"#,
+            ])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !probe {
+            eprintln!("skipped: needs a mount namespace where root may mount and change owners");
+            return false;
+        }
+        let test = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
+        let status = Command::new("unshare")
+            .args(args)
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env("NERVE_TEST_IN_NS", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "in the namespace: {status}");
+        false
+    }
+
+    /// `f` on a thread of its own without the capabilities that pass a
+    /// folder's mode: root then is held to the modes as the owner is.
+    fn without_passing<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+        #[repr(C)]
+        struct Header {
+            version: u32,
+            pid: libc::c_int,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Data {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let h = Header {
+                    version: 0x2008_0522,
+                    pid: 0,
+                };
+                let mut caps = [Data {
+                    effective: 0,
+                    permitted: 0,
+                    inheritable: 0,
+                }; 2];
+                // SAFETY: capget and capset with structs laid out as the
+                // kernel's, on this thread.
+                unsafe {
+                    assert_eq!(
+                        libc::syscall(libc::SYS_capget, &h as *const Header, caps.as_mut_ptr()),
+                        0
+                    );
+                    // CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH.
+                    caps[0].effective &= !((1 << 1) | (1 << 2));
+                    assert_eq!(
+                        libc::syscall(libc::SYS_capset, &h as *const Header, caps.as_ptr()),
+                        0
+                    );
+                }
+                f()
+            })
+            .join()
+            .unwrap()
+        })
+    }
+
+    /// A tmpfs mounted on a folder, until it is dropped, also when the
+    /// test fails: the folder around it can be removed then.
+    struct Mounted(PathBuf);
+
+    impl Mounted {
+        fn tmpfs(p: &Path) -> Mounted {
+            let ok = std::process::Command::new("mount")
+                .args(["-t", "tmpfs", "none"])
+                .arg(p)
+                .status()
+                .unwrap();
+            assert!(ok.success());
+            Mounted(p.to_path_buf())
+        }
+    }
+
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("umount").arg(&self.0).status();
+        }
+    }
+
+    /// An inner grant on another file system, whose own walk fails on its
+    /// revoke (a link on the way), is not counted done by a walk of the
+    /// grant around it, which does not cross into that file system: it is
+    /// stale until its own walk takes the entries off. The same at
+    /// `uninstall` (#142).
+    #[test]
+    fn a_revoked_inner_grant_on_another_file_system_stays_stale() {
+        if !in_a_namespace("a_revoked_inner_grant_on_another_file_system_stays_stale") {
+            return;
+        }
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let data = work.join("x/data");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(outside.join("data")).unwrap();
+        let mut mounted = Mounted::tmpfs(&data);
+        std::fs::write(data.join("f"), "f").unwrap();
+        let file = root.join("acl.json");
+        let want = [grant(&work, "r"), grant(&data, "rw")];
+        let r = sync(&file, &want, who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert_eq!(rights(&data.join("f"), RUN), Some(R | W));
+        std::fs::rename(work.join("x"), work.join("x.old")).unwrap();
+        std::os::unix::fs::symlink(&outside, work.join("x")).unwrap();
+        let moved = work.join("x.old/data");
+        mounted.0 = moved.clone();
+        let r = sync(&file, &want[..1], who(), &none);
+        // The entries are still there, and that is said.
+        assert_eq!(rights(&moved.join("f"), RUN), Some(R | W));
+        assert!(r.stale.contains(&data), "{r:?}");
+        assert!(r.refusal().is_some());
+        let r = remove_all(&file, &|_| (uid(), gid()));
+        assert!(r.stale.contains(&data), "{r:?}");
+        assert!(file.exists());
+        // Back where it was, its own walk takes them off.
+        std::fs::remove_file(work.join("x")).unwrap();
+        std::fs::rename(work.join("x.old"), work.join("x")).unwrap();
+        mounted.0 = data.clone();
+        let r = sync(&file, &want[..1], who(), &none);
+        assert!(r.stale.is_empty() && r.errors.is_empty(), "{r:?}");
+        // The outer grant's rights only.
+        assert_eq!(rights(&data.join("f"), RUN), Some(R));
+        drop(mounted);
+    }
+
+    /// The same for an inner grant below a folder of another account's that
+    /// the owner may not list any more: the walk around it cannot see it.
+    #[test]
+    fn a_revoked_inner_grant_the_owner_cannot_reach_stays_stale() {
+        if !in_a_namespace("a_revoked_inner_grant_the_owner_cannot_reach_stays_stale") {
+            return;
+        }
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let other = work.join("other");
+        let mine = other.join("mine");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join("f"), "f").unwrap();
+        std::os::unix::fs::chown(&other, Some(4303), Some(4303)).unwrap();
+        let file = root.join("acl.json");
+        let want = [grant(&work, "r"), grant(&mine, "rw")];
+        let r = sync(&file, &want, who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert_eq!(rights(&mine.join("f"), RUN), Some(R | W));
+        // The other account closes its folder (open again at the end, so
+        // that the folder can be removed also when the test fails).
+        struct Reopen<'a>(&'a Path);
+        impl Drop for Reopen<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _reopen = Reopen(&other);
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let r = without_passing(|| sync(&file, &want[..1], who(), &none));
+        assert_eq!(rights(&mine.join("f"), RUN), Some(R | W));
+        assert!(r.stale.contains(&mine), "{r:?}");
+        let r = without_passing(|| remove_all(&file, &|_| (uid(), gid())));
+        assert!(r.stale.contains(&mine), "{r:?}");
+        // Open again, the revoke goes through.
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = without_passing(|| sync(&file, &want[..1], who(), &none));
+        assert!(r.stale.is_empty() && r.errors.is_empty(), "{r:?}");
+        assert_eq!(rights(&mine.join("f"), RUN), Some(R));
     }
 }

@@ -218,7 +218,8 @@ and no other groups; `uninstall` removes both.
   can then read what others may read inside that folder ([your
   home](#your-home-and-other-accounts)). Removing the grant takes the entries
   off your files again, and a default ACL of your own on a folder below it
-  (one you set with `setfacl -d`) is left as you had it. `ls -l` shows a `+` on such files, and their group bits show
+  (one you set with `setfacl -d`) is left as you had it, with an entry you
+  gave yourself there; a folder that had none has none again. `ls -l` shows a `+` on such files, and their group bits show
   the ACL's mask. The account is one for all pairings, so its entries are the
   union of the folders of every pairing whose commands run as `nerve-run`;
   Landlock holds each command to its own pairing's. A pairing in `user` mode,
@@ -255,7 +256,10 @@ and no other groups; `uninstall` removes both.
   place of a folder below it, is not followed: that grant fails until its
   path is a plain folder again. Where you remove such a grant inside another
   one you still give, the node takes its entries off by going through the
-  outer folder, wherever the inner one lies in it now.
+  outer folder, wherever the inner one lies in it now. If the outer folder
+  holds another file system, or a folder you may not open, the node cannot
+  tell that it reached the inner one: its entries count as not taken off
+  (below) until its path is a plain folder again.
 - While the node cannot take an entry off that `nerve-run` should have lost,
   no command of `nerve-run` runs, for any pairing: `folder rm`, `nerve-node
   status` and the app (**nerve-run keeps access it should have lost**) name

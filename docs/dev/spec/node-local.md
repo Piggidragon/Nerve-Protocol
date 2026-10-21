@@ -1299,7 +1299,8 @@ entries split out as for Landlock, joined over the pairings) as POSIX ACL
 entries (`crate::acl`): `user:nerve-run` with the folder's rights (a folder
 `r` → `r-x`, `w` → `-wx`, `x` → `--x`; a file `r`, `w`, and `x` only for a
 file someone may run already) on the folder and everything below it, and on
-each folder below the default entries `user:nerve-run` and `user:<owner>:rwx`.
+each folder below the default entries `user:nerve-run` and `user:<owner>:rwx`
+(a default entry the owner had for itself is left as it is).
 The mask grows to let the entry through and is never narrowed; it goes with
 the last named entry, which gives the file its mode back. A folder of the
 owner's above a grant that others may not enter gets `user:nerve-run:--x`; a
@@ -1309,24 +1310,30 @@ it, `nerve-run` reaches through it whatever below is open to others, and
 `status`'s `home_warning` says so for the owner's home (with a grant below
 it, or the home open to others). A default ACL without an entry of
 `nerve-run` is never removed; one the owner had before the grant keeps its
-plain entries when the node's come off (`defaults` in the record, and a
-folder made below one later), one the node made goes. The node writes the attributes itself
+plain entries and the owner's own named entry when the node's come off
+(`defaults` and `own_entries` in the record, and a folder made below one
+later), one the node made goes, also on a folder that was there below such
+a folder without one (`made_defaults`). The node writes the attributes itself
 (`system.posix_acl_access`, `system.posix_acl_default`), on its thread with
 the owner's file system ids, so only the owner's files change: links, files
 of other accounts, files with more than one name and other file systems
 below a grant are left alone. `acl.json` in the state folder records the
 uid, the owner's uid, the grants, the pass-through folders, the grants that
-failed and the owner's own default ACLs (`defaults`); a sync walks the
+failed and what of the default ACLs is the owner's (`defaults`,
+`own_entries`, `made_defaults`); a sync walks the
 grants that are new, changed, failed last time or gone (and everything when
 the uid or the owner changed). A grant that went inside one still given,
-whose path a link now crosses, is taken off by a walk of the outer grant.
+whose path a link now crosses, is taken off by a walk of the outer grant,
+if that walk saw all of it: one that skipped a folder on another file system
+or one the owner may not list leaves the inner grant `stale`, until its own
+walk goes through.
 A sync runs at the start (also for failed grants), on each config version,
 on `folder.grants`, and before a call of `nerve-run` (`exec.run`, `fs`),
 where a failed grant is tried again at most once a minute (`ACL_RETRY`).
 The call is refused while an entry that should have come off is left
 (`stale`), for every pairing of `nerve-run`. `uninstall` takes every
 recorded entry off as root before it removes `nerve-run`, outer grants
-first, gives what `nerve-run` owns below the grants to the owner (to root
+first (an outer walk counts for the grants inside only as above), gives what `nerve-run` owns below the grants to the owner (to root
 when the owner's account is gone), and stops if an entry stays.
 
 ## 6. Audit log

@@ -1090,16 +1090,20 @@ nothing of the config. `update` of 0.0.2 asks it that way to wait for the
 node it restarted, and puts the old program back if it does not answer `ok`;
 since 0.0.3 `install`, `update` and `setup` send the token.
 
-The token holds as far as the sandbox does. While the commands run as the
-node's own user, `folder` mode is no boundary against that user's other
-programs: any of them that runs commands for whoever connects to its socket
-runs them outside the sandbox, as the user's own process, which reads the
-token, `node.toml` and the keys as the CLI does. The user's systemd and D-Bus
-session (`systemd-run --user`) is one, a tmux or screen server another
-(`tmux run-shell`, its socket in `/tmp`); there are more. A connect rule
-(`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) that leaves out only the session
-does not close them, and the node sets none while the keys are in files
-(`exec.rs`). The boundary is `machine.user`: the commands run as another
+The token holds as far as the sandbox does, and the sandbox holds the
+command's own processes only. Any program of the commands' account that runs
+things for whoever asks it runs them outside the sandbox, as the account's
+own process, which reads the token (and, as the node's own user, `node.toml`
+and the keys) as the CLI does; the account's session service manager and a
+terminal multiplexer are such programs, and there are more. The connect rule
+(`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`) is set only while the keys are in the
+keyring and leaves out only the node's own folders (`exec::connect_rule`), so
+it does not change that. While the commands run as the node's own user or as
+an owner, `folder` mode is therefore no boundary against that account's
+other programs: that is the owner's choice and responsibility, and the
+desktop app's account card says "Nerve's settings too" in every mode. A
+separate account for `folder` mode by default is planned (issue #142). The
+boundary is `machine.user`: the commands run as another
 account that only the node uses and that gets root in no way without a
 password: not root, not in `docker`, `lxd`, `incus-admin`, `libvirt` or
 `disk`, no `NOPASSWD` sudo, and nobody works as it and uses `sudo` or `su`
@@ -1234,6 +1238,59 @@ run by hand (the node's own account) pass the DACL; the job check stops them
 on the pipe, but they can still change `node.toml` itself. On Windows, allow
 commands only to centers you would also give `settings = write`, or install
 the node as a service.
+
+### The owner endpoint
+
+The installed node also takes commands from its owners, who are no root: on
+Linux the members of the group `nerve-admin`, looked up by name at each
+request; on Windows the SIDs in the service's registry value
+`Parameters\Owners`. It serves them `/run/nerve-node/owner.sock` (0666 in the
+unit's runtime folder) or the pipe `\\.\pipe\nerve-node-owner` (DACL: SYSTEM, the
+administrators, the owners; first instance; no remote clients), with the same
+lines and two methods. On Linux a `cli` request carries `"token"`: the
+content of `owner.token` beside the socket, a new random token at each start,
+0640 for the node's user and the group `nerve-admin`, which no `folder` mode
+command can read (its folder is out of every Landlock rule of a command).
+The pipe has no token: its DACL names no package, so no AppContainer opens
+it.
+
+| Method | Params | |
+|---|---|---|
+| `status` | | `{"running": true}`, to anyone |
+| `cli` | `args`, `cwd` | runs `nerve-node --config-dir … --state-dir … <args>` as the node's user, with `NERVE_OWNER=<owner>`; then `{"ok": {}}`, the program's output as `{"out"}` and `{"err"}` lines and `{"exit": code}`; the caller sends `{"in": text}` and `{"eof": true}` |
+
+`cli` is refused to a caller who is no owner, without the token (Linux), below
+a command the node runs, with `no_new_privs` (Linux), in a command's job
+(Windows), with `--config-dir` or `--state-dir`, and for `run`, `install`,
+`update`, `uninstall`, `service`, `setup` and `sudo on`. The checks of the
+caller's process read the process that connected, which may have ended by
+the time the request comes: they are a second layer behind the token.
+
+`backup` and `restore` take the file the caller opened itself: on Linux its
+descriptor, sent with the request line (SCM_RIGHTS), which the program gets
+as descriptor 3; on Windows the request says `"file": "stream"` and the bytes
+come as `{"file": base64}` lines and `{"file_end": true}` before the input
+(restore), or go back as `{"file"}` lines before `{"exit"}` (backup), through
+a file in the node's state folder. The program finds it in
+`NERVE_OWNER_FILE` (`fd:3` or that file) and never opens the path it is
+given. The caller asks the passphrase and sends it as the input; a backup's
+new file is its own (`create_new`, 0600, a temporary name and a rename with
+`--overwrite`). A `restore` runs while the node is stopped: the daemon stops,
+runs it, and starts again (`Daemon::run_until`), and with `NERVE_OWNER` the
+program refuses a backup that would change one of the four `machine.*`
+settings above. A program
+with `NERVE_OWNER` refuses a change of `machine.user`, `machine.allow_root`,
+`machine.sudo_path` and `machine.shell`, and names the owner in the audit's
+settings entries (`"user"`). Starting and stopping the service is the service
+manager's: on Linux the service helper (`/usr/local/lib/nerve-node/service-control`,
+`start|stop|restart` of the unit and nothing else) through `pkexec`, with its
+own action `org.nerve-protocol.node.service-control`, which a polkit rule
+(or on polkit 0.105 a `.pkla` file) gives `nerve-admin` in a local active
+session; the rule also gives them systemd's `manage-units` for that unit and
+those verbs (never a `.pkla` file for it, which could not name the unit).
+On Windows the service's DACL. Where `machine.user` is an owner, a command
+without a sandbox (`user`, `allowlist`) reads the token and is that owner, as
+is one that gets a process outside the node's tree and sandbox (as above).
 
 ## 6. Audit log
 

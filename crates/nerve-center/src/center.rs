@@ -710,6 +710,29 @@ impl Center {
         }
     }
 
+    /// Answers `POST /nerve/v0/pair/check`: whether the code in the body
+    /// could pair now, without using it or counting a try
+    /// ([`crate::pairing::Codes::probe`]).
+    pub fn pair_check(&self, body: &[u8]) -> (u16, Value) {
+        let code = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|v| v["code"].as_str().map(str::to_string))
+            .filter(|c| nerve_proto::link::valid_code(c));
+        let Some(code) = code else {
+            return (
+                400,
+                json!({ "error": "the body is {\"code\": \"<pairing code>\"}" }),
+            );
+        };
+        let probe = self.codes.lock().unwrap().probe(&code, Instant::now());
+        self.log.record(
+            Level::Debug,
+            None,
+            &format!("a node checked a pairing code: {}", probe.word()),
+        );
+        (200, json!({ "code": probe.word() }))
+    }
+
     /// Answers `POST /nerve/v0/pair`: the status and the body.
     pub fn pair(&self, body: &[u8]) -> (u16, Value) {
         // A request without a code that works costs nothing to make, so a
@@ -3592,6 +3615,23 @@ mod tests {
             statuses.iter().all(|s| matches!(s, 200 | 403)),
             "{statuses:?}"
         );
+    }
+
+    /// A node's check before it pairs tells whether the code could pair,
+    /// and the code stays as it was: still open, every try left.
+    #[test]
+    fn a_check_tells_the_code_open_and_uses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let code = c.new_pairing()["code"].as_str().unwrap().to_string();
+        let check = |code: &str| c.pair_check(json!({ "code": code }).to_string().as_bytes());
+        for _ in 0..20 {
+            assert_eq!(check(&code), (200, json!({"code": "open"})));
+        }
+        assert_eq!(check("wrongwrong12"), (200, json!({"code": "gone"})));
+        assert_eq!(c.pair_check(b"{}").0, 400);
+        assert_eq!(c.pair(&pair_body(&code, "box-1", 7)).0, 200);
+        assert_eq!(check(&code), (200, json!({"code": "used"})));
     }
 
     // ---- The log ----

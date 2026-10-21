@@ -410,6 +410,10 @@ async fn folder_node(dir: &Path) -> Option<(FakeCenter, NodeOptions)> {
     owner_edit(&o.paths, |c| {
         let p = &mut c.centers[0].policy;
         p.mode = nerve_policy::Mode::Folder;
+        // These tests run the CLI from a command on purpose, to show what
+        // holds when the guard's deny rules (which catch mistakes only)
+        // are taken off or got around.
+        p.deny.clear();
         for (path, access) in [
             (&home, nerve_policy::config::Access::ALL),
             // Names the config folder itself, as the test above does.

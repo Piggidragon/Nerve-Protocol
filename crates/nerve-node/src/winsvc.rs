@@ -21,7 +21,8 @@ use nerve_policy::settings::SettingsStore;
 
 use crate::paths::NodePaths;
 use crate::service::{
-    Account, Layout, Steps, USER, USER_MARK, Version, asset_name, audit, fetch_release, write_file,
+    Account, Layout, ServiceAction, ServiceState, Steps, USER, USER_MARK, Version, asset_name,
+    audit, fetch_release, node_beside, put_parts, uninstall_parts, write_file,
 };
 
 /// The name the service is registered under.
@@ -51,6 +52,9 @@ pub trait WinSystem {
     fn secure(&self, dir: &Path, owner: Option<&str>) -> Result<(), String>;
     /// The service: `None` when it is not registered, else whether it runs.
     fn service(&self) -> Result<Option<bool>, String>;
+    /// The service's state for `service status`; `None` when it is not
+    /// registered.
+    fn service_state(&self) -> Result<Option<ServiceState>, String>;
     /// Registers the service, or changes it: `layout.bin` with the folders,
     /// as `.\nerve` with `password`, started with the machine and again
     /// after a failure.
@@ -104,6 +108,50 @@ pub trait WinSystem {
         paths: &crate::paths::NodePaths,
         node_ids: &[String],
     ) -> crate::grants::Synced;
+    /// The account that installs, as an owner of the node (crate::owner):
+    /// its SID and its name. The desktop app's user when its broker names
+    /// one, else the account this runs as.
+    fn owner_sid(&self) -> Option<(String, String)>;
+    /// The owners' SIDs the service's registry key lists.
+    fn owners(&self) -> Result<Vec<String>, String>;
+    /// Writes `sids` as the owners, and gives them the right to start,
+    /// stop and ask the service ([`service_dacl`]).
+    fn put_owners(&self, sids: &[String]) -> Result<(), String>;
+}
+
+/// The service's DACL in SDDL: what Windows gives a new service (SYSTEM,
+/// the administrators, read for the interactive and service users), and to
+/// each owner the right to start, stop and ask it, nothing more.
+pub fn service_dacl(owners: &[String]) -> String {
+    let mut s = String::from(
+        "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)",
+    );
+    for o in owners {
+        s.push_str(&format!("(A;;CCLCSWRPWPLOCRRC;;;{o})"));
+    }
+    s
+}
+
+/// The owners (crate::owner): the account that installs joins them at
+/// install (`always`), and at an update only when there are none, as after
+/// an install from before them.
+fn put_owners(sys: &dyn WinSystem, always: bool, steps: &mut Steps) -> Result<(), String> {
+    let mut owners = sys.owners()?;
+    if !always && !owners.is_empty() {
+        return Ok(());
+    }
+    let Some((sid, name)) = sys.owner_sid() else {
+        steps.did("no owner besides the administrators");
+        return Ok(());
+    };
+    if !owners.contains(&sid) {
+        owners.push(sid);
+    }
+    sys.put_owners(&owners)?;
+    steps.did(format!(
+        "{name} is an owner of the node: the app and `nerve-node` change its settings, and start and stop its service, without administrator rights"
+    ));
+    Ok(())
 }
 
 /// Takes the folder grants of the node at `paths` off, for uninstall.
@@ -196,14 +244,24 @@ fn new_password() -> String {
     format!("Nn1-{}", nerve_transport::keys::random_token(28))
 }
 
+/// The program's name without `.exe`: `nerve-node`, or the desktop app's.
+/// The start of the name a program gets when it moves aside, held by
+/// Windows, until it goes at the next start ([`WinSystem::remove_program`]).
+pub(crate) const ASIDE: &str = "nerve-node.";
+
+fn stem(bin: &Path) -> String {
+    bin.file_stem()
+        .map_or_else(|| "nerve-node".into(), |s| s.to_string_lossy().into_owned())
+}
+
 /// Where `update` puts the new program before it replaces the old one, and
 /// where the old one waits until the new one runs.
 fn staged(bin: &Path) -> PathBuf {
-    bin.with_file_name("nerve-node.new.exe")
+    bin.with_file_name(format!("{}.new.exe", stem(bin)))
 }
 
 fn previous(bin: &Path) -> PathBuf {
-    bin.with_file_name("nerve-node.old.exe")
+    bin.with_file_name(format!("{}.old.exe", stem(bin)))
 }
 
 /// Whether `what` can run here: as an elevated administrator.
@@ -319,8 +377,10 @@ fn install_steps(
         write_file(&layout.bin, &program, 0o755)?;
         steps.did(format!("put the program at {}", layout.bin.display()));
     }
+    put_parts(layout, steps)?;
     // What an update or an uninstall left behind when it ran from the
-    // program it replaced or removed.
+    // program it replaced or removed, or moved aside because the Event Log
+    // held it: a name of [`ASIDE`].
     let _ = std::fs::remove_file(previous(&layout.bin));
     let _ = std::fs::remove_file(staged(&layout.bin));
     if let Some(dir) = layout.bin.parent()
@@ -329,7 +389,7 @@ fn install_steps(
         for e in entries.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("nerve-node.") && name.ends_with(".del") {
+            if name.starts_with(ASIDE) && name.ends_with(".del") {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -344,9 +404,46 @@ fn install_steps(
         crate::eventlog::SOURCE,
         layout.paths.log_file().display()
     ));
+    put_owners(sys, true, steps)?;
+    // Now that the service and the Event Log name this program.
+    remove_node_alone(layout, sys, steps)?;
     sys.start()?;
     sys.wait_running(layout)?;
     steps.did(format!("the service {SERVICE_NAME} runs"));
+    Ok(())
+}
+
+/// When the desktop app takes over a node installed with `nerve-node`, the
+/// old `nerve-node.exe` goes: the app's program is the node now, and it
+/// cannot be the terminal's command, as a link to it would make it, since
+/// a shell does not wait for a GUI program. A terminal takes the CLI edition,
+/// downloaded on its own. The Event Log may still hold the old program as
+/// the message file it read before; it then moves aside and goes at the
+/// next start ([`WinSystem::remove_program`]).
+fn remove_node_alone(
+    layout: &Layout,
+    sys: &dyn WinSystem,
+    steps: &mut Steps,
+) -> Result<(), String> {
+    let Some(node) = node_beside(layout) else {
+        return Ok(());
+    };
+    // A file only: a link to the app, as an earlier install made, goes with
+    // the uninstall.
+    if !std::fs::symlink_metadata(&node).is_ok_and(|m| m.is_file()) {
+        return Ok(());
+    }
+    let gone = sys.remove_program(&node)?;
+    steps.did(format!(
+        "removed {}, the node installed alone: {} is the node now{}. For a terminal, download the CLI edition nerve-node.exe on its own",
+        node.display(),
+        layout.bin.display(),
+        if gone {
+            ""
+        } else {
+            " (Windows holds the old file, as when the Event Log read it or it runs; Windows deletes it at its next start)"
+        }
+    ));
     Ok(())
 }
 
@@ -423,7 +520,8 @@ fn command_account(layout: &Layout, sys: &dyn WinSystem, invoker: &str, steps: &
     match r {
         Ok(step) => steps.did(step),
         Err(e) => steps.did(format!(
-            "no account for commands: {e}; `nerve-node install` asks again"
+            "no account for commands: {e}; {}",
+            crate::account::NO_ACCOUNT_INSTALL
         )),
     }
 }
@@ -560,6 +658,7 @@ fn uninstall_steps(
         }
         None => {}
     }
+    uninstall_parts(layout, steps)?;
     for left in [staged(&layout.bin), previous(&layout.bin)] {
         if left.exists() {
             sys.remove_program(&left)?;
@@ -611,6 +710,7 @@ async fn update_steps(
     from: Option<&Path>,
     steps: &mut Steps<'_>,
 ) -> Result<(), String> {
+    let program = layout.edition.program;
     sys.account(USER)?
         .filter(|a| a.comment == USER_MARK)
         .ok_or_else(|| {
@@ -620,6 +720,7 @@ async fn update_steps(
     // and one whose source points elsewhere gets it back; it is the same
     // program path after the update.
     sys.put_event_source(layout)?;
+    put_owners(sys, false, steps)?;
     let new = match from {
         Some(f) => {
             let b = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
@@ -627,7 +728,7 @@ async fn update_steps(
             b
         }
         None => {
-            let asset = asset_name()?;
+            let asset = asset_name(layout.edition.program)?;
             let b = fetch_release(&layout.release, &asset).await?;
             steps.did(format!(
                 "downloaded {asset} from {} and checked it against its SHA256SUMS",
@@ -646,14 +747,17 @@ async fn update_steps(
     write_file(&new_path, &new, 0o755)?;
     let checked = (|| {
         let said = sys.version_of(&new_path)?;
-        let new_v = Version::parse(&said)
-            .ok_or_else(|| format!("the new program is not nerve-node: it says {said:?}"))?;
-        let old_v = sys.version_of(bin).ok().and_then(|s| Version::parse(&s));
+        let new_v = Version::of_program(layout, &said)
+            .ok_or_else(|| format!("the new program is not {program}: it says {said:?}"))?;
+        let old_v = sys
+            .version_of(bin)
+            .ok()
+            .and_then(|s| Version::of_program(layout, &s));
         if let Some(o) = old_v
             && new_v < o
         {
             return Err(format!(
-                "the new program is nerve-node {new_v}, older than the installed {o}; nothing changed"
+                "the new program is {program} {new_v}, older than the installed {o}; nothing changed"
             ));
         }
         Ok((old_v, new_v))
@@ -689,7 +793,7 @@ async fn update_steps(
         return Err(e);
     }
     let old_v = old_v.map_or_else(|| "?".to_string(), |v| v.to_string());
-    steps.did(format!("replaced nerve-node {old_v} with {new_v}"));
+    steps.did(format!("replaced {program} {old_v} with {new_v}"));
     let started = sys.start().and_then(|()| sys.wait_running(layout));
     if let Err(e) = started {
         let _ = sys.stop();
@@ -698,7 +802,7 @@ async fn update_steps(
             .and_then(|()| sys.start())
             .and_then(|()| sys.wait_running(layout));
         let _ = std::fs::remove_file(&new_path);
-        steps.did(format!("put nerve-node {old_v} back"));
+        steps.did(format!("put {program} {old_v} back"));
         return Err(match back {
             Ok(()) => format!("the new program did not start ({e}); the old one runs again"),
             Err(e2) => format!(
@@ -710,6 +814,43 @@ async fn update_steps(
     // This command may run from the old program; then it goes at the next
     // restart, or with the next update or install.
     let _ = sys.remove_program(&old_path);
+    put_parts(layout, steps)
+}
+
+/// `service start`, `stop` and `restart` on Windows: the installed
+/// service, through the service control manager, waiting until a node that
+/// starts runs.
+pub fn control(
+    layout: &Layout,
+    sys: &dyn WinSystem,
+    action: ServiceAction,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    // The service's DACL decides: the administrators and the owners may
+    // (crate::owner).
+    if sys.service()?.is_none() {
+        return Err(
+            "the node is not installed as a service here; `nerve-node install` installs it".into(),
+        );
+    }
+    if action != ServiceAction::Start {
+        sys.stop()?;
+    }
+    let said = if action == ServiceAction::Stop {
+        format!(
+            "stopped the service {SERVICE_NAME}: the node ended its links; it starts again with the machine"
+        )
+    } else {
+        sys.start()?;
+        sys.wait_running(layout)?;
+        let did = if action == ServiceAction::Start {
+            "started"
+        } else {
+            "restarted"
+        };
+        format!("{did} the service {SERVICE_NAME}, and the node runs")
+    };
+    let _ = writeln!(out, "{said}");
     Ok(())
 }
 
@@ -750,9 +891,16 @@ pub(crate) mod tests {
         event_source: RefCell<Option<PathBuf>>,
         /// The programs removed, in order.
         removed: RefCell<Vec<PathBuf>>,
+        /// The programs Windows holds, as the Event Log holds the one it
+        /// read: they move aside.
+        held: RefCell<Vec<PathBuf>>,
         /// The state folders of nodes that run: their containers' profiles
         /// stay.
         running: RefCell<Vec<PathBuf>>,
+        /// The account that installs, by SID and name.
+        pub(crate) installer: RefCell<Option<(String, String)>>,
+        /// The owners the service's key lists.
+        pub(crate) owner_list: RefCell<Vec<String>>,
     }
 
     impl Fake {
@@ -777,7 +925,10 @@ pub(crate) mod tests {
                 away: RefCell::new(Vec::new()),
                 event_source: RefCell::new(None),
                 removed: RefCell::new(Vec::new()),
+                held: RefCell::new(Vec::new()),
                 running: RefCell::new(Vec::new()),
+                installer: RefCell::new(Some(("S-1-5-21-1-2-3-1001".into(), "alice".into()))),
+                owner_list: RefCell::new(Vec::new()),
             }
         }
 
@@ -844,6 +995,12 @@ pub(crate) mod tests {
         fn service(&self) -> Result<Option<bool>, String> {
             Ok(self.service.get())
         }
+        fn service_state(&self) -> Result<Option<ServiceState>, String> {
+            Ok(self.service.get().map(|runs| ServiceState {
+                state: if runs { "running" } else { "stopped" }.into(),
+                enabled: Some(true),
+            }))
+        }
         fn put_service(&self, layout: &Layout, _: &str) -> Result<(), String> {
             self.call(format!("put {}", layout.bin.display()));
             *self.program.borrow_mut() = Some(layout.bin.clone());
@@ -872,6 +1029,8 @@ pub(crate) mod tests {
         fn delete_service(&self) -> Result<(), String> {
             self.call("delete");
             self.service.set(None);
+            // The service's key and DACL go with it.
+            self.owner_list.borrow_mut().clear();
             Ok(())
         }
         fn put_event_source(&self, layout: &Layout) -> Result<(), String> {
@@ -957,9 +1116,32 @@ pub(crate) mod tests {
         }
         fn remove_program(&self, path: &Path) -> Result<bool, String> {
             self.removed.borrow_mut().push(path.to_path_buf());
+            if self.held.borrow().iter().any(|p| p == path) {
+                let aside = path.with_file_name(format!("{ASIDE}held.del"));
+                std::fs::rename(path, aside).map_err(|e| e.to_string())?;
+                return Ok(false);
+            }
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
             Ok(true)
         }
+        fn owner_sid(&self) -> Option<(String, String)> {
+            self.installer.borrow().clone()
+        }
+
+        fn owners(&self) -> Result<Vec<String>, String> {
+            // They go with the service.
+            if self.service.get().is_none() {
+                return Ok(Vec::new());
+            }
+            Ok(self.owner_list.borrow().clone())
+        }
+
+        fn put_owners(&self, sids: &[String]) -> Result<(), String> {
+            self.call(format!("owners {}", sids.join(",")));
+            *self.owner_list.borrow_mut() = sids.to_vec();
+            Ok(())
+        }
+
         fn remove_grants(&self, paths: &NodePaths, node_ids: &[String]) -> crate::grants::Synced {
             // The record is in the state folder, which a purge deletes.
             let recorded = crate::grants::record_file(paths).exists();
@@ -1013,6 +1195,7 @@ pub(crate) mod tests {
             paths: NodePaths::new(data.join("config"), data.join("state")),
             home: data,
             release: "http://127.0.0.1:1/none".into(),
+            edition: &crate::edition::NODE,
         }
     }
 
@@ -1135,9 +1318,13 @@ pub(crate) mod tests {
                 "logon alice".into(),
                 format!("put {}", l.bin.display()),
                 "event source".into(),
+                "owners S-1-5-21-1-2-3-1001".into(),
                 "start".into(),
             ]
         );
+        // The one who installed is an owner: the service lets that SID
+        // start and stop it.
+        assert!(out.contains("alice is an owner of the node"), "{out}");
         // The Event Log takes the text of the node's entries from the
         // installed program.
         assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
@@ -1165,7 +1352,7 @@ pub(crate) mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0]["event"], "install");
         assert!(a[0].get("error").is_none());
-        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 7, "{}", a[0]);
+        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 8, "{}", a[0]);
         // Again, as another administrator: the account is reset, the
         // service stopped and started, the account of the commands and its
         // stored password kept without a question.
@@ -1719,6 +1906,59 @@ pub(crate) mod tests {
         assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
     }
 
+    /// An install from before the owners gets the one who updates as its
+    /// owner; an update after that changes none.
+    #[tokio::test]
+    async fn an_update_gives_an_earlier_install_its_owner() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        sys.owner_list.borrow_mut().clear();
+        *sys.installer.borrow_mut() = Some(("S-1-5-21-1-2-3-1002".into(), "bob".into()));
+        let new = d.path().join("new.exe");
+        std::fs::write(&new, "nerve-node 1.2.0\n").unwrap();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("bob is an owner of the node"), "{out}");
+        assert_eq!(*sys.owner_list.borrow(), ["S-1-5-21-1-2-3-1002"]);
+        // The owners are set before the service starts again.
+        let calls = sys.calls();
+        let owners = calls.iter().position(|c| c.starts_with("owners"));
+        let start = calls.iter().rposition(|c| c == "start");
+        assert!(owners < start, "{calls:?}");
+        *sys.installer.borrow_mut() = Some(("S-1-5-21-1-2-3-1004".into(), "dave".into()));
+        std::fs::write(&new, "nerve-node 1.3.0\n").unwrap();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("owner"));
+        assert_eq!(*sys.owner_list.borrow(), ["S-1-5-21-1-2-3-1002"]);
+    }
+
+    /// The service's DACL gives each owner start, stop and asking, and
+    /// keeps what Windows gives everyone else.
+    #[test]
+    fn the_service_lets_its_owners_start_and_stop_it() {
+        let d = service_dacl(&["S-1-5-21-1-2-3-1001".into()]);
+        assert!(
+            d.starts_with("D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)"),
+            "{d}"
+        );
+        assert!(
+            d.ends_with("(A;;CCLCSWRPWPLOCRRC;;;S-1-5-21-1-2-3-1001)"),
+            "{d}"
+        );
+        // No change of its config, its DACL or its removal for an owner.
+        let owner = d.rsplit("(A;;").next().unwrap();
+        for right in ["DC", "SD", "WD", "WO", "DT"] {
+            assert!(
+                !owner.split(";;").next().unwrap().contains(right),
+                "{right}"
+            );
+        }
+        assert_eq!(service_dacl(&[]).matches("(A;").count(), 4);
+    }
+
     #[tokio::test]
     async fn update_refuses_an_older_or_foreign_program_and_puts_back_one_that_does_not_start() {
         let d = tempfile::tempdir().unwrap();
@@ -1803,6 +2043,150 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("put nerve-node 1.2.0 back")
         );
+    }
+
+    /// The desktop app's parts, as a file beside the program.
+    struct Entry;
+
+    impl crate::edition::Parts for Entry {
+        fn install(&self, bin: &Path) -> Result<Vec<String>, String> {
+            std::fs::write(bin.with_file_name("Nerve.lnk"), "link").map_err(|e| e.to_string())?;
+            Ok(vec!["put the Start menu entry in place".into()])
+        }
+        fn uninstall(&self, bin: &Path) -> Result<Vec<String>, String> {
+            std::fs::remove_file(bin.with_file_name("Nerve.lnk")).map_err(|e| e.to_string())?;
+            Ok(vec!["removed the Start menu entry".into()])
+        }
+    }
+
+    static DESKTOP: crate::edition::Edition = crate::edition::Edition {
+        program: "nerve-node-desktop",
+        parts: Some(&Entry),
+    };
+
+    #[tokio::test]
+    async fn the_desktop_app_comes_and_goes_with_its_parts_and_controls_the_service() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = Layout {
+            bin: d.path().join("Program Files/Nerve/nerve-node-desktop.exe"),
+            edition: &DESKTOP,
+            ..layout(d.path())
+        };
+        let e = control(&l, &sys, ServiceAction::Start, &mut Vec::new()).unwrap_err();
+        assert!(e.contains("not installed as a service"), "{e}");
+        let link = l.bin.with_file_name("Nerve.lnk");
+        let exe = d
+            .path()
+            .join("Downloads/nerve-node-desktop-x86_64-windows.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "nerve-node-desktop 1.0.0\n").unwrap();
+        sys.types("alice's");
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("put the Start menu entry in place"), "{out}");
+        assert!(link.exists());
+
+        for (action, calls, state) in [
+            (ServiceAction::Stop, &["stop"][..], "stopped"),
+            (ServiceAction::Start, &["start"][..], "running"),
+            (ServiceAction::Restart, &["stop", "start"][..], "running"),
+        ] {
+            let before = sys.calls().len();
+            control(&l, &sys, action, &mut Vec::new()).unwrap();
+            assert_eq!(sys.calls()[before..], *calls, "{action:?}");
+            assert_eq!(sys.service_state().unwrap().unwrap().state, state);
+        }
+
+        std::fs::remove_file(&link).unwrap();
+        let new = d.path().join("new.exe");
+        std::fs::write(&new, "nerve-node-desktop 1.1.0\n").unwrap();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("replaced nerve-node-desktop 1.0.0 with 1.1.0"),
+            "{out}"
+        );
+        assert!(link.exists(), "{out}");
+        assert_eq!(
+            staged(&l.bin).file_name().unwrap(),
+            "nerve-node-desktop.new.exe"
+        );
+        assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
+
+        let mut out = Vec::new();
+        uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("removed the Start menu entry")
+        );
+        assert!(!link.exists());
+    }
+
+    #[tokio::test]
+    async fn the_app_removes_the_node_installed_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        // A node installed with nerve-node.exe, whose entries the Event Log
+        // read: it holds the program.
+        let node = installed(d.path(), &sys, "1.0.0").bin;
+        sys.held.borrow_mut().push(node.clone());
+        let l = Layout {
+            bin: d.path().join("Program Files/Nerve/nerve-node-desktop.exe"),
+            edition: &DESKTOP,
+            ..layout(d.path())
+        };
+        assert_eq!(crate::service::node_beside(&l).as_ref(), Some(&node));
+        // What an earlier uninstall moved aside goes with this install.
+        let earlier = l.bin.with_file_name("nerve-node.x1y2.del");
+        std::fs::write(&earlier, "old").unwrap();
+        let exe = d.path().join("Downloads/nerve-node-desktop.exe");
+        std::fs::write(&exe, "nerve-node-desktop 1.0.0\n").unwrap();
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("nerve-node.exe, the node installed alone") && out.contains("CLI edition"),
+            "{out}"
+        );
+        assert!(out.contains("deletes it at its next start"), "{out}");
+        assert!(!out.contains("is a link"), "{out}");
+        // No link: the old program moved aside, as Windows lets it, once the
+        // service and the Event Log name the app's.
+        assert!(std::fs::symlink_metadata(&node).is_err());
+        assert!(l.bin.with_file_name("nerve-node.held.del").exists());
+        assert!(!earlier.exists());
+        assert_eq!(*sys.program.borrow(), Some(l.bin.clone()));
+        assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
+
+        // Again, and after an update: nothing more to remove.
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("installed alone"));
+        let new = d.path().join("new.exe");
+        std::fs::write(&new, "nerve-node-desktop 1.1.0\n").unwrap();
+        update(&l, &sys, Some(&new), &mut Vec::new()).await.unwrap();
+
+        let mut out = Vec::new();
+        uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
+        assert!(!l.bin.exists() && std::fs::symlink_metadata(&node).is_err());
+
+        // A link an earlier build made stays at install and goes with the
+        // uninstall.
+        #[cfg(unix)]
+        {
+            install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap();
+            std::os::unix::fs::symlink(&l.bin, &node).unwrap();
+            install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap();
+            assert_eq!(std::fs::read_link(&node).unwrap(), l.bin);
+            let mut out = Vec::new();
+            uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
+            assert!(String::from_utf8(out).unwrap().contains("removed the link"));
+            assert!(std::fs::symlink_metadata(&node).is_err());
+        }
     }
 
     #[tokio::test]

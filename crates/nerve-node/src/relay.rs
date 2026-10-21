@@ -2566,8 +2566,10 @@ mod tests {
         // dead at once and its tunnels end. On Windows the running node takes
         // it at its next start, and the output says that the old token still
         // opens tunnels until then, and the new one is refused.
-        let out = cli(&["relay", "token", "lab"]).await;
-        let token2 = out.lines().nth(1).unwrap().trim().to_string();
+        let out = cli(&["relay", "token", "lab", "--address", "127.0.0.1:7490"]).await;
+        let token2 = nerve_proto::link::RelayLink::parse(out.lines().nth(1).unwrap())
+            .unwrap()
+            .token;
         let lab2 = basic("lab", &token2);
         if cfg!(windows) {
             assert!(

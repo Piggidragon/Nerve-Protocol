@@ -55,11 +55,31 @@ pub struct NodeOptions {
     /// How long a dropped link is kept for the center to resume it
     /// (nerve_proto::resume::GRACE). A test shortens it.
     pub resume_grace: Duration,
+    /// Where the node takes its owners' commands, besides the control
+    /// socket (crate::owner): the installed node's, unless a test gives
+    /// one. Served only with `ctl`.
+    pub owners: Option<crate::owner::Endpoint>,
+    /// Where work goes that runs while the node is stopped, after which it
+    /// starts again: an owner's restore ([`Daemon::run_until`] sets it).
+    /// Without it the node refuses such work.
+    pub aside: Option<tokio::sync::mpsc::UnboundedSender<Aside>>,
+}
+
+/// Work the node runs while it is stopped ([`NodeOptions::aside`]).
+pub type Aside = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// What [`Daemon::run_until`] is told while the node runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// Read the config again (SIGHUP).
+    Reload,
+    Stop,
 }
 
 impl NodeOptions {
     pub fn new(paths: NodePaths) -> NodeOptions {
         NodeOptions {
+            owners: crate::owner::Endpoint::of_service(&paths),
             paths,
             exe: None,
             home: home_dir(),
@@ -69,6 +89,7 @@ impl NodeOptions {
             confinement: None,
             cgroups: None,
             resume_grace: resume::GRACE,
+            aside: None,
         }
     }
 }
@@ -469,8 +490,14 @@ pub(crate) struct Shared {
     pub grace: Duration,
     /// The capability providers attached now (crate::provider).
     pub providers: crate::provider::Providers,
+    /// Where work goes that runs while the node is stopped
+    /// ([`NodeOptions::aside`]).
+    pub aside: Option<tokio::sync::mpsc::UnboundedSender<Aside>>,
     /// The relay for other nodes (crate::relay), and who is connected.
     pub relay: crate::relay::Relays,
+    /// Linux: the folder of the owner socket and its token, when the node
+    /// serves one (crate::owner).
+    pub owner_dir: Option<PathBuf>,
 }
 
 impl Shared {
@@ -611,6 +638,18 @@ impl Shared {
         #[cfg(not(target_os = "linux"))]
         let _ = cfg;
         own
+    }
+
+    /// The folders a confined command neither reads nor gets as a folder of
+    /// its own: [`Shared::own`], and the folder of the owner socket with its
+    /// token ([`Shared::owner_dir`]), which lies in `/run`, a system folder
+    /// every command reads otherwise. Not the folders a command's account
+    /// must not enter at all (crate::account::out_of_reach): every account
+    /// may enter that one, to reach the socket.
+    pub fn sealed(&self, cfg: &NodeConfig) -> Vec<PathBuf> {
+        let mut out = self.own(cfg);
+        out.extend(self.owner_dir.clone());
+        out
     }
 
     /// Whether commands of `folder` mode may run: confined (Landlock or an
@@ -787,6 +826,9 @@ impl Shared {
         json!({
             "version": cfg.version,
             "locked": cfg.locked,
+            // The account commands run as (the desktop app warns when it is
+            // its own user's: crate::owner).
+            "account": cfg.machine.user,
             "confinement": self.confinement.describe(),
             "running": self.running.load(Ordering::Relaxed),
             "sudo": if self.sudo_on() { "on" } else { "off" },
@@ -866,6 +908,8 @@ pub struct Daemon {
     supervisor: JoinHandle<()>,
     relay: JoinHandle<()>,
     ctl: Option<JoinHandle<()>>,
+    /// The owner endpoint's task and its socket (crate::owner).
+    owner: Option<(JoinHandle<()>, PathBuf)>,
     /// Held while the node runs: a CLI moves the keys only while no node
     /// reads them.
     _keys: crate::secrets::KeysLock,
@@ -994,6 +1038,11 @@ impl Daemon {
         let cgroups = opts
             .cgroups
             .unwrap_or_else(|| crate::cgroup::Cgroups::find().map(Arc::new));
+        let owner_dir = opts
+            .owners
+            .as_ref()
+            .filter(|_| opts.ctl && cfg!(unix))
+            .and_then(|e| e.at.parent().map(std::path::Path::to_path_buf));
         let shared = Arc::new(Shared {
             paths: paths.clone(),
             service,
@@ -1021,6 +1070,8 @@ impl Daemon {
             grace: opts.resume_grace,
             providers: Default::default(),
             relay: Default::default(),
+            aside: opts.aside,
+            owner_dir,
         });
         shared.tell_confinement(&cfg);
         // A file that says on starts off: on Linux the password lives in
@@ -1030,6 +1081,21 @@ impl Daemon {
             Some(start_ctl(shared.clone()).await?)
         } else {
             None
+        };
+        // A node whose owner endpoint cannot be made runs on without it:
+        // its owners then need root, as before there was one.
+        let owner = match opts.owners.filter(|_| opts.ctl) {
+            Some(e) => {
+                let at = e.at.clone();
+                match crate::owner::serve(shared.clone(), e).await {
+                    Ok(task) => Some((task, at)),
+                    Err(e) => {
+                        tracing::error!("{e}; the node's owners need root to change it");
+                        None
+                    }
+                }
+            }
+            None => None,
         };
         let supervisor = tokio::spawn(supervise(shared.clone()));
         let relay = tokio::spawn(crate::relay::run(shared.clone()));
@@ -1059,6 +1125,7 @@ impl Daemon {
             supervisor,
             relay,
             ctl,
+            owner,
             _keys: keys,
         })
     }
@@ -1127,39 +1194,90 @@ impl Daemon {
             let _ = std::fs::remove_file(nerve_transport::ctl::token_file(&socket));
             let _ = std::fs::remove_file(socket);
         }
+        if let Some((task, _at)) = self.owner {
+            task.abort();
+            #[cfg(unix)]
+            {
+                let _ = std::fs::remove_file(crate::owner::token_file(&_at));
+                let _ = std::fs::remove_file(_at);
+            }
+        }
         tracing::info!("node daemon stopped");
     }
 
     /// Runs until SIGINT or SIGTERM; SIGHUP reloads the config.
     pub async fn run(opts: NodeOptions) -> Result<(), String> {
-        let d = Daemon::start(opts).await?;
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        // The signals are taken for the whole run, on a task of their own: one
+        // that comes while the node is stopped for an owner's restore still
+        // counts after it.
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
             let mut term = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
             let mut hup = signal(SignalKind::hangup()).map_err(|e| e.to_string())?;
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => break,
-                    _ = term.recv() => break,
-                    _ = hup.recv() => {
-                        let _ = d.reload();
+            tokio::spawn(async move {
+                loop {
+                    let e = tokio::select! {
+                        _ = tokio::signal::ctrl_c() => Event::Stop,
+                        _ = term.recv() => Event::Stop,
+                        _ = hup.recv() => Event::Reload,
+                    };
+                    if tx.send(e).is_err() {
+                        return;
                     }
                 }
-            }
+            });
         }
         // Under the service control manager, its stop request ends the node.
         #[cfg(windows)]
         {
             crate::win_service::running();
-            if crate::win_service::is_service() {
-                crate::win_service::stop_requested().await;
-            } else {
-                let _ = tokio::signal::ctrl_c().await;
-            }
+            tokio::spawn(async move {
+                if crate::win_service::is_service() {
+                    crate::win_service::stop_requested().await;
+                } else {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+                let _ = tx.send(Event::Stop);
+            });
         }
         #[cfg(not(any(unix, windows)))]
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = tx.send(Event::Stop);
+        });
+        Daemon::run_until(opts, events).await
+    }
+
+    /// Runs the node until `events` says stop, or ends; a reload reads the
+    /// config again. Work for while the node is stopped
+    /// ([`NodeOptions::aside`]) stops it, runs, and starts it again; a
+    /// start that fails then ends this with its error, and the service
+    /// manager starts the node again.
+    pub async fn run_until(
+        mut opts: NodeOptions,
+        mut events: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ) -> Result<(), String> {
+        let (tx, mut asides) = tokio::sync::mpsc::unbounded_channel();
+        opts.aside = Some(tx);
+        let mut d = Daemon::start(opts.clone()).await?;
+        loop {
+            let job = tokio::select! {
+                e = events.recv() => match e {
+                    Some(Event::Reload) => {
+                        let _ = d.reload();
+                        continue;
+                    }
+                    Some(Event::Stop) | None => break,
+                },
+                Some(job) = asides.recv() => job,
+            };
+            tracing::info!("the node stops for an owner's restore, and starts again after it");
+            d.stop().await;
+            job.await;
+            d = Daemon::start(opts.clone()).await?;
+        }
         d.stop().await;
         Ok(())
     }
@@ -1523,7 +1641,11 @@ pub(crate) fn control(
                     "machine.sudo changes only through nerve-node sudo on|off".into(),
                 );
             }
+            // Who made it, as the CLI names its user (crate::cli::invoker):
+            // only the owner's programs hold the token.
+            store.set_user(str_of("user"));
             let r = store.set_local(new, if_version);
+            store.set_user(None);
             drop(store);
             match r {
                 Ok(v) => {
@@ -1556,7 +1678,13 @@ pub(crate) fn control(
             }
         }
         "config.accept" => {
-            let r = lock(&shared.store).accept();
+            let r = {
+                let mut store = lock(&shared.store);
+                store.set_user(str_of("user"));
+                let r = store.accept();
+                store.set_user(None);
+                r
+            };
             match r {
                 Ok(v) => {
                     shared.settle_sudo();
@@ -1852,6 +1980,78 @@ mod tests {
             assert!(!set.iter().any(|r| keyrings.starts_with(r)), "{set:?}");
         }
         daemon.stop().await;
+    }
+
+    /// The owner socket's folder, with the owner token, is out of every rule
+    /// of a confined command and no folder of one, even with the whole home
+    /// it lies in among its folders; the account of a command may still
+    /// enter it, for the socket. In `/run`, a system folder, the rest of
+    /// `/run` stays readable.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_owner_sockets_folder_is_sealed_from_commands() {
+        let d = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap();
+        let run = home.join("run");
+        std::fs::create_dir(&run).unwrap();
+        let paths = NodePaths::new(home.join("config"), home.join("state"));
+        let mut opts = NodeOptions::new(paths);
+        opts.home = home.clone();
+        opts.owners = Some(crate::owner::Endpoint {
+            at: run.join(crate::owner::SOCKET_NAME),
+            owners: crate::owner::Owners::Uids(Vec::new()),
+            program: "/bin/false".into(),
+        });
+        let daemon = Daemon::start(opts).await.unwrap();
+        let cfg = daemon.config();
+        let token = crate::owner::token_file(&run.join(crate::owner::SOCKET_NAME));
+        assert!(token.exists());
+        let sealed = daemon.shared.sealed(&cfg);
+        assert!(sealed.contains(&run), "{sealed:?}");
+        assert!(!daemon.shared.own(&cfg).contains(&run));
+        let policy = nerve_policy::CenterPolicy {
+            folders: vec![nerve_policy::config::Folder {
+                path: home.display().to_string(),
+                access: nerve_policy::config::Access::ALL,
+            }],
+            ..Default::default()
+        };
+        let spec = crate::exec::landlock_spec(&policy, &home, &sealed, &[]);
+        for set in [&spec.read, &spec.write, &spec.exec] {
+            assert!(!set.iter().any(|r| token.starts_with(r)), "{set:?}");
+        }
+        // The rest of the home is the command's.
+        std::fs::write(home.join("note.txt"), "x").unwrap();
+        let spec = crate::exec::landlock_spec(&policy, &home, &sealed, &[]);
+        assert!(
+            spec.read.contains(&home.join("note.txt")),
+            "{:?}",
+            spec.read
+        );
+        daemon.stop().await;
+        assert!(!token.exists());
+
+        // The installed node's, in /run.
+        let own = [PathBuf::from(crate::owner::RUNTIME_DIR)];
+        let spec = crate::exec::landlock_spec(&Default::default(), &home, &own, &[]);
+        let token = crate::owner::token_file(&crate::owner::socket());
+        assert!(
+            !spec.read.iter().any(|r| token.starts_with(r)),
+            "{:?}",
+            spec.read
+        );
+        for other in std::fs::read_dir("/run").unwrap().flatten() {
+            let p = other.path();
+            if p != std::path::Path::new(crate::owner::RUNTIME_DIR)
+                && !other.file_type().unwrap().is_symlink()
+            {
+                assert!(
+                    spec.read.iter().any(|r| p.starts_with(r)),
+                    "{p:?}: {:?}",
+                    spec.read
+                );
+            }
+        }
     }
 
     async fn daemon() -> (tempfile::TempDir, Daemon) {
@@ -2495,6 +2695,56 @@ mod tests {
         assert!(file.exists());
         let e = run(restore()).await.unwrap_err();
         assert!(e.contains("runs on these folders"), "{e}");
+        daemon.stop().await;
+    }
+
+    /// A command of a center must not wipe what it did from the owner's
+    /// sight: `log clear` and `audit clear` ask `owner.check` first.
+    #[tokio::test]
+    async fn clearing_the_log_and_the_audit_is_refused_from_below_a_command() {
+        use clap::Parser;
+        let (_d, daemon) = daemon().await;
+        let s = daemon.shared.clone();
+        let paths = daemon.paths().clone();
+        let run = |args: [&str; 2]| {
+            let mut argv: Vec<String> = vec![
+                "nerve-node".into(),
+                "--config-dir".into(),
+                paths.config_dir.display().to_string(),
+                "--state-dir".into(),
+                paths.state_dir.display().to_string(),
+            ];
+            argv.extend(args.map(String::from));
+            async move {
+                let cli = crate::cli::Cli::try_parse_from(argv).map_err(|e| e.to_string())?;
+                crate::cli::execute(cli, &mut Vec::new()).await
+            }
+        };
+        let log = AuditLog::new(paths.audit_log());
+        log.settings("local", 1, &[]).unwrap();
+        let audit = std::fs::read(paths.audit_log()).unwrap();
+        let logged = b"{\"ts\":1,\"level\":\"info\",\"msg\":\"node started\"}\n";
+        std::fs::write(paths.log_file(), logged).unwrap();
+        // This process stands in for a command the node started.
+        lock(&s.commands).insert(std::process::id(), "home".into());
+        for args in [["log", "clear"], ["audit", "clear"]] {
+            let e = run(args).await.unwrap_err();
+            assert!(e.starts_with("refused"), "{args:?}: {e}");
+        }
+        assert_eq!(std::fs::read(paths.audit_log()).unwrap(), audit);
+        assert!(!log.old_path().exists());
+        assert_eq!(std::fs::read(paths.log_file()).unwrap(), logged);
+        // The owner clears them while the node runs.
+        lock(&s.commands).clear();
+        run(["audit", "clear"]).await.unwrap();
+        run(["log", "clear"]).await.unwrap();
+        assert_eq!(std::fs::read(log.old_path()).unwrap(), audit);
+        let read = log.read().unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0]["event"], "cleared");
+        let now = std::fs::read_to_string(paths.log_file()).unwrap();
+        assert_eq!(now.lines().count(), 1, "{now}");
+        assert!(now.contains("the log was cleared by"), "{now}");
         daemon.stop().await;
     }
 

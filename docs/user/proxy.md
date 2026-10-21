@@ -18,12 +18,16 @@ Another node can be the proxy: see [relay](relay.md).
 ## A proxy over TLS
 
 An `https://` proxy is reached over TLS of its own, and the `CONNECT` and its
-login travel inside it. A relay is one; give the pin of its certificate, as
-`relay add` on the relay shows it:
+login travel inside it. A relay is one: paste the link `relay add` on the
+relay shows, which holds the relay's address, this node's name and token,
+and the pin of the relay's certificate:
 
 ```sh
-nerve-node proxy set 'https://lab-pc:<token>@relay.example:7490' --pin <pin>
+nerve-node proxy set 'nerve://relay?address=relay.example%3A7490&node=lab-pc&token=...&pin=...'
 ```
+
+It is the same as the URL with the login and the pin:
+`proxy set 'https://lab-pc:<token>@relay.example:7490' --pin <pin>`.
 
 Without `--pin` the proxy's certificate must be one this machine trusts. The
 user name and password of an `https://` proxy are kept with the node's own
@@ -43,6 +47,15 @@ nerve-node proxy set http://proxy.example:3128 --header 'X-Proxy-Token: abc'
 
 Write special characters of the password as `%XX`. `--header` can be given
 more than once.
+
+An argument shows in the process list while the command runs. To keep the
+secrets out of it, give the user name alone in the URL and the password on
+stdin, and the headers after it, one a line (the desktop app does this):
+
+```sh
+printf '%s\n' "$PASSWORD" 'X-Proxy-Token: abc' |
+  nerve-node proxy set http://user@proxy.example:3128 --password-stdin --headers-stdin
+```
 
 The values are secrets. The node keeps them in the system keyring (Keychain,
 Credential Manager, Secret Service), in one entry named `proxy:<config folder>`

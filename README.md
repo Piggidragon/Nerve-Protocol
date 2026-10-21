@@ -4,12 +4,15 @@ Nerve lets an agent harness use its owner's machines: read and write files and
 run commands. On each machine the owner decides what is allowed. Everything
 else is refused.
 
-Two programs:
+Three programs:
 
-| Program | Job |
-|---|---|
-| `nerve-center` | The center. A harness starts it as an MCP server. It pairs machines, keeps their links, gives the harness their tools and serves a web UI |
-| `nerve-node` | The node. A daemon on each machine, plus a CLI for pairing, rules and the audit log |
+| Program | Job | Put it on |
+|---|---|---|
+| `nerve-center` | The center. A harness starts it as an MCP server. It pairs machines, keeps their links, gives the harness their tools and serves a web UI | the machine where the harness runs |
+| `nerve-node` | The node. A daemon, plus a CLI for pairing, rules and the audit log | each machine the agent may use, without a desktop (a server, Linux on ARM), or where you prefer a terminal |
+| `nerve-node-desktop` | The node with an app: the same node and CLI, and a window that does what the CLI does. It installs itself with the node as a service | each machine the agent may use that has a desktop: Linux x86_64 with GNOME or KDE Plasma, Windows x86_64 |
+
+A machine runs one node: `nerve-node` or `nerve-node-desktop`.
 
 ## Quick install
 
@@ -32,6 +35,20 @@ from a terminal opened as administrator
 ([Windows](docs/user/service.md#windows)). The center is
 `nerve-center-x86_64-linux` (or `-aarch64-linux`, `-x86_64-windows.exe`)
 from the same release.
+
+## Install the desktop app
+
+1. Download `nerve-node-desktop-x86_64-linux` or
+   `nerve-node-desktop-x86_64-windows.exe` from
+   [Releases](https://github.com/Piggidragon/Nerve-Protocol/releases/latest).
+2. On Linux, allow it to run: in the file's **Properties** switch on
+   **Executable as Program** (GNOME Files) or tick **Is executable** under
+   **Permissions** (KDE Dolphin).
+3. Open it, and press **Install**.
+
+It installs the node as a service and the app, with **Nerve** in the
+application menu or Start menu, then walks you through naming the machine and
+pairing it ([desktop app](docs/user/desktop.md)).
 
 ## Quick start
 

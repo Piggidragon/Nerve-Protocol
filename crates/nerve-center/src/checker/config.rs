@@ -883,8 +883,64 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "the system cron table",
         ),
         b("fs-cron-d", "fs.write:/etc/cron.d/*", "a system cron job"),
+        // ---- the node itself: an agent that runs the node's own program,
+        //      names its control socket or pipe, or touches its folders is
+        //      about to change the node it runs on. This catches a confused
+        //      agent, not one that hides what it does; the real protection
+        //      is that commands run as an account of their own
+        //      (docs/user/action-checker.md) ----
+        b(
+            "nerve-node",
+            "exec.run:nerve-node",
+            "drives the node itself",
+        ),
+        b(
+            "nerve-node-desktop",
+            "exec.run:nerve-node-desktop",
+            "drives the node itself",
+        ),
+        b(
+            "nerve-node-socket",
+            &format!(r"exec.run:re:(?i)(?:/run/nerve-node{NAME_END}|\\\\[.?]\\pipe\\nerve-node)"),
+            "names the node's control socket or pipe",
+        ),
+        b(
+            "nerve-node-folders",
+            &format!(
+                r"exec.run:re:(?i)(?:/etc/nerve|/var/lib/nerve|\.config[\\/]+nerve|\.local[\\/]+state[\\/]+nerve|programdata%?[\\/]+nerve){NAME_END}"
+            ),
+            "names the node's config or state folder",
+        ),
+        b(
+            "fs-nerve-home-config",
+            "fs.write:~/.config/nerve/*",
+            "the node's config",
+        ),
+        b(
+            "fs-nerve-home-state",
+            "fs.write:~/.local/state/nerve/*",
+            "the node's state",
+        ),
+        b("fs-nerve-etc", "fs.write:/etc/nerve/*", "the node's config"),
+        b(
+            "fs-nerve-var",
+            "fs.write:/var/lib/nerve/*",
+            "the node's state",
+        ),
+        // Any drive: the wire path of `C:\ProgramData\Nerve` is
+        // `/c/ProgramData/Nerve`, matched in any case.
+        b(
+            "fs-nerve-programdata",
+            "fs.write:/?/ProgramData/Nerve/*",
+            "the node's config and state",
+        ),
     ]
 }
+
+/// The end of a name in a `re:` entry: the line's end or a character that
+/// cannot go on in a name, so `/etc/nerve` is not `/etc/nervecenter` and
+/// `~/.config/nerve` is not the desktop app's `~/.config/nerve-node-desktop`.
+const NAME_END: &str = "(?:$|[^a-z0-9_-])";
 
 /// How the blocklist is kept: only the owner's part of it, so a later
 /// release's built-ins reach a center that has the list saved. Per built-in

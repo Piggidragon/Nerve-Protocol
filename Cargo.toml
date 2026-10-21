@@ -6,23 +6,24 @@ members = [
     "crates/nerve-policy",
     "crates/nerve-sandbox",
     "crates/nerve-node",
+    "crates/nerve-node-desktop",
     "crates/nerve-center",
     "crates/nerve-conformance",
 ]
 
 [workspace.package]
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 repository = "https://github.com/Piggidragon/Nerve-Protocol"
 rust-version = "1.88"
 
 [workspace.dependencies]
-nerve-proto = { path = "crates/nerve-proto", version = "0.0.5" }
-nerve-transport = { path = "crates/nerve-transport", version = "0.0.5" }
-nerve-policy = { path = "crates/nerve-policy", version = "0.0.5" }
-nerve-sandbox = { path = "crates/nerve-sandbox", version = "0.0.5" }
-nerve-node = { path = "crates/nerve-node", version = "0.0.5" }
-nerve-center = { path = "crates/nerve-center", version = "0.0.5" }
+nerve-proto = { path = "crates/nerve-proto", version = "0.0.6" }
+nerve-transport = { path = "crates/nerve-transport", version = "0.0.6" }
+nerve-policy = { path = "crates/nerve-policy", version = "0.0.6" }
+nerve-sandbox = { path = "crates/nerve-sandbox", version = "0.0.6" }
+nerve-node = { path = "crates/nerve-node", version = "0.0.6" }
+nerve-center = { path = "crates/nerve-center", version = "0.0.6" }
 
 # Every crate below except keyring is a widely used, well-tested choice for its job.
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync", "signal", "fs"] }
@@ -52,6 +53,12 @@ keyring = "4.2"
 # and the AppContainer of folder mode with the grants on its folders: the
 # bindings the node does not declare itself.
 windows-sys = "0.61"
+# The node's desktop app (crates/nerve-node-desktop), under Slint's Royalty-free
+# license 2.0: the app shows Slint's AboutSlint in its About dialog.
+slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "renderer-software", "software-renderer-systemfonts", "accessibility", "unstable-winit-030"] }
+slint-build = "1.18"
+# The desktop app's file and folder dialogs.
+rfd = "0.17"
 
 [profile.release]
 lto = "thin"

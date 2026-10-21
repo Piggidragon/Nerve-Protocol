@@ -2,13 +2,16 @@
 
 Releases are made by the `Release` workflow (`.github/workflows/release.yml`).
 The owner starts it by hand: **Actions, Release, Run workflow**. Leave "Use
-workflow from" on `main` and fill in:
+workflow from" on `main` and fill in the inputs below. A pre-release of a
+branch that changes the release workflow itself picks that branch under "Use
+workflow from" too: GitHub takes the workflow file from there, not from
+`branch`.
 
 | Input | Meaning |
 |---|---|
 | `branch` | The branch to build from. Default `main` |
 | `kind` | `pre-release` or `release` |
-| `version` | `x.y.z`, the version of `nerve-center` and `nerve-node` in the workspace `Cargo.toml` |
+| `version` | `x.y.z`, the version of `nerve-center`, `nerve-node` and `nerve-node-desktop` in the workspace `Cargo.toml` |
 
 ## Rules
 
@@ -40,12 +43,19 @@ workflow from" on `main` and fill in:
    `aarch64-unknown-linux-musl` (static) and `x86_64-pc-windows-msvc` (static C
    runtime). Each Linux binary must be static. Each binary must print its
    version from `--version`, and it must equal the one given.
+   It also builds the desktop app `nerve-node-desktop`: for Linux x86_64 on
+   Ubuntu 22.04, the oldest runner (it links glibc and fontconfig, so it runs
+   where glibc is 2.35 or newer; the run's summary says the glibc it needs) and for Windows x86_64
+   (static C runtime). It must print `nerve-node-desktop <version>`.
 3. Runs the conformance suite (`cargo test -p nerve-conformance`) against the
    Linux binaries that were just built, the ones to be released, with
    `NERVE_CENTER_BIN` and `NERVE_NODE_BIN` set to them. `x86_64` runs on an
    x86_64 runner and `aarch64` on an arm64 runner. The Windows binaries are
    built but not run by the workflow.
-4. Publishes a GitHub Release with the six binaries and `SHA256SUMS`. A release
+4. Publishes a GitHub Release with the eight binaries and `SHA256SUMS`. The
+   desktop app's update takes `nerve-node-desktop-x86_64-linux` or
+   `nerve-node-desktop-x86_64-windows.exe` from there, as `nerve-node update`
+   takes `nerve-node-*`. A release
    is marked latest. A pre-release is marked as a pre-release.
 
 The binaries are not signed. The workflow uses no secrets. Only its last job
@@ -69,10 +79,12 @@ run again.
 
 1. Set the version in the workspace `Cargo.toml`, in the `version` of the path
    dependencies in `[workspace.dependencies]`, and in `Cargo.lock` (run
-   `cargo build`). Write the `## <version>` section of `CHANGELOG.md`.
+   `cargo build`). Rename the `## Unreleased` section of `CHANGELOG.md`, where
+   the changes since the last release collect, to `## <version>`.
 2. Merge that to `main`.
 3. Run the workflow with kind `release` and that version.
 
 After a release, raise the version in `Cargo.toml` and `Cargo.lock` with the
 first change toward the next one. Until then the workflow refuses a pre-release
-of the released version.
+of the released version. That change also starts a new `## Unreleased` section
+at the top of `CHANGELOG.md`.

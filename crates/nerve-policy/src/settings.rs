@@ -280,6 +280,9 @@ pub struct SettingsStore {
     audit: AuditLog,
     config: NodeConfig,
     observer: Option<Observer>,
+    /// The account of the person whose local changes these are, for the
+    /// audit ([`SettingsStore::set_user`]).
+    user: Option<String>,
 }
 
 impl SettingsStore {
@@ -313,6 +316,7 @@ impl SettingsStore {
             audit,
             config: NodeConfig::default(),
             observer: None,
+            user: None,
         };
         // The versions a file of this node had stay behind it: the next one
         // continues them, or the node would refuse its own file at its next
@@ -367,6 +371,7 @@ impl SettingsStore {
             audit,
             config: NodeConfig::default(),
             observer: None,
+            user: None,
         };
         let v = s.accept().map_err(|e| e.to_string())?;
         Ok((s, v))
@@ -418,11 +423,20 @@ impl SettingsStore {
         self.observer = Some(Box::new(f));
     }
 
+    /// Names the account of the person who makes the next local changes
+    /// (`None`: not known), which the audit records beside `local`.
+    pub fn set_user(&mut self, user: Option<String>) {
+        self.user = user;
+    }
+
     /// Audits a change that was saved and tells the observer.
     fn changed(&self, by: &str, version: u64, changes: &[Change]) {
+        let user = (by == Writer::Local.label())
+            .then_some(self.user.as_deref())
+            .flatten();
         // The change is saved; an audit log that cannot be written is no
         // reason to undo it.
-        let _ = self.audit.settings(by, version, changes);
+        let _ = self.audit.settings_by(by, user, version, changes);
         if let Some(f) = &self.observer {
             f(by, version, changes);
         }

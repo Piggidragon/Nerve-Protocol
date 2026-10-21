@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
-use nerve_proto::{CONNECT_PATH, NODE_HEADER, PAIR_PATH};
+use nerve_proto::{CONNECT_PATH, NODE_HEADER, PAIR_CHECK_PATH, PAIR_PATH};
 use nerve_transport::http::{self, Request, Response};
 use nerve_transport::net::BoxIo;
 
@@ -129,6 +129,10 @@ async fn node_conn(center: Center, mut io: BoxIo) {
     match (req.method.as_str(), req.path.as_str()) {
         ("POST", PAIR_PATH) => {
             let (status, body) = center.pair(&req.body);
+            let _ = Response::json(status, &body).write(&mut io).await;
+        }
+        ("POST", PAIR_CHECK_PATH) => {
+            let (status, body) = center.pair_check(&req.body);
             let _ = Response::json(status, &body).write(&mut io).await;
         }
         ("GET", CONNECT_PATH) if req.is_upgrade() => connect(center, io, req).await,

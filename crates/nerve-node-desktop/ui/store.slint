@@ -1,0 +1,499 @@
+// The app's state and its actions, shared by every page. The Rust side
+// (src/app.rs) fills it from the CLI's answers and runs the actions as
+// `nerve-node` commands; nothing here decides anything about the node.
+
+import { Tone } from "theme.slint";
+import {
+    Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
+    RefGroup, RelayNodeRow, TunnelRow, Pick, Limit,
+} from "data.slint";
+
+export global Store {
+    in-out property <Page> page: Page.overview;
+    in-out property <string> version;
+
+    // The node's status and its centers, both from `nerve-node status`.
+    in-out property <Load> status-load: Load.loading;
+    in-out property <string> status-error;
+    in-out property <NodeStatus> status;
+    in-out property <[CenterRow]> centers;
+
+    in-out property <Load> audit-load: Load.loading;
+    in-out property <string> audit-error;
+    in-out property <[AuditRow]> audit;
+    // How many entries the page read (the newest, src/app/live.rs), and how
+    // many of those it shows at most.
+    in-out property <int> audit-read;
+    in-out property <int> audit-limit: 200;
+    // What the page shows of them (view::AuditFilter): the decision (0 all,
+    // 1 allowed, 2 refused, 3 settings changes), the order, words in the
+    // target and the reason, and a center and an action by their place in
+    // the options (0: every one).
+    in-out property <int> audit-decision;
+    in-out property <bool> audit-oldest;
+    in-out property <string> audit-text;
+    in-out property <int> audit-center;
+    in-out property <int> audit-action;
+    in-out property <[string]> audit-center-options: ["Every center"];
+    in-out property <[string]> audit-action-options: ["Every action"];
+    // The entries of each decision under the other filters, how many match
+    // them all, that in words, and the foot's line.
+    in-out property <[int]> audit-counts: [0, 0, 0, 0];
+    in-out property <int> audit-matches;
+    in-out property <string> audit-summary;
+    in-out property <string> audit-foot;
+    in-out property <bool> audit-more-left;
+
+    // Pairing: the link, then what the owner confirms.
+    in-out property <bool> pair-open;
+    in-out property <int> pair-step;
+    in-out property <string> pair-link;
+    in-out property <string> pair-name;
+    in-out property <bool> pair-busy;
+    in-out property <string> pair-error;
+    in-out property <PairPreview> pair-preview;
+
+    // What a change that waits for its answer is about (a center's name, an
+    // audit entry), so its buttons wait too.
+    in-out property <string> busy;
+
+    in-out property <bool> confirm-open;
+    in-out property <string> confirm-title;
+    in-out property <string> confirm-text;
+    in-out property <string> confirm-button;
+    // A choice the question offers, such as ending the old key's days at
+    // once; none when empty.
+    in-out property <string> confirm-option;
+    in-out property <string> confirm-option-detail;
+    in-out property <bool> confirm-option-on;
+
+    in-out property <bool> toast-shown;
+    in-out property <string> toast;
+    in-out property <Tone> toast-tone: Tone.ok;
+
+    in-out property <bool> about-open;
+    // A part of the desktop the app needs is missing (src/deps.rs): what,
+    // and what to install.
+    in-out property <bool> missing-open;
+    in-out property <string> missing-title;
+    in-out property <string> missing-text;
+    // 0 follows the system, 1 light, 2 dark.
+    in-out property <int> appearance;
+
+    // Opens a page; the page that is open stays as it is.
+    callback show(Page);
+    // Reads the open page again (Refresh, Ctrl+R).
+    callback reload();
+    callback refresh();
+    callback refresh-audit();
+    callback audit-more();
+    // A filter or the order changed.
+    callback audit-filtered();
+    // Asks before `audit clear`.
+    callback audit-clear();
+    callback audit-rule(int, string, bool);
+
+    callback pair-start();
+    callback pair-check(string, string);
+    callback pair-confirm();
+
+    callback center-pause(string, bool);
+    callback center-grant(string, bool);
+    callback center-unpair(string);
+    callback center-rotate(string);
+    callback confirm-accepted();
+
+    callback panic();
+    callback unlock();
+    callback set-appearance(int);
+
+    // Whether the node's folders are the installed service's.
+    in-out property <bool> installed;
+    // The installed service, from `nerve-node service status`: "" before
+    // the first answer, "none" when the node is not installed as a
+    // service, else running, stopped, starting, stopping or failed.
+    in-out property <string> service-state;
+    in-out property <bool> service-enabled;
+    // start, stop or restart.
+    callback service(string);
+    // A change was made that the running service takes only when it starts
+    // again (src/app.rs, Ctl::done): the Overview offers the restart.
+    in-out property <bool> restart-due;
+    // Whether the node's keys may go into the system keyring here, and why
+    // not (src/app.rs, Ctl::keyring_state).
+    in-out property <bool> keyring-usable;
+    in-out property <string> keyring-why;
+
+    // The installed node runs commands as the app's own user (src/app.rs,
+    // Ctl::show_status): a center's command could then change the node's
+    // settings as its owner. The Overview warns and offers an account of
+    // their own for the commands.
+    in-out property <bool> commands-as-you;
+    in-out property <string> commands-account;
+    // How a command gets root besides: through these groups and sudo, in
+    // words ("docker and sudo"); empty when it does not.
+    in-out property <string> commands-root-via;
+    // The owner said not to show the card again for this account and these
+    // ways to root (src/settings.rs); Settings, General brings it back.
+    in-out property <bool> commands-dismissed;
+    callback separate-account();
+    callback commands-dismiss();
+    callback commands-show();
+
+    // Elevation: an installed node's files are the system's; an owner is
+    // asked only for what needs an administrator, anyone else once, and the
+    // app says why first.
+    in-out property <bool> elevate-needed;
+    in-out property <bool> elevate-open;
+    in-out property <bool> elevate-busy;
+    in-out property <string> elevate-error;
+    callback elevate-allow();
+
+    // The first-run steps: 0 the name, 1 the keys, 2 the first center, 3 its
+    // mode, 4 done.
+    in-out property <bool> setup-open;
+    in-out property <int> setup-step;
+    in-out property <string> setup-name;
+    in-out property <int> setup-storage;
+    in-out property <string> setup-center;
+    in-out property <string> setup-mode: "allowlist";
+    in-out property <bool> setup-busy;
+    in-out property <string> setup-error;
+    callback setup-start();
+    callback setup-next();
+    callback setup-skip();
+    // One step back; the first step has none.
+    callback setup-back();
+    // The steps closed before their end (× or Escape).
+    callback setup-close();
+}
+
+// The Permissions page: what one center may do.
+export global Perm {
+    in-out property <[string]> centers;
+    in-out property <int> current;
+    in-out property <string> center;
+    in-out property <Load> load: Load.loading;
+    in-out property <string> error;
+    in-out property <string> mode;
+    in-out property <string> mode-until;
+    in-out property <[FolderRow]> folders;
+    in-out property <[string]> allow;
+    in-out property <[string]> deny;
+    in-out property <[string]> sudo-list;
+    // The new rule each list's field holds, and its Wildcard switch; the
+    // lists are 0 allow, 1 deny, 2 sudo.
+    in-out property <string> allow-text;
+    in-out property <bool> allow-wild;
+    in-out property <string> deny-text;
+    in-out property <bool> deny-wild;
+    in-out property <string> sudo-text;
+    in-out property <bool> sudo-wild;
+    // Allowlist mode: whether its exceptions (the deny rules) are open.
+    in-out property <bool> except-open;
+    // The rule being edited in place: its list (-1: none), its row, and
+    // what it becomes.
+    in-out property <int> edit-list: -1;
+    in-out property <int> edit-index;
+    in-out property <string> edit-text;
+    in-out property <bool> edit-busy;
+    in-out property <[CapRow]> caps;
+    in-out property <bool> sudo-on;
+
+    in-out property <bool> mode-open;
+    in-out property <string> mode-choice;
+    in-out property <bool> mode-timed;
+    in-out property <string> mode-hours: "8";
+    in-out property <string> mode-error;
+
+    in-out property <bool> folder-open;
+    in-out property <string> folder-path;
+    in-out property <bool> folder-read: true;
+    in-out property <bool> folder-write;
+    in-out property <bool> folder-execute;
+    in-out property <string> folder-error;
+
+    in-out property <bool> sudo-open;
+    in-out property <string> sudo-password;
+    in-out property <string> sudo-error;
+    in-out property <bool> sudo-busy;
+
+    // The deny list lacks rules of the guard (nerve_policy::rules::GUARD).
+    in-out property <bool> guard-missing;
+    in-out property <bool> guard-busy;
+
+    callback pick(int);
+    callback refresh();
+    callback mode-pick(string);
+    callback mode-apply();
+    callback folder-choose();
+    callback folder-add();
+    callback folder-set(string, bool, bool, bool);
+    callback folder-remove(string);
+    callback rule-add(int);
+    callback rule-remove(int, string);
+    callback rule-edit-save();
+    callback cap-set(string, int);
+    callback sudo-ask();
+    callback sudo-confirm();
+    callback sudo-off();
+    callback guard-add();
+}
+
+// The Log page.
+export global Logs {
+    in-out property <Load> load: Load.loading;
+    in-out property <string> error;
+    in-out property <[LogRow]> rows;
+    in-out property <bool> problems-only;
+    // How many of the newest lines the page asks for (src/app/live.rs).
+    in-out property <int> limit: 300;
+    callback filter(bool);
+    callback more();
+    // Asks before `log clear`.
+    callback clear();
+}
+
+// The Help page: whether its keys and its command reference are open, and
+// the reference (src/reference.rs): what it shows for the filter and the
+// order. Each part, topic and command opens and closes on its own.
+export global Manual {
+    in-out property <bool> keys-open;
+    in-out property <bool> commands-open;
+    in-out property <[RefGroup]> ref-groups;
+    in-out property <string> ref-filter;
+    in-out property <bool> ref-by-name;
+    // A command (by its name) or a topic opens or closes.
+    callback ref-toggle(string);
+    callback ref-group-toggle(string);
+    // The filter or the order changed.
+    callback ref-update();
+    // Opens the page, and the tab of Settings (-1: none), a command's work
+    // is done on.
+    callback ref-go(Page, int);
+}
+
+// The Settings page.
+export global Prefs {
+    in-out property <Load> load: Load.loading;
+    in-out property <string> error;
+    // Its tab: 0 General, 1 Keys, 2 Network, 3 Limits, 4 Backup, 5 App,
+    // 6 Advanced.
+    in-out property <int> tab;
+
+    // log.level: 0 error, 1 warn, 2 info, 3 debug.
+    in-out property <int> log-level: 2;
+    callback log-level-set(int);
+    // machine.shell, and the platform's shell it is without one.
+    in-out property <string> shell;
+    in-out property <string> shell-default;
+    callback shell-save();
+
+    // The limits, by group: what one command may use, how long it runs,
+    // the node's commands and output, and the relay's tunnels. A save sets
+    // the changed ones of a group; an empty field is the default again.
+    in-out property <[Limit]> limits-command;
+    in-out property <[Limit]> limits-time;
+    in-out property <[Limit]> limits-node;
+    in-out property <[Limit]> limits-relay;
+    in-out property <string> limits-error;
+    in-out property <string> limits-busy;
+    // A field of a group changed: the group (command, time, node, relay),
+    // its row and the text.
+    callback limit-edit(string, int, string);
+    callback limits-save(string);
+
+    in-out property <string> name;
+    in-out property <string> name-shown;
+    in-out property <int> storage;
+    callback name-save(string);
+    callback storage-set(int);
+
+    in-out property <string> proxy;
+    in-out property <string> proxy-pin;
+    in-out property <string> proxy-login;
+    in-out property <string> proxy-headers;
+    in-out property <string> proxy-problem;
+    in-out property <bool> proxy-open;
+    in-out property <string> proxy-new-url;
+    in-out property <string> proxy-new-pin;
+    in-out property <string> proxy-new-headers;
+    in-out property <string> proxy-new-password;
+    in-out property <string> proxy-error;
+    callback proxy-edit();
+    callback proxy-set();
+    callback proxy-remove();
+
+    // The Relay page. This node as a relay: where it listens, its state,
+    // its pin, the nodes it carries and their tunnels now.
+    in-out property <string> relay-listen;
+    in-out property <string> relay-status;
+    in-out property <string> relay-pin;
+    in-out property <[RelayNodeRow]> relay-nodes;
+    in-out property <[TunnelRow]> tunnels;
+    in-out property <string> relay-address: "0.0.0.0:7490";
+    callback relay-on();
+    callback relay-off();
+    callback relay-remove(string);
+    // A node's link: a new node (`relay add`), or a new link for the node
+    // `relay-add-for` names (`relay token`). Where the other node reaches
+    // this machine goes into it, as the relay's guess or the owner's.
+    in-out property <bool> relay-add-open;
+    in-out property <string> relay-add-for;
+    in-out property <string> relay-add-name;
+    in-out property <string> relay-add-address;
+    in-out property <string> relay-add-error;
+    in-out property <bool> relay-add-busy;
+    callback relay-add();
+    callback relay-token(string);
+    callback relay-add-confirm();
+    // This node through a relay: its proxy is one (https, a pin and a
+    // login), at this address under this name, and how its links fare.
+    in-out property <bool> via-relay;
+    in-out property <string> via-address;
+    in-out property <string> via-node;
+    in-out property <string> via-state;
+    in-out property <Tone> via-tone: Tone.neutral;
+    // The dialog that takes a relay's link, or its parts apart.
+    in-out property <bool> connect-open;
+    in-out property <string> connect-link;
+    in-out property <bool> connect-apart;
+    in-out property <string> connect-address;
+    in-out property <string> connect-node;
+    in-out property <string> connect-token;
+    in-out property <string> connect-pin;
+    // What the link says, once it reads as one.
+    in-out property <string> connect-summary;
+    in-out property <string> connect-error;
+    in-out property <bool> connect-busy;
+    callback connect-start();
+    callback connect-read(string);
+    callback connect-save();
+    callback disconnect();
+    // One relayed node's centers and limits, in its dialog: no center
+    // ticked lets it reach every https center of this node.
+    in-out property <bool> relay-edit-open;
+    in-out property <string> relay-edit-name;
+    in-out property <[Pick]> relay-edit-centers;
+    in-out property <bool> relay-edit-own;
+    in-out property <string> relay-edit-links;
+    in-out property <string> relay-edit-opens;
+    in-out property <string> relay-edit-error;
+    in-out property <bool> relay-edit-busy;
+    callback relay-edit(int);
+    callback relay-edit-pick(int, bool);
+    callback relay-edit-save();
+
+    // A token or a key shown once, with what to do with it.
+    in-out property <bool> once-open;
+    in-out property <string> once-title;
+    in-out property <string> once-note;
+    in-out property <string> once-text;
+    in-out property <string> once-copy;
+
+    in-out property <string> raw-key;
+    in-out property <string> raw-value;
+    in-out property <string> raw-shown;
+    in-out property <string> raw-error;
+    callback raw-get();
+    callback raw-set();
+    callback raw-unset();
+    callback raw-add();
+    // The account commands run as (machine.user), choosing another, and on
+    // Windows giving the service its new password.
+    in-out property <string> account;
+    in-out property <string> account-new;
+    in-out property <string> account-password;
+    in-out property <string> account-error;
+    in-out property <bool> account-busy;
+    callback account-use();
+    callback account-password-save();
+    callback raw-remove();
+    callback accept-file();
+
+    in-out property <bool> backup-open;
+    in-out property <string> backup-file;
+    in-out property <string> backup-pass;
+    in-out property <string> backup-pass2;
+    in-out property <bool> backup-keyring;
+    in-out property <string> backup-error;
+    in-out property <bool> backup-busy;
+    callback backup-choose();
+    callback backup-confirm();
+
+    in-out property <bool> restore-open;
+    in-out property <string> restore-file;
+    in-out property <string> restore-pass;
+    in-out property <bool> restore-replace;
+    in-out property <bool> restore-without-proxy;
+    in-out property <bool> restore-in-files;
+    in-out property <string> restore-error;
+    in-out property <bool> restore-busy;
+    callback restore-choose();
+    callback restore-confirm();
+}
+
+// Installing, updating and removing the app with the node: the installer
+// window, which a program that is not the installed one shows, and the
+// update and uninstall of Settings.
+export global Install {
+    // The window is the installer.
+    in-out property <bool> shown;
+    // welcome: what will be installed; installed: it is, from another
+    // file; choose: what goes with an uninstall, or where an update comes
+    // from; working; done.
+    in-out property <string> step: "welcome";
+    // What runs or ran: install, update or uninstall.
+    in-out property <string> action: "install";
+    // This program's version, the installed one's ("" when none), and
+    // whether this one is newer.
+    in-out property <string> version;
+    in-out property <string> installed-version;
+    in-out property <bool> newer;
+    // The node is installed as a service already, without the app.
+    in-out property <bool> node-only;
+    // Where the app goes, or is.
+    in-out property <string> program;
+    in-out property <bool> windows;
+    // Windows: the account commands run as, and its password, which the
+    // service needs to start them.
+    in-out property <string> account;
+    in-out property <string> password;
+    // Uninstall: delete the node's data too.
+    in-out property <bool> purge;
+    // Update: 0 the latest release, 1 a file.
+    in-out property <int> source;
+    in-out property <string> file;
+    // The system's question for the rights is open.
+    in-out property <bool> asking;
+    in-out property <string> error;
+    // The heading of the error when it is not that the step did not finish:
+    // no file dialog could open.
+    in-out property <string> error-title;
+    // What the command did, and what it warned about.
+    in-out property <[string]> did;
+    in-out property <[string]> warnings;
+    // Settings' dialogs.
+    in-out property <bool> update-open;
+    in-out property <bool> uninstall-open;
+    // The app closes: set when it is gone, for the tests.
+    in-out property <bool> closed;
+
+    // Another copy of the program was opened while the app is open, such as
+    // the file just downloaded: the app offers what the installer offers
+    // for it. Its path, its version, and whether it is newer.
+    in-out property <bool> other-open;
+    in-out property <string> other-file;
+    in-out property <string> other-version;
+    in-out property <bool> other-newer;
+    callback other-update();
+
+    callback install();
+    callback update();
+    callback choose-file();
+    callback uninstall();
+    callback ask-update();
+    callback ask-uninstall();
+    callback open-app();
+    callback close();
+}

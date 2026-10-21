@@ -34,7 +34,8 @@ Whatever the downloaded file is called, `install` puts it in place as
 2. Makes the folders, private to `nerve` (mode 0700). Folders an earlier
    install left behind are given to the new user.
 3. Sets the account that [commands run as](#the-account-commands-run-as):
-   the account that ran `sudo`. An account chosen before stays. When you
+   the account that ran `sudo` (or polkit's `pkexec`, with which the
+   [desktop app](desktop.md) asks). An account chosen before stays. When you
    are logged in as root without `sudo`, it is root, and `install` warns
    that commands from a center then run as root. It warns about the account
    that ran `sudo` as well, since a person logs in as it, and about any
@@ -64,21 +65,32 @@ Running `install` again repairs what is missing and restarts the service.
 | Home of `nerve` | `/var/lib/nerve` |
 | The program | `/usr/local/bin/nerve-node` |
 | The unit | `/etc/systemd/system/nerve-node.service` |
+| The owners' socket and owner token, made at each start, gone at the stop | `/run/nerve-node` |
 
 Nothing else is written. `journalctl -u nerve-node` shows the node's output.
 
 ## Use the commands
 
 When the node is installed, `nerve-node` without `--config-dir` and
-`--state-dir` works on the installed node. Run the commands with `sudo`:
+`--state-dir` works on the installed node. Its owners, the members of the
+group `nerve-admin` (`install` puts the user who ran `sudo` there), run the
+commands without `sudo`:
 
 ```sh
-sudo nerve-node status
-sudo nerve-node rule add allow 'git status'
+nerve-node status
+nerve-node rule add allow 'git status'
+nerve-node service restart
 ```
 
-A command that root runs on these folders runs as `nerve`, so every file it
-writes stays the node's. Another user gets a message that says to use `sudo`.
+The running node runs an owner's command as `nerve`, with the CLI's checks,
+and audits it with the owner's name ([who may change the
+node](desktop.md#administrator-rights)). These stay root's, with `sudo`:
+`install`, `update`, `uninstall`, `setup`, `sudo on`, and `machine.user`,
+`machine.allow_root`, `machine.sudo_path` and `machine.shell`, also a
+`restore` that would change them. `backup` and `restore` open the file as the
+owner and hand it to the node ([backup](backup.md#on-a-node-installed-as-a-service)). While the node is stopped, only root changes it. A command
+that root runs on these folders runs as `nerve`, so every file it writes
+stays the node's. Another user gets a message that says to use `sudo`.
 
 ## The account commands run as
 
@@ -96,7 +108,12 @@ account's home.
 - In `user` mode a command may do what that account may do.
 - In `folder` mode it is that account as well, held by Landlock to the
   folders you gave the center ([modes](modes.md)). That is the only
-  difference to `user` mode.
+  difference to `user` mode. Landlock holds the command's own processes,
+  not the account's other programs: one of them that runs things on request
+  runs what the command asks outside the sandbox, so `folder` mode is no
+  boundary against that account. When `install` took you, that account is
+  yours, and that is yours to answer for; an account of their own
+  ([setup](#setup)) keeps commands from what is yours.
 - In `allowlist` mode it runs what an allow rule names, as that account.
 
 No command can read the node's keys: they are private to `nerve`. Before a
@@ -187,6 +204,32 @@ it, and asks the other questions. An account that is there already is
 taken if the node can use it. `nerve`, an account that could open the
 node's folders, and a name other than a-z, 0-9, `_` and `-` are refused
 before anything changes. `--create-user` works on an installed node only.
+With `--account-only` setup chooses that account and asks nothing else; the
+desktop app does that in Settings, **Account for commands**.
+
+## Start and stop
+
+```sh
+nerve-node service stop      # the node ends its links; nothing runs
+nerve-node service start
+nerve-node service restart   # takes every change in node.toml
+nerve-node service status    # anyone may ask
+```
+
+`service` does what `systemctl stop|start|restart nerve-node` does (on
+Windows, the service control manager), and waits until a node that starts
+answers. An owner needs no `sudo` for it at the machine. `install` writes a
+helper, `/usr/local/lib/nerve-node/service-control`, that starts, stops or
+restarts `nerve-node.service` and does nothing else, with a polkit action of
+its own (`/usr/share/polkit-1/actions/org.nerve-protocol.node.service-control.policy`).
+`service` runs it through `pkexec`, and polkit lets the members of
+`nerve-admin` do that without a password from their own local session: by the
+rule `/etc/polkit-1/rules.d/50-nerve-node.rules` (which also lets them use
+`systemctl` for this service), or on polkit 0.105 (Ubuntu 22.04), which takes
+no rules, by `/etc/polkit-1/localauthority/50-local.d/50-nerve-node.pkla`.
+No file lets them manage other units. Over SSH it needs `sudo`. A stopped service starts again with the machine. `service status`
+says whether the node is installed as a service, whether it runs, whether it
+starts with the machine, and the installed program with its version.
 
 ## Update
 
@@ -204,10 +247,11 @@ The config, the keys and the audit log are not touched. `update` refuses a
 file that is not `nerve-node` and a program older than the installed one. If
 the new program does not start, the old one is put back and started again.
 
-`update` does not write the unit. After an update from a version without
-[limits per command](limits.md), run `sudo nerve-node install` once more: it
-writes the unit with `Delegate=` and restarts the node. Until then
-`nerve-node status` says that commands run without their limits.
+`update` writes the unit of the new version when it differs, so the node
+gets what a newer version needs ([limits per command](limits.md), the owners'
+runtime folder). A node installed before there were owners gets them: the
+group `nerve-admin` with the user who updates, the polkit files and the
+helper. An update changes no owner that is there.
 
 ## Uninstall
 
@@ -216,14 +260,19 @@ sudo nerve-node uninstall           # keeps the config and state folders
 sudo nerve-node uninstall --purge   # deletes them too
 ```
 
-`uninstall` stops and disables the service, removes the unit, the user
-`nerve` and `/usr/local/bin/nerve-node`. A session that a keyring gave
+`uninstall` stops and disables the service, removes the unit, the polkit
+files and the helper, the group `nerve-admin`, the user `nerve` and
+`/usr/local/bin/nerve-node`. A session that a keyring gave
 `nerve` is ended first. Without `--purge`, `/etc/nerve` and
 `/var/lib/nerve` stay and belong to root from then on, so no later user with
 the old uid gets the keys. The account of the commands stays, also one that
 `setup` made; `sudo userdel -r <name>` removes it. A later `install` takes them up again: the node
 comes back with its pairings, rules and audit log. `--purge` deletes them,
-keys and audit log included.
+keys and audit log included. The [desktop app](desktop.md)'s uninstall also
+removes its menu entry, its link handler and the `nerve-node` link it made.
+Where the app took over the node, `nerve-node uninstall` of the downloaded
+CLI edition hands over to the app's (`nerve-node-desktop uninstall`, with
+`--purge` if given), so the app goes with the node.
 
 ## Windows
 
@@ -264,10 +313,24 @@ Restart-Service nerve-node
 The service writes its log to `C:\ProgramData\Nerve\state\log.jsonl`. When
 it does not start, the Event Viewer says why, and the log has the rest.
 
+`install` also makes the user who ran it an owner of the node: its SID goes
+into the service's registry key
+(`HKLM\SYSTEM\CurrentControlSet\Services\nerve-node\Parameters`, value
+`Owners`), and the service lets it start, stop and restart the service. An
+owner runs the other commands in an ordinary terminal; the service runs them
+as `nerve` over a pipe open to the owners only, and audits them with the
+owner's name ([who may change the node](desktop.md#administrator-rights)).
+`install`, `update`, `uninstall`, `setup`, `sudo on` and the `machine.*`
+settings that pick the account (also a `restore` that would change them)
+still need an administrator's terminal. `update` gives a node installed before there were owners the user
+who updates as its owner; `uninstall` removes the service, and the owners and
+their rights with it.
+
 The other commands work on the installed node from an administrator's
-terminal. The service takes `folder add`, `folder set` and `folder rm` at
-once over its [control pipe](platforms.md#the-control-pipe), and every other
-change at its next start: `Restart-Service nerve-node`. `setup` asks no
+terminal, or an owner's. The service takes `folder add`, `folder set` and
+`folder rm` at once over its [control pipe](platforms.md#the-control-pipe),
+and every other change at its next start: `Restart-Service nerve-node`, or
+`nerve-node service restart`. `setup` asks no
 account there, and `--create-user` is refused.
 
 The installed node on Windows keeps its keys in files. The service runs as
@@ -348,6 +411,12 @@ source `nerve-node` again. A node installed by a program that did not
 register it yet gets it from the installed program:
 `& "C:\Program Files\Nerve\nerve-node.exe" install`, or the next `update`.
 
+When the [desktop app](desktop.md) takes over a node installed with
+`nerve-node.exe`, its `install` removes `C:\Program Files\Nerve\nerve-node.exe`
+once the service and the Event Log source name the app's program, or moves it
+aside when the Event Log still holds it, as above. The app's program has no
+console; the CLI edition, downloaded on its own, is the one for a terminal.
+
 `uninstall` stops and removes the service, the source `nerve-node` of the
 Event Log (its entries stay), the user `nerve` and its profile, and the
 program. It also takes off the folder grants of `folder` mode that a node
@@ -360,7 +429,10 @@ password goes, so sudo is off after a later `install`. A later `install`
 takes them up again.
 `--purge` deletes them. Run from the installed program, `uninstall` cannot
 delete that file at once: it moves it aside, and Windows deletes it at its
-next start. Where Windows
+next start. Where the [desktop app](desktop.md) took over the node,
+`nerve-node.exe uninstall` hands over to the app's uninstall, which also
+removes the app, its Start menu entry, its link handler and its entry in Apps
+& features. Where Windows
 still holds the profile of `nerve` (Windows Search can), `uninstall` says how
 to remove it after a restart.
 

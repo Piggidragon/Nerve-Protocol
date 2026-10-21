@@ -1,0 +1,1327 @@
+// The dialogs: pairing a center, confirming a change that cannot be undone,
+// and About with Slint's AboutSlint, as Slint's Royalty-free license asks.
+
+import { AboutSlint } from "std-widgets.slint";
+import { Theme, Type, Space, Radius, Tone } from "theme.slint";
+import { Store, Perm, Prefs, Install } from "store.slint";
+import { Working, DidList, UninstallChoice, UpdateChoice } from "installer.slint";
+import {
+    Button, ButtonKind, Banner, Dialog, DialogButtons, Field, TextField, InfoRow, Divider, Code,
+    Icon, CheckBox, Segmented, TextArea, CopyText, OptionTile, Steps, Reveal, ScrollBox,
+} from "widgets.slint";
+
+export component PairDialog inherits Dialog {
+    title: Store.pair-step == 0 ? "Pair a center" : "Pair with this center?";
+    subtitle: Store.pair-step == 0
+        ? "Paste the link the center's web UI shows under Pair a machine."
+        : "Check that this is your center. It may do nothing until you allow it.";
+    close => {
+        Store.pair-open = false;
+    }
+    enter => {
+        if (Store.pair-busy) {
+            return;
+        }
+        if (Store.pair-step == 0 && Store.pair-link != "") {
+            Store.pair-check(Store.pair-link, Store.pair-name);
+        } else if (Store.pair-step == 1 && Store.pair-preview.ready) {
+            Store.pair-confirm();
+        }
+    }
+
+    // One step at a time; both stay in place (see Reveal).
+    VerticalLayout {
+    Reveal {
+        shown: Store.pair-step == 0;
+      VerticalLayout {
+        spacing: Space.lg;
+        Field {
+            label: "Pairing link";
+            link := TextField {
+                text <=> Store.pair-link;
+                placeholder: "nerve://pair?center=…";
+                mono: true;
+                label: "Pairing link";
+                invalid: Store.pair-error != "";
+                enabled: !Store.pair-busy;
+                accepted => {
+                    Store.pair-check(Store.pair-link, Store.pair-name);
+                }
+                init => {
+                    self.focus();
+                }
+            }
+        }
+        Field {
+            label: "Name on this machine";
+            hint: "Optional. Empty: the center's own name.";
+            TextField {
+                text <=> Store.pair-name;
+                placeholder: "home-lab";
+                label: "Name on this machine";
+                enabled: !Store.pair-busy;
+                accepted => {
+                    Store.pair-check(Store.pair-link, Store.pair-name);
+                }
+            }
+        }
+        DialogButtons {
+            error: Store.pair-error;
+            Button {
+                text: "Cancel";
+                kind: ButtonKind.ghost;
+                clicked => {
+                    Store.pair-open = false;
+                }
+            }
+            Button {
+                text: "Continue";
+                kind: ButtonKind.primary;
+                enabled: Store.pair-link != "";
+                busy: Store.pair-busy;
+                clicked => {
+                    Store.pair-check(Store.pair-link, Store.pair-name);
+                }
+            }
+        }
+      }
+    }
+
+    Reveal {
+        shown: Store.pair-step == 1;
+      VerticalLayout {
+        spacing: Space.lg;
+        VerticalLayout {
+        Rectangle {
+            background: Theme.surface-alt;
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                padding: Space.lg;
+                spacing: Space.md;
+                InfoRow {
+                    label: "Center";
+                    value: Store.pair-preview.center;
+                    mono: true;
+                }
+                InfoRow {
+                    label: "Certificate";
+                    value: !Store.pair-preview.tls ? "None: plain http"
+                        : Store.pair-preview.pin != "" ? "Pinned: " + Store.pair-preview.pin
+                        : "Checked by the system";
+                    mono: Store.pair-preview.tls && Store.pair-preview.pin != "";
+                    tone: Store.pair-preview.tls ? Tone.ok : Tone.danger;
+                }
+                InfoRow {
+                    label: "Name here";
+                    value: Store.pair-preview.name != "" ? Store.pair-preview.name : "The center's own name";
+                }
+            }
+        }
+        // What the check before the pairing found: Pair only when it can
+        // work.
+        Reveal {
+            shown: Store.pair-preview.check != "";
+            gap: Space.lg;
+            Banner {
+                tone: Store.pair-preview.ready ? Tone.ok : Tone.danger;
+                title: Store.pair-preview.ready ? "Ready to pair" : "Pairing cannot work";
+                text: Store.pair-preview.check;
+            }
+        }
+        Reveal {
+            shown: !Store.pair-preview.tls;
+            gap: Space.lg;
+            Banner {
+                tone: Tone.warn;
+                title: "Not encrypted";
+                text: "Anyone on the way can read and change the traffic. Use plain http only on a network you trust.";
+            }
+        }
+        }
+        VerticalLayout {
+            spacing: 6px;
+            Text {
+                text: "The center starts with";
+                color: Theme.text;
+                font-size: Type.small;
+                font-weight: Type.semibold;
+            }
+            HorizontalLayout {
+                spacing: Space.sm;
+                VerticalLayout {
+                    alignment: start;
+                    padding-top: 2px;
+                    Icon {
+                        source: @image-url("icons/shield.svg");
+                        colorize: Theme.ok;
+                        size: 14px;
+                    }
+                }
+                Text {
+                    text: "Allowlist mode: nothing allowed yet.";
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
+            }
+            HorizontalLayout {
+                spacing: Space.sm;
+                VerticalLayout {
+                    alignment: start;
+                    padding-top: 2px;
+                    Icon {
+                        source: @image-url("icons/lock.svg");
+                        colorize: Theme.ok;
+                        size: 14px;
+                    }
+                }
+                Text {
+                    text: "No settings grant: it cannot change what it may do.";
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
+            }
+        }
+        DialogButtons {
+            error: Store.pair-error;
+            error-title: "Not paired";
+            Button {
+                text: "Back";
+                icon: @image-url("icons/arrow-left.svg");
+                kind: ButtonKind.ghost;
+                enabled: !Store.pair-busy;
+                clicked => {
+                    Store.pair-error = "";
+                    Store.pair-step = 0;
+                }
+            }
+            Button {
+                text: "Pair";
+                icon: @image-url("icons/link.svg");
+                kind: ButtonKind.primary;
+                busy: Store.pair-busy;
+                enabled: Store.pair-preview.ready;
+                clicked => {
+                    Store.pair-confirm();
+                }
+            }
+        }
+      }
+    }
+    }
+}
+
+export component ConfirmDialog inherits Dialog {
+    title: Store.confirm-title;
+    subtitle: Store.confirm-text;
+    card-width: 460px;
+    close => {
+        Store.confirm-open = false;
+    }
+    enter => {
+        Store.confirm-open = false;
+        Store.confirm-accepted();
+    }
+    Reveal {
+        shown: Store.confirm-option != "";
+        CheckBox {
+            text: Store.confirm-option;
+            detail: Store.confirm-option-detail;
+            checked: Store.confirm-option-on;
+            toggled(on) => {
+                Store.confirm-option-on = on;
+            }
+        }
+    }
+    DialogButtons {
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Store.confirm-open = false;
+            }
+        }
+        Button {
+            text: Store.confirm-button;
+            kind: ButtonKind.danger;
+            clicked => {
+                Store.confirm-open = false;
+                Store.confirm-accepted();
+            }
+        }
+    }
+}
+
+export component AboutDialog inherits Dialog {
+    title: "About";
+    card-width: 440px;
+    close => {
+        Store.about-open = false;
+    }
+    enter => {
+        Store.about-open = false;
+    }
+    VerticalLayout {
+        spacing: Space.sm;
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                source: @image-url("icons/app.svg");
+                width: 64px;
+                height: 64px;
+            }
+        }
+        Text {
+            text: "Nerve node";
+            color: Theme.text;
+            font-size: 18px;
+            font-weight: Type.semibold;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "Version " + Store.version;
+            color: Theme.text-muted;
+            font-size: Type.small;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "Every action runs nerve-node, with its checks and audit records.";
+            color: Theme.text-muted;
+            font-size: Type.small;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            alignment: center;
+            padding-top: Space.xs;
+            Button {
+                text: "Project page";
+                icon: @image-url("icons/external.svg");
+                kind: ButtonKind.ghost;
+                small: true;
+                clicked => {
+                    Platform.open-url("https://github.com/Piggidragon/Nerve-Protocol");
+                }
+            }
+        }
+    }
+    Divider { }
+    AboutSlint {
+        preferred-height: self.min-height;
+    }
+}
+
+export component ModeDialog inherits Dialog {
+    title: Perm.mode-choice == "folder" ? "Folder mode for " + Perm.center : "User mode for " + Perm.center;
+    subtitle: Perm.mode-choice == "folder"
+        ? "It may do what each of its folders allows."
+        : "It may do anything you may do, protected files aside. Best for a while, not for good.";
+    card-width: 480px;
+    close => {
+        Perm.mode-open = false;
+    }
+    enter => {
+        Perm.mode-apply();
+    }
+    VerticalLayout {
+        Segmented {
+            options: ["Until I change it", "For a time"];
+            current: Perm.mode-timed ? 1 : 0;
+            chosen(i) => {
+                Perm.mode-timed = i == 1;
+            }
+        }
+        Reveal {
+            shown: Perm.mode-timed;
+            gap: Space.md;
+            Field {
+                label: "Hours";
+                hint: "Then it goes back to allowlist mode.";
+                TextField {
+                    text <=> Perm.mode-hours;
+                    label: "Hours";
+                    accepted => {
+                        Perm.mode-apply();
+                    }
+                }
+            }
+        }
+    }
+    DialogButtons {
+        error: Perm.mode-error;
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Perm.mode-open = false;
+            }
+        }
+        Button {
+            text: "Switch";
+            kind: ButtonKind.primary;
+            clicked => {
+                Perm.mode-apply();
+            }
+        }
+    }
+}
+
+export component FolderDialog inherits Dialog {
+    title: "Add a folder";
+    subtitle: "What may " + Perm.center + " do in it?";
+    card-width: 520px;
+    close => {
+        Perm.folder-open = false;
+    }
+    enter => {
+        if (Perm.folder-read || Perm.folder-write || Perm.folder-execute) {
+            Perm.folder-add();
+        }
+    }
+    Code {
+        text: Perm.folder-path;
+    }
+    VerticalLayout {
+        spacing: Space.md;
+        CheckBox {
+            text: "Read";
+            detail: "List, read and search files.";
+            checked: Perm.folder-read;
+            toggled(on) => {
+                Perm.folder-read = on;
+            }
+        }
+        CheckBox {
+            text: "Write";
+            detail: "Change, add and delete files.";
+            checked: Perm.folder-write;
+            toggled(on) => {
+                Perm.folder-write = on;
+            }
+        }
+        CheckBox {
+            text: "Run commands";
+            detail: "Run commands in it.";
+            checked: Perm.folder-execute;
+            toggled(on) => {
+                Perm.folder-execute = on;
+            }
+        }
+    }
+    DialogButtons {
+        error: Perm.folder-error;
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Perm.folder-open = false;
+            }
+        }
+        Button {
+            text: "Add";
+            kind: ButtonKind.primary;
+            enabled: Perm.folder-read || Perm.folder-write || Perm.folder-execute;
+            clicked => {
+                Perm.folder-add();
+            }
+        }
+    }
+}
+
+export component SudoDialog inherits Dialog {
+    title: "Turn sudo on";
+    subtitle: "Your sudo password, kept in the node's memory only. On Windows, the password of the commands' account.";
+    card-width: 480px;
+    close => {
+        Perm.sudo-open = false;
+    }
+    enter => {
+        if (Perm.sudo-password != "" && !Perm.sudo-busy) {
+            Perm.sudo-confirm();
+        }
+    }
+    Field {
+        label: "Password";
+        TextField {
+            text <=> Perm.sudo-password;
+            password: true;
+            label: "Password";
+            enabled: !Perm.sudo-busy;
+            accepted => {
+                Perm.sudo-confirm();
+            }
+            init => {
+                self.focus();
+            }
+        }
+    }
+    DialogButtons {
+        error: Perm.sudo-error;
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Perm.sudo-open = false;
+            }
+        }
+        Button {
+            text: "Turn on";
+            kind: ButtonKind.primary;
+            enabled: Perm.sudo-password != "";
+            busy: Perm.sudo-busy;
+            clicked => {
+                Perm.sudo-confirm();
+            }
+        }
+    }
+}
+
+export component ProxyDialog inherits Dialog {
+    title: "Proxy";
+    subtitle: "Every link to a center goes through it.";
+    card-width: 560px;
+    close => {
+        Prefs.proxy-open = false;
+    }
+    enter => {
+        if (Prefs.proxy-new-url != "") {
+            Prefs.proxy-set();
+        }
+    }
+    Field {
+        label: "Proxy";
+        hint: "http://host:port, http://user@host:port, or https://… for a relay.";
+        TextField {
+            text <=> Prefs.proxy-new-url;
+            mono: true;
+            placeholder: "http://proxy.example:3128";
+            label: "Proxy";
+        }
+    }
+    Field {
+        label: "Password";
+        hint: "Optional. For the user in the URL.";
+        TextField {
+            text <=> Prefs.proxy-new-password;
+            password: true;
+            label: "Password";
+        }
+    }
+    Field {
+        label: "Pin";
+        hint: "Optional. The pin of an https proxy's certificate.";
+        TextField {
+            text <=> Prefs.proxy-new-pin;
+            mono: true;
+            label: "Pin";
+        }
+    }
+    Field {
+        label: "Headers";
+        hint: "Optional. One a line: Name: value.";
+        TextArea {
+            text <=> Prefs.proxy-new-headers;
+            mono: true;
+            label: "Headers";
+            placeholder: "Proxy-Authorization: Bearer …";
+        }
+    }
+    DialogButtons {
+        error: Prefs.proxy-error;
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.proxy-open = false;
+            }
+        }
+        Button {
+            text: "Save";
+            kind: ButtonKind.primary;
+            enabled: Prefs.proxy-new-url != "";
+            clicked => {
+                Prefs.proxy-set();
+            }
+        }
+    }
+}
+
+// What a command did, to read once: a token or a key to copy (`once-copy`),
+// what to do with it, or what a restore did (`once-text`).
+export component OnceDialog inherits Dialog {
+    title: Prefs.once-title;
+    subtitle: Prefs.once-note;
+    card-width: 620px;
+    close => {
+        Prefs.once-open = false;
+    }
+    enter => {
+        Prefs.once-open = false;
+    }
+    Reveal {
+        shown: Prefs.once-text != "";
+        Text {
+            text: Prefs.once-text;
+            color: Theme.text;
+            font-size: Type.small;
+            wrap: word-wrap;
+        }
+    }
+    Reveal {
+        shown: Prefs.once-copy != "";
+        CopyText {
+            text: Prefs.once-copy;
+            copy-button: true;
+        }
+    }
+    DialogButtons {
+        Button {
+            text: "Done";
+            kind: ButtonKind.primary;
+            clicked => {
+                Prefs.once-open = false;
+            }
+        }
+    }
+}
+
+// A part of the desktop is missing for what the owner asked: what, and
+// what to install.
+export component MissingDialog inherits Dialog {
+    title: Store.missing-title;
+    subtitle: "A part of the desktop is missing.";
+    card-width: 560px;
+    close => {
+        Store.missing-open = false;
+    }
+    enter => {
+        Store.missing-open = false;
+    }
+    DialogButtons {
+        error: Store.missing-text;
+        Button {
+            text: "Close";
+            kind: ButtonKind.primary;
+            clicked => {
+                Store.missing-open = false;
+            }
+        }
+    }
+}
+
+export component BackupDialog inherits Dialog {
+    title: "Back up this node";
+    subtitle: "Sealed with the passphrase: without it nobody can use the file, you included.";
+    card-width: 540px;
+    close => {
+        Prefs.backup-open = false;
+    }
+    enter => {
+        if (Prefs.backup-pass != "" && Prefs.backup-pass == Prefs.backup-pass2 && !Prefs.backup-busy) {
+            Prefs.backup-confirm();
+        }
+    }
+    Code {
+        text: Prefs.backup-file;
+    }
+    Field {
+        label: "Passphrase";
+        hint: "At least 12 characters.";
+        TextField {
+            text <=> Prefs.backup-pass;
+            password: true;
+            label: "Passphrase";
+            init => {
+                self.focus();
+            }
+        }
+    }
+    Field {
+        label: "The passphrase again";
+        TextField {
+            text <=> Prefs.backup-pass2;
+            password: true;
+            label: "The passphrase again";
+            invalid: Prefs.backup-pass2 != "" && Prefs.backup-pass2 != Prefs.backup-pass;
+            accepted => {
+                Prefs.backup-confirm();
+            }
+        }
+    }
+    CheckBox {
+        text: "Include the keys in the system keyring";
+        detail: "Without it, they stay out of the file.";
+        checked: Prefs.backup-keyring;
+        toggled(on) => {
+            Prefs.backup-keyring = on;
+        }
+    }
+    DialogButtons {
+        error: Prefs.backup-error;
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.backup-open = false;
+            }
+        }
+        Button {
+            text: "Back up";
+            kind: ButtonKind.primary;
+            busy: Prefs.backup-busy;
+            enabled: Prefs.backup-pass != "" && Prefs.backup-pass == Prefs.backup-pass2;
+            clicked => {
+                Prefs.backup-confirm();
+            }
+        }
+    }
+}
+
+export component RestoreDialog inherits Dialog {
+    title: "Restore a backup";
+    subtitle: Store.service-state == "running" ? "Its settings and keys replace this node's. The node restarts for it."
+        : "Its settings and keys replace this node's.";
+    card-width: 540px;
+    close => {
+        Prefs.restore-open = false;
+    }
+    enter => {
+        if (Prefs.restore-pass != "" && !Prefs.restore-busy) {
+            Prefs.restore-confirm();
+        }
+    }
+    Code {
+        text: Prefs.restore-file;
+    }
+    Field {
+        label: "Passphrase";
+        TextField {
+            text <=> Prefs.restore-pass;
+            password: true;
+            label: "Passphrase";
+            accepted => {
+                Prefs.restore-confirm();
+            }
+            init => {
+                self.focus();
+            }
+        }
+    }
+    CheckBox {
+        text: "It is another node's backup";
+        detail: "Replace this node with it.";
+        checked: Prefs.restore-replace;
+        toggled(on) => {
+            Prefs.restore-replace = on;
+        }
+    }
+    CheckBox {
+        text: "Leave its proxy out";
+        detail: "This machine reaches its centers its own way.";
+        checked: Prefs.restore-without-proxy;
+        toggled(on) => {
+            Prefs.restore-without-proxy = on;
+        }
+    }
+    CheckBox {
+        text: "Keep its keys in files";
+        detail: "When this machine cannot use the system keyring.";
+        checked: Prefs.restore-in-files;
+        toggled(on) => {
+            Prefs.restore-in-files = on;
+        }
+    }
+    DialogButtons {
+        error: Prefs.restore-error;
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.restore-open = false;
+            }
+        }
+        Button {
+            text: "Restore";
+            kind: ButtonKind.danger;
+            busy: Prefs.restore-busy;
+            enabled: Prefs.restore-pass != "";
+            clicked => {
+                Prefs.restore-confirm();
+            }
+        }
+    }
+}
+
+// Why the app asks for administrator rights, before the system asks.
+export component ElevateDialog inherits Dialog {
+    title: "Administrator rights";
+    subtitle: "You are not an owner of this node, so reading and changing it needs administrator rights.";
+    card-width: 520px;
+    close => {
+        Store.elevate-open = false;
+    }
+    enter => {
+        if (!Store.elevate-busy) {
+            Store.elevate-allow();
+        }
+    }
+    Text {
+        text: "The system asks once; the app keeps them while it is open.";
+        color: Theme.text-muted;
+        font-size: Type.small;
+        wrap: word-wrap;
+    }
+    DialogButtons {
+        error: Store.elevate-error;
+        Button {
+            text: "Not now";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Store.elevate-open = false;
+            }
+        }
+        Button {
+            text: "Continue";
+            icon: @image-url("icons/shield.svg");
+            kind: ButtonKind.primary;
+            busy: Store.elevate-busy;
+            clicked => {
+                Store.elevate-allow();
+            }
+        }
+    }
+}
+
+// Settings: update the app and the node, from the latest release or a file.
+export component UpdateDialog inherits Dialog {
+    title: Install.step == "done" ? "Nerve is updated to " + Install.installed-version : "Update Nerve";
+    subtitle: Install.step == "done" ? (Install.installed-version == Install.version ? "Nerve was up to date." : "The service runs it. Restart Nerve to use it here too.")
+        : Install.step == "working" ? ""
+        : "Version " + Install.version + " is installed. Settings, keys and the audit log stay.";
+    card-width: 560px;
+    close => {
+        if (Install.step != "working") {
+            Install.update-open = false;
+        }
+    }
+    enter => {
+        if (Install.step == "choose" && (Install.source == 0 || Install.file != "")) {
+            Install.update();
+        } else if (Install.step == "done") {
+            Install.open-app();
+        }
+    }
+    VerticalLayout {
+        Reveal {
+            shown: Install.step == "choose";
+            VerticalLayout {
+                spacing: Space.xl;
+                UpdateChoice { }
+                DialogButtons {
+                    error: Install.error;
+                    error-title: Install.error-title != "" ? Install.error-title : "The update did not finish";
+                    Button {
+                        text: "Cancel";
+                        kind: ButtonKind.ghost;
+                        clicked => {
+                            Install.update-open = false;
+                        }
+                    }
+                    Button {
+                        text: "Update";
+                        icon: @image-url("icons/download.svg");
+                        kind: ButtonKind.primary;
+                        enabled: Install.source == 0 || Install.file != "";
+                        clicked => {
+                            Install.update();
+                        }
+                    }
+                }
+            }
+        }
+        Reveal {
+            shown: Install.step == "working";
+            Working { }
+        }
+        Reveal {
+            shown: Install.step == "done";
+            VerticalLayout {
+                spacing: Space.xl;
+                DidList { }
+                DialogButtons {
+                    Button {
+                        text: "Later";
+                        kind: ButtonKind.ghost;
+                        clicked => {
+                            Install.update-open = false;
+                        }
+                    }
+                    Button {
+                        text: "Restart Nerve";
+                        icon: @image-url("icons/refresh.svg");
+                        kind: ButtonKind.primary;
+                        clicked => {
+                            Install.open-app();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Settings: remove the node, the app and, if chosen, the node's data.
+export component UninstallDialog inherits Dialog {
+    title: Install.step == "done" ? "Nerve is removed"
+        : Install.step == "working" ? "Uninstall Nerve"
+        : "Uninstall Nerve?";
+    subtitle: Install.step == "done" ? (Install.purge ? "Nerve and its data are gone." : "Nerve is gone. Its data stays for a new install.")
+        : Install.step == "working" ? ""
+        : "The service, its user, the app and its menu entry go.";
+    card-width: 600px;
+    close => {
+        if (Install.step == "done") {
+            Install.close();
+        } else if (Install.step != "working") {
+            Install.uninstall-open = false;
+        }
+    }
+    enter => {
+        if (Install.step == "choose") {
+            Install.uninstall();
+        } else if (Install.step == "done") {
+            Install.close();
+        }
+    }
+    VerticalLayout {
+        Reveal {
+            shown: Install.step == "choose";
+            VerticalLayout {
+                spacing: Space.xl;
+                UninstallChoice { }
+                DialogButtons {
+                    error: Install.error;
+                    error-title: "Uninstalling did not finish";
+                    Button {
+                        text: "Cancel";
+                        kind: ButtonKind.ghost;
+                        clicked => {
+                            Install.uninstall-open = false;
+                        }
+                    }
+                    Button {
+                        text: Install.purge ? "Uninstall and delete the data" : "Uninstall";
+                        icon: @image-url("icons/trash.svg");
+                        kind: ButtonKind.danger;
+                        clicked => {
+                            Install.uninstall();
+                        }
+                    }
+                }
+            }
+        }
+        Reveal {
+            shown: Install.step == "working";
+            Working { }
+        }
+        Reveal {
+            shown: Install.step == "done";
+            VerticalLayout {
+                spacing: Space.xl;
+                DidList { }
+                DialogButtons {
+                    Button {
+                        text: "Close Nerve";
+                        kind: ButtonKind.primary;
+                        clicked => {
+                            Install.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A node that reaches this node's centers through the relay: which centers,
+// and its own limits, for a relay behind this one that carries many nodes.
+export component RelayNodeDialog inherits Dialog {
+    title: Prefs.relay-edit-name;
+    subtitle: "Reaches this node's centers through the relay.";
+    card-width: 540px;
+    close => {
+        Prefs.relay-edit-open = false;
+    }
+    enter => {
+        if (!Prefs.relay-edit-busy) {
+            Prefs.relay-edit-save();
+        }
+    }
+    Field {
+        label: "Centers it may reach";
+        hint: "None ticked: every https center, also one paired later.";
+        VerticalLayout {
+            spacing: Space.sm;
+            ScrollBox {
+                rows: Prefs.relay-edit-centers.length;
+                long-height: 300px;
+                spacing: Space.sm;
+                for p[i] in Prefs.relay-edit-centers: CheckBox {
+                    checked: p.on;
+                    text: p.name;
+                    toggled(on) => {
+                        Prefs.relay-edit-pick(i, on);
+                    }
+                }
+            }
+        }
+    }
+    Field {
+        label: "Limits";
+        hint: Prefs.relay-edit-own ? "For a relay behind this one, which carries many nodes." : "The relay's limits.";
+        VerticalLayout {
+            spacing: Space.md;
+            HorizontalLayout {
+                alignment: start;
+                Segmented {
+                    options: ["The relay's", "Its own"];
+                    current: Prefs.relay-edit-own ? 1 : 0;
+                    chosen(i) => {
+                        Prefs.relay-edit-own = i == 1;
+                    }
+                }
+            }
+            Reveal {
+                shown: Prefs.relay-edit-own;
+                HorizontalLayout {
+                    spacing: Space.md;
+                    Field {
+                        label: "Tunnels at once";
+                        TextField {
+                            text <=> Prefs.relay-edit-links;
+                            label: "Tunnels at once";
+                        }
+                    }
+                    Field {
+                        label: "Tunnels opened a minute";
+                        TextField {
+                            text <=> Prefs.relay-edit-opens;
+                            label: "Tunnels opened a minute";
+                        }
+                    }
+                }
+            }
+        }
+    }
+    DialogButtons {
+        error: Prefs.relay-edit-error;
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.relay-edit-open = false;
+            }
+        }
+        Button {
+            text: "Save";
+            kind: ButtonKind.primary;
+            busy: Prefs.relay-edit-busy;
+            clicked => {
+                Prefs.relay-edit-save();
+            }
+        }
+    }
+}
+
+// Another copy of Nerve was opened while the app is open, such as the file
+// just downloaded: what the installer offers for it.
+export component OtherCopyDialog inherits Dialog {
+    title: "Nerve is installed";
+    subtitle: Install.other-newer ? "The file you opened is newer. Update Nerve with it?"
+        : Install.other-version == Install.version ? "The file you opened is the version that is installed."
+        : "The file you opened is older than the installed Nerve.";
+    card-width: 540px;
+    close => {
+        Install.other-open = false;
+    }
+    enter => {
+        if (Install.other-newer) {
+            Install.other-update();
+        } else {
+            Install.other-open = false;
+        }
+    }
+    Rectangle {
+        background: Theme.surface-alt;
+        border-radius: Radius.lg;
+        border-width: 1px;
+        border-color: Theme.border;
+        VerticalLayout {
+            padding: Space.lg;
+            spacing: Space.md;
+            InfoRow {
+                label: "Installed";
+                value: "Version " + Install.version;
+            }
+            InfoRow {
+                label: "The file";
+                value: Install.other-version != "" ? "Version " + Install.other-version : "Version unknown";
+                tone: Install.other-newer ? Tone.accent : Tone.neutral;
+            }
+            InfoRow {
+                label: "Its path";
+                value: Install.other-file;
+                mono: true;
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: Space.sm;
+        padding-top: Space.xs;
+        Button {
+            text: "Uninstall…";
+            icon: @image-url("icons/trash.svg");
+            kind: ButtonKind.danger-soft;
+            clicked => {
+                Install.other-open = false;
+                Install.ask-uninstall();
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+        Button {
+            text: "Close";
+            kind: Install.other-newer ? ButtonKind.ghost : ButtonKind.primary;
+            clicked => {
+                Install.other-open = false;
+            }
+        }
+        if Install.other-newer: Button {
+            text: "Update to " + Install.other-version;
+            icon: @image-url("icons/download.svg");
+            kind: ButtonKind.primary;
+            clicked => {
+                Install.other-update();
+            }
+        }
+    }
+}
+
+// A relayed node's link: a new node, or a new link for one (its old link
+// stops working). The link names where the other node reaches this machine.
+export component RelayAddDialog inherits Dialog {
+    title: Prefs.relay-add-for != "" ? "New link for " + Prefs.relay-add-for : "Add a node";
+    subtitle: Prefs.relay-add-for != "" ? "Its old link stops working; its centers and limits stay."
+        : "It gets a link to paste, which lets it reach this node's centers.";
+    card-width: 540px;
+    close => {
+        Prefs.relay-add-open = false;
+    }
+    enter => {
+        if (!Prefs.relay-add-busy && (Prefs.relay-add-for != "" || Prefs.relay-add-name != "")) {
+            Prefs.relay-add-confirm();
+        }
+    }
+    VerticalLayout {
+    Reveal {
+        shown: Prefs.relay-add-for == "";
+        VerticalLayout {
+        padding-bottom: Space.lg;
+        Field {
+            label: "Its name here";
+            hint: "1 to 32 of a-z, 0-9 and -, like laptop-2.";
+            TextField {
+                text <=> Prefs.relay-add-name;
+                mono: true;
+                placeholder: "laptop-2";
+                label: "Its name here";
+                accepted => {
+                    Prefs.relay-add-confirm();
+                }
+            }
+        }
+        }
+    }
+    Field {
+        label: "This machine, as the other node reaches it";
+        hint: "A host name or address, with :port when it is not the relay's.";
+        TextField {
+            text <=> Prefs.relay-add-address;
+            mono: true;
+            label: "This machine, as the other node reaches it";
+            accepted => {
+                Prefs.relay-add-confirm();
+            }
+        }
+    }
+    }
+    DialogButtons {
+        error: Prefs.relay-add-error;
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.relay-add-open = false;
+            }
+        }
+        Button {
+            text: Prefs.relay-add-for != "" ? "Make a new link" : "Add";
+            kind: ButtonKind.primary;
+            enabled: Prefs.relay-add-for != "" || Prefs.relay-add-name != "";
+            busy: Prefs.relay-add-busy;
+            clicked => {
+                Prefs.relay-add-confirm();
+            }
+        }
+    }
+}
+
+// This node through a relay: the link the relay showed, or its parts.
+export component ConnectDialog inherits Dialog {
+    title: "Connect through a relay";
+    subtitle: "Paste the link the relay showed under Add a node.";
+    card-width: 580px;
+    close => {
+        Prefs.connect-open = false;
+    }
+    enter => {
+        if (!Prefs.connect-busy) {
+            Prefs.connect-save();
+        }
+    }
+    // One block: a hidden part takes no room, nor the space around it.
+    VerticalLayout {
+    Reveal {
+        shown: !Prefs.connect-apart;
+        VerticalLayout {
+            spacing: Space.md;
+            Field {
+                label: "Relay link";
+                TextField {
+                    text <=> Prefs.connect-link;
+                    mono: true;
+                    placeholder: "nerve://relay?address=…";
+                    label: "Relay link";
+                    invalid: Prefs.connect-error != "";
+                    edited(t) => {
+                        Prefs.connect-read(t);
+                    }
+                    accepted => {
+                        Prefs.connect-save();
+                    }
+                    init => {
+                        self.focus();
+                    }
+                }
+            }
+            Reveal {
+                shown: Prefs.connect-summary != "";
+                Banner {
+                    tone: Tone.accent;
+                    text: Prefs.connect-summary;
+                }
+            }
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: "Enter its parts instead";
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    clicked => {
+                        Prefs.connect-apart = true;
+                    }
+                }
+            }
+        }
+    }
+    Reveal {
+        shown: Prefs.connect-apart;
+        VerticalLayout {
+            spacing: Space.md;
+            Field {
+                label: "Relay address";
+                hint: "Host name or address and port.";
+                TextField {
+                    text <=> Prefs.connect-address;
+                    mono: true;
+                    placeholder: "relay.example:7490";
+                    label: "Relay address";
+                }
+            }
+            HorizontalLayout {
+                spacing: Space.md;
+                Field {
+                    label: "This node's name there";
+                    TextField {
+                        text <=> Prefs.connect-node;
+                        mono: true;
+                        placeholder: "laptop-2";
+                        label: "This node's name there";
+                    }
+                }
+                Field {
+                    label: "Token";
+                    TextField {
+                        text <=> Prefs.connect-token;
+                        password: true;
+                        label: "Token";
+                    }
+                }
+            }
+            Field {
+                label: "Pin of the relay";
+                TextField {
+                    text <=> Prefs.connect-pin;
+                    mono: true;
+                    label: "Pin of the relay";
+                }
+            }
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: "Paste a link instead";
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    clicked => {
+                        Prefs.connect-apart = false;
+                    }
+                }
+            }
+        }
+    }
+    Reveal {
+        shown: Prefs.proxy != "" && !Prefs.via-relay;
+        gap: Space.md;
+        Banner {
+            tone: Tone.warn;
+            text: "It takes the place of the proxy " + Prefs.proxy + ".";
+        }
+    }
+    }
+    DialogButtons {
+        error: Prefs.connect-error;
+        error-title: "Not connected";
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.connect-open = false;
+            }
+        }
+        Button {
+            text: "Connect";
+            icon: @image-url("icons/link.svg");
+            kind: ButtonKind.primary;
+            busy: Prefs.connect-busy;
+            enabled: Prefs.connect-apart ? (Prefs.connect-address != "" && Prefs.connect-node != "" && Prefs.connect-token != "" && Prefs.connect-pin != "")
+                : Prefs.connect-link != "";
+            clicked => {
+                Prefs.connect-save();
+            }
+        }
+    }
+}

@@ -21,6 +21,8 @@ use crate::folder_change::{Applied, FolderChange};
 use crate::paths::NodePaths;
 use crate::service::{Host, Layout};
 
+mod json;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "nerve-node",
@@ -34,6 +36,9 @@ pub struct Cli {
     /// Where the control socket and the audit log live [env: NERVE_STATE_DIR] [default: ~/.local/state/nerve, or /var/lib/nerve/state when installed as a service]
     #[arg(long, global = true)]
     pub state_dir: Option<PathBuf>,
+    /// Print JSON for programs instead of text: the read commands their data, the others the lines they print, an error {"error": ...}
+    #[arg(long, global = true)]
+    pub json: bool,
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -80,13 +85,34 @@ pub enum Cmd {
     /// Show whether the node runs and which centers it is paired with.
     Status,
     /// Show what the node allowed and refused.
+    #[command(args_conflicts_with_subcommands = true)]
     Audit {
+        #[command(subcommand)]
+        clear: Option<AuditCmd>,
         /// Keep running and print new entries as they arrive.
         #[arg(long)]
         follow: bool,
         /// Show only the calls that were refused.
         #[arg(long)]
         denied: bool,
+        /// Show only the newest N entries (with --follow, then the new ones).
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
+    },
+    /// Show the node's log: its starts and stops, its links, and what went wrong.
+    #[command(args_conflicts_with_subcommands = true)]
+    Log {
+        #[command(subcommand)]
+        clear: Option<LogCmd>,
+        /// Keep running and print new lines as they arrive.
+        #[arg(long)]
+        follow: bool,
+        /// Show only the newest N lines (with --follow, then the new ones).
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
+        /// Show only errors and warnings (with --last, the newest N of them).
+        #[arg(long)]
+        problems: bool,
     },
     /// Stop everything at once; nothing runs until `unlock`.
     Panic,
@@ -99,6 +125,9 @@ pub enum Cmd {
         /// Run commands as this account instead of asking, and make it if it is not there: a group and a home (/home/NAME) of its own, no login (installed node).
         #[arg(long, value_name = "NAME")]
         create_user: Option<String>,
+        /// With --create-user: only choose (and make) that account, and ask nothing else.
+        #[arg(long, requires = "create_user")]
+        account_only: bool,
     },
     /// Replace the installed program with the latest release and restart the service; config, keys and audit log stay.
     Update {
@@ -106,6 +135,9 @@ pub enum Cmd {
         #[arg(long, value_name = "FILE")]
         from: Option<PathBuf>,
     },
+    /// Start, stop or restart the installed service, or show its state.
+    #[command(subcommand)]
+    Service(ServiceCmd),
     /// Stop and remove the service, its user and the program; the config and state folders stay.
     Uninstall {
         /// Delete the config and state folders too: the keys, the pairings and the audit log.
@@ -223,6 +255,9 @@ pub enum RuleCmd {
         /// Cover every command that starts with the same program.
         #[arg(long)]
         wildcard: bool,
+        /// Make the rule of an audit entry of this action instead, as the audit buttons do: `fs.read` takes a path and covers its folder with --wildcard, an action without a target takes "" and covers its capability.
+        #[arg(long, value_name = "CAP.ACTION")]
+        action: Option<String>,
         #[command(flatten)]
         center: CenterArg,
     },
@@ -235,6 +270,9 @@ pub enum RuleCmd {
         /// The entry was added with --wildcard.
         #[arg(long)]
         wildcard: bool,
+        /// The entry was added with this --action.
+        #[arg(long, value_name = "CAP.ACTION")]
+        action: Option<String>,
         #[command(flatten)]
         center: CenterArg,
     },
@@ -242,6 +280,22 @@ pub enum RuleCmd {
     Ls {
         /// The list; all three if left out.
         list: Option<List>,
+        #[command(flatten)]
+        center: CenterArg,
+    },
+    /// Change one entry of a list in place, as one change: the entry as `ls` shows it, and what it becomes.
+    Edit {
+        /// The list: `allow`, `deny` or `sudo`.
+        list: List,
+        /// The entry as `ls` shows it.
+        entry: String,
+        /// What it becomes: an entry as `ls` shows them (`exec.run:git status`, `fs.read:~/notes/*`; on the sudo list a sudo command's pattern), or a plain command line, which becomes the rule `add` makes of it.
+        new: String,
+        #[command(flatten)]
+        center: CenterArg,
+    },
+    /// Put the deny rules that keep a center's commands off this node itself (its programs, service, socket and folders) on the deny list, as a new pairing has them. They catch mistakes, not someone who hides the name.
+    Guard {
         #[command(flatten)]
         center: CenterArg,
     },
@@ -263,6 +317,30 @@ pub enum CapCmd {
         #[command(flatten)]
         center: CenterArg,
     },
+}
+
+#[derive(Debug, Subcommand, Clone, Copy)]
+pub enum ServiceCmd {
+    /// Start the installed service; an owner of the node needs no root or administrator for it.
+    Start,
+    /// Stop it: the node ends its links and runs nothing until it starts again, at the latest with the machine.
+    Stop,
+    /// Stop it and start it again, so the node takes every change in node.toml.
+    Restart,
+    /// Show whether the node is installed as a service, whether it runs, and the program it runs with its version.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuditCmd {
+    /// Start the audit log afresh. The entries so far become its one older file (audit.jsonl.1, in place of the one before), and the new log begins with an entry of who cleared it.
+    Clear,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LogCmd {
+    /// Empty the node's log and its older file. The new log begins with a line of who cleared it.
+    Clear,
 }
 
 #[derive(Debug, Subcommand)]
@@ -359,7 +437,7 @@ pub enum ConfigCmd {
 pub enum ProxyCmd {
     /// Reach centers through an HTTP proxy. Header values and a password are kept in the system keyring, never in node.toml; the installed node on Windows takes neither.
     Set {
-        /// The proxy, http://host:port, or http://user:password@host:port when it wants a login; https://... for a relay or another proxy reached over TLS.
+        /// The proxy, http://host:port, or http://user:password@host:port when it wants a login; https://... for another proxy reached over TLS; or the nerve://relay link a relay showed, which holds its address, pin and this node's token.
         url: String,
         /// The pin of an https:// proxy's certificate (a relay's: `nerve-node relay ls` there shows it); without it the system's roots check it.
         #[arg(long)]
@@ -367,6 +445,12 @@ pub enum ProxyCmd {
         /// A header for the proxy, `Name: value`; can be given more than once. The value goes into the system keyring.
         #[arg(long = "header", value_name = "NAME: VALUE")]
         headers: Vec<String>,
+        /// Read the proxy's password from the first line of stdin, for a URL with a user name and no password (http://user@host:port); it never shows in the process list.
+        #[arg(long)]
+        password_stdin: bool,
+        /// Read headers from stdin, one `Name: value` a line, after the password with --password-stdin.
+        #[arg(long)]
+        headers_stdin: bool,
     },
     /// Reach centers directly again, and delete the proxy's values from the system keyring.
     Rm,
@@ -392,13 +476,16 @@ pub enum RelayCmd {
     },
     /// Turn the relay off: stop listening and end every tunnel. The nodes and their tokens stay.
     Off,
-    /// Let a node use the relay: makes its token and shows it once. Without --center its tunnels may go to every https center of this node.
+    /// Let a node use the relay: makes its token and shows it once, in a link the other node pastes. Without --center its tunnels may go to every https center of this node.
     Add {
         /// The relayed node's name here, 1 to 32 of a-z, 0-9 and -.
         name: String,
         /// A center of this node the relayed node may reach; can be given more than once. Without it, every one.
         #[arg(long = "center", value_name = "CENTER")]
         centers: Vec<String>,
+        /// Where the other node reaches this machine, HOST or HOST:PORT, for its link (without it: the address the relay listens on, else this machine's host name).
+        #[arg(long, value_name = "HOST[:PORT]")]
+        address: Option<String>,
     },
     /// Change which centers of this node a relayed node may reach; without --center, every one. Its tunnels to others end.
     SetCenters {
@@ -419,10 +506,13 @@ pub enum RelayCmd {
         #[arg(long, value_name = "N")]
         max_opens_per_minute: Option<u32>,
     },
-    /// Give a relayed node a new token and end the tunnels of the old one; its centers and limits stay. Shows the token once.
+    /// Give a relayed node a new token and end the tunnels of the old one; its centers and limits stay. Shows the token once, in a link the other node pastes.
     Token {
         /// The relayed node's name.
         name: String,
+        /// Where the other node reaches this machine, HOST or HOST:PORT, for its link (as for `relay add`).
+        #[arg(long, value_name = "HOST[:PORT]")]
+        address: Option<String>,
     },
     /// Take a node's token away and end its tunnels.
     Rm {
@@ -461,6 +551,7 @@ const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
         "Run the node as a service under a user of its own (Linux with sudo, Windows as administrator), set it up, keep it current, and back it up or move it.",
         &[
             &["install", "uninstall"],
+            &["service"],
             &["setup"],
             &["update"],
             &["backup", "restore"],
@@ -486,7 +577,13 @@ const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
     (
         "Run and watch",
         "Start the node, see what it did, and stop it.",
-        &[&["run"], &["status"], &["audit"], &["panic", "unlock"]],
+        &[
+            &["run"],
+            &["status"],
+            &["audit"],
+            &["log"],
+            &["panic", "unlock"],
+        ],
     ),
 ];
 
@@ -526,6 +623,11 @@ pub struct Verb {
     pub about: String,
     /// Its own arguments and flags, without the global and the shared ones.
     pub args: Vec<ArgHelp>,
+    /// Every argument and flag it takes but the global ones, the shared
+    /// ones too: for a page that shows one command on its own (the desktop
+    /// app's reference), where the card's and the page's are not in sight.
+    #[serde(skip)]
+    pub takes: Vec<ArgHelp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -673,17 +775,27 @@ fn noun_cards(noun: &clap::Command, name: &str) -> Vec<Card> {
         .filter(|c| visible(c))
         .partition(|c| c.has_subcommands());
     let mut out = Vec::new();
+    // A noun that also runs on its own (`audit`, beside `audit clear`) is
+    // its card's first verb, and holds nothing.
+    let alone = !noun.is_subcommand_required_set();
+    let holds = if alone { Vec::new() } else { vec![name.into()] };
     if !leaves.is_empty() {
-        let verbs = leaves
-            .iter()
-            .map(|c| verb(c, &format!("{name} {}", c.get_name())))
+        let verbs = alone
+            .then(|| verb(noun, name))
+            .into_iter()
+            .chain(
+                leaves
+                    .iter()
+                    .map(|c| verb(c, &format!("{name} {}", c.get_name()))),
+            )
             .collect();
-        out.push(card(name, about_of(noun), vec![name.into()], verbs));
+        out.push(card(name, about_of(noun), holds, verbs));
     }
     for h in &holders {
         out.extend(noun_cards(h, &format!("{name} {}", h.get_name())));
     }
-    if !out.iter().any(|c| c.holds.iter().any(|h| h == name))
+    if !alone
+        && !out.iter().any(|c| c.holds.iter().any(|h| h == name))
         && let Some(first) = out.first_mut()
     {
         first.holds.insert(0, name.into());
@@ -693,15 +805,20 @@ fn noun_cards(noun: &clap::Command, name: &str) -> Vec<Card> {
 
 fn verb(sub: &clap::Command, name: &str) -> Verb {
     let usage = sub.clone().render_usage().to_string();
+    // A command that also holds others has their form on a second line:
+    // that is theirs.
+    let usage = usage.lines().next().unwrap_or_default();
+    let args: Vec<ArgHelp> = sub
+        .get_arguments()
+        .filter(|a| !a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version"))
+        .map(arg_help)
+        .collect();
     Verb {
         name: name.into(),
-        usage: usage.strip_prefix("Usage: ").unwrap_or(&usage).to_string(),
+        usage: usage.strip_prefix("Usage: ").unwrap_or(usage).to_string(),
         about: about_of(sub),
-        args: sub
-            .get_arguments()
-            .filter(|a| !a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version"))
-            .map(arg_help)
-            .collect(),
+        takes: args.clone(),
+        args,
     }
 }
 
@@ -787,9 +904,15 @@ pub async fn edit_saved(
                 Err(e) if e == nerve_transport::ctl::NOT_RUNNING => break,
                 Err(e) => return Err(e),
             };
-            let mut cfg = NodeConfig::parse(read["config"].as_str().unwrap_or_default())?;
+            let old = NodeConfig::parse(read["config"].as_str().unwrap_or_default())?;
+            let mut cfg = old.clone();
             f(&mut cfg)?;
-            let params = json!({"config": cfg.to_toml(), "if_version": read["version"]});
+            crate::owner::check_change(&old, &cfg)?;
+            let params = json!({
+                "config": cfg.to_toml(),
+                "if_version": read["version"],
+                "user": changed_by(),
+            });
             match nerve_transport::ctl::call(&sock, "config.write", params).await {
                 Ok(_) => {
                     return Ok(Saved {
@@ -815,7 +938,12 @@ pub async fn edit_saved(
         Box::new(crate::secrets::NodeSecrets::for_cli(paths)),
         AuditLog::new(paths.audit_log()),
     )?;
-    match store.update(f) {
+    store.set_user(Some(changed_by()));
+    let old = store.config().clone();
+    match store.update(|c| {
+        f(c)?;
+        crate::owner::check_change(&old, c)
+    }) {
         Ok(_) => {
             let cfg = store.config().clone();
             // No daemon took the change, so the folder grants of Windows
@@ -877,6 +1005,7 @@ async fn rotate_key(
         return Ok(());
     }
     let days = nerve_proto::ROTATE_GRACE_MS / 86_400_000;
+    json::also("public_key", json!(key));
     let _ = writeln!(
         out,
         "center {name} took this machine's new key:\n  {key}\nThe old key is deleted here. The center takes it for {days} more days, unless you end that now with `nerve-node center rotate-key --end-grace --center {name}`."
@@ -982,7 +1111,10 @@ impl List {
     /// (`fs.read:~/notes/*`, `fs:~/private/*`) is refused. As a command it
     /// would become a rule that never matches. A single letter before the `:`
     /// is a drive (`C:\tools\x.exe`), not a capability.
-    fn entry(self, command: &str, wildcard: bool) -> Result<String, String> {
+    fn entry(self, command: &str, wildcard: bool, action: Option<&str>) -> Result<String, String> {
+        if let Some(action) = action {
+            return self.action_rule(action, command, wildcard);
+        }
         if matches!(self, List::Allow | List::Deny)
             && let Some((scope, _)) = command.trim().split_once(':')
             && (scope.contains('.') || scope.len() > 1)
@@ -994,6 +1126,57 @@ impl List {
             ));
         }
         self.command_rule(command, wildcard)
+    }
+
+    /// What an edited entry becomes, for `rule edit`: an entry in the form
+    /// `ls` shows (a `cap.action:pattern` rule; on the sudo list a pattern
+    /// of a sudo command) as it is, a plain command line as `add` makes it.
+    fn edited(self, new: &str) -> Result<String, String> {
+        let new = new.trim();
+        if new.is_empty() {
+            return Err("the new entry is empty: `rule rm` takes an entry away".into());
+        }
+        match self {
+            List::Allow | List::Deny => match new.split_once(':') {
+                // A single letter before the `:` is a drive, not a
+                // capability (`C:\tools\x.exe`).
+                Some((scope, _)) if scope.len() > 1 && rules::valid_scope(scope) => {
+                    rules::validate(new)?;
+                    Ok(new.to_string())
+                }
+                _ => self.command_rule(new, false),
+            },
+            List::Sudo => {
+                let glob = if sudo_command(new).is_some() {
+                    new.to_string()
+                } else {
+                    format!("sudo {new}")
+                };
+                rules::validate_command_glob(&glob)?;
+                Ok(glob)
+            }
+        }
+    }
+
+    /// The rule of an audit entry of `action` (`fs.read`) with `target`, as
+    /// the audit buttons of the desktop app and of the center make it
+    /// ([`rules::rule_for`]). The sudo list takes sudo commands only.
+    fn action_rule(self, action: &str, target: &str, wildcard: bool) -> Result<String, String> {
+        // A cut target is no longer the call's, so no rule can name it.
+        if nerve_policy::audit::is_cut_target(target) {
+            return Err("the target was cut to its start, so a rule cannot name it".into());
+        }
+        let (cap, act) = action
+            .split_once('.')
+            .ok_or_else(|| format!("{action:?} is not a capability and action, like fs.read"))?;
+        match self {
+            List::Sudo if (cap, act) != ("exec", "run") => {
+                Err("the sudo list is for sudo commands (--action exec.run)".into())
+            }
+            List::Sudo => self.command_rule(target, wildcard),
+            List::Allow if (cap, act) == ("exec", "run") => self.command_rule(target, wildcard),
+            List::Allow | List::Deny => rules::rule_for(cap, act, target, wildcard),
+        }
     }
 
     /// The rule a command line stands for. The allow and deny lists hold
@@ -1022,9 +1205,10 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             list,
             command,
             wildcard,
+            action,
             center,
         } => {
-            let rule = list.entry(&command, wildcard)?;
+            let rule = list.entry(&command, wildcard, action.as_deref())?;
             let name = edit_center(paths, &center, |e| {
                 push_unique(list.of(&mut e.policy), &rule);
                 Ok(())
@@ -1040,6 +1224,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             list,
             command,
             wildcard,
+            action,
             center,
         } => {
             let removed = std::sync::Mutex::new(String::new());
@@ -1049,7 +1234,10 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                 // An entry copied from `ls` goes as it is, so rules for
                 // files and other actions can be removed too. The arguments
                 // of `add` stand for the command rule they made.
-                let made = list.command_rule(&command, wildcard);
+                let made = match &action {
+                    Some(a) => list.action_rule(a, &command, wildcard),
+                    None => list.command_rule(&command, wildcard),
+                };
                 let rule = match made {
                     Ok(made) if made != command && l.contains(&command) && l.contains(&made) => {
                         return Err(format!(
@@ -1073,6 +1261,61 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             .await?;
             let removed = removed.into_inner().unwrap();
             let _ = writeln!(out, "{name}: removed {removed:?} from the {}", list.label());
+        }
+        RuleCmd::Edit {
+            list,
+            entry,
+            new,
+            center,
+        } => {
+            let rule = list.edited(&new)?;
+            let name = edit_center(paths, &center, |e| {
+                let l = list.of(&mut e.policy);
+                let Some(at) = l.iter().position(|r| *r == entry) else {
+                    return Err(format!("{entry:?} is not on the {}", list.label()));
+                };
+                if rule == entry {
+                    return Err(format!("{entry:?} is that already"));
+                }
+                // In its place; a copy of the new entry elsewhere on the
+                // list goes, so the list holds each entry once.
+                l[at] = rule.clone();
+                let mut i = 0;
+                l.retain(|r| {
+                    i += 1;
+                    i - 1 == at || *r != rule
+                });
+                Ok(())
+            })
+            .await?;
+            let _ = writeln!(
+                out,
+                "{name}: the {} {entry:?} is {rule:?} now",
+                list.label()
+            );
+        }
+        RuleCmd::Guard { center } => {
+            let added = std::sync::Mutex::new(0usize);
+            let name = edit_center(paths, &center, |e| {
+                let missing = nerve_policy::rules::guard_missing(&e.policy.deny);
+                if missing.is_empty() {
+                    return Err(format!(
+                        "{} has every deny rule of the guard already",
+                        e.name
+                    ));
+                }
+                *added.lock().unwrap() = missing.len();
+                e.policy
+                    .deny
+                    .extend(missing.into_iter().map(str::to_string));
+                Ok(())
+            })
+            .await?;
+            let added = added.into_inner().unwrap();
+            let _ = writeln!(
+                out,
+                "{name}: added {added} deny rules of the guard; commands that name this node's programs, service, socket or folders are forbidden"
+            );
         }
         RuleCmd::Ls { list, center } => {
             let (cfg, _) = read_config(paths).await?;
@@ -1105,7 +1348,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
 }
 
 /// When a change that only the file holds counts.
-const NEXT_START: &str = "takes effect at the next start of the node";
+pub(crate) const NEXT_START: &str = "takes effect at the next start of the node";
 
 /// Runs one command line, writing what it shows to `out`. A change made
 /// while no daemon answers on the control socket (none runs, or Windows,
@@ -1125,27 +1368,68 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     if !service {
         crate::service::check_access(&paths)?;
     }
+    if !cli.json {
+        return said(paths, cli.cmd, out).await;
+    }
+    // The read commands have a JSON form of their own; the others give the
+    // lines they print as a list.
+    if json::own_form(&cli.cmd) {
+        return json::command(&paths, cli.cmd, out).await;
+    }
+    json::changed(paths, cli.cmd, out).await
+}
+
+/// Whether `line` is one a change prints to say that the node takes it
+/// only at its next start: a node that does not run, the installed node on
+/// Windows for anything but folders, a relay change or sudo on Windows. The
+/// desktop app shows such a line in words of its own. Only the whole line
+/// counts: a change also prints what others chose (a rule a center's
+/// command became), and such text could hold the same words.
+pub fn takes_at_next_start(line: &str) -> bool {
+    line == in_file_line()
+        || line == RELAY_AT_NEXT_START
+        || line == crate::winsudo::next_start_line()
+}
+
+/// What a change says when only node.toml holds it.
+fn in_file_line() -> String {
+    format!("the change is in node.toml; it {NEXT_START}")
+}
+
+/// Says, as `"next_start": true` with `--json`, that the node takes the
+/// change only at its next start: called where the line that says so is
+/// written, so a program learns it from what the command did and not from
+/// its text.
+pub(crate) fn waits_for_next_start() {
+    json::also("next_start", json!(true));
+}
+
+/// [`execute`] with the text output, and what it says when a change is
+/// only in the file.
+async fn said(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), String> {
+    let service = cmd.is_service();
     // The daemon writes the file itself while it runs; the service commands
     // leave it alone (or delete it with the rest). Sudo on Windows says
     // itself when its change counts (crate::winsudo).
     // A restore says itself what comes next.
-    let own_say = (cfg!(windows) && matches!(cli.cmd, Cmd::Sudo(_)))
-        || matches!(cli.cmd, Cmd::Restore { .. });
-    let before = (!matches!(cli.cmd, Cmd::Run) && !service && !own_say)
+    let own_say =
+        (cfg!(windows) && matches!(cmd, Cmd::Sudo(_))) || matches!(cmd, Cmd::Restore { .. });
+    let before = (!matches!(cmd, Cmd::Run) && !service && !own_say)
         .then(|| std::fs::read(paths.config_file()).ok());
     // On Windows the running node takes folder changes over its pipe, and
     // nothing else yet.
     let folders = matches!(
-        cli.cmd,
+        cmd,
         Cmd::Folder(FolderCmd::Add { .. } | FolderCmd::Set { .. } | FolderCmd::Rm { .. })
     );
-    let r = command(paths.clone(), cli.cmd, out).await;
+    let r = command(paths.clone(), cmd, out).await;
     if r.is_ok()
         && let Some(before) = before
         && std::fs::read(paths.config_file()).ok() != before
         && !daemon_answers(&paths, folders).await
     {
-        let _ = writeln!(out, "the change is in node.toml; it {NEXT_START}");
+        let _ = writeln!(out, "{}", in_file_line());
+        waits_for_next_start();
     }
     r
 }
@@ -1153,10 +1437,10 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
 impl Cmd {
     /// install, update and uninstall: they work on the installed node, as
     /// root.
-    fn is_service(&self) -> bool {
+    pub(crate) fn is_service(&self) -> bool {
         matches!(
             self,
-            Cmd::Install | Cmd::Update { .. } | Cmd::Uninstall { .. }
+            Cmd::Install | Cmd::Update { .. } | Cmd::Uninstall { .. } | Cmd::Service(_)
         )
     }
 }
@@ -1168,25 +1452,105 @@ impl Cmd {
 /// node's. install, update and uninstall keep root; setup keeps it as its
 /// saved id, to make the account of the commands when the owner asks.
 pub fn settle_user(cli: &Cli) -> Result<(), String> {
+    #[cfg(unix)]
+    STARTED_AS.get_or_init(own_real_uid);
     if cli.cmd.is_service() {
         return Ok(());
     }
-    crate::service::become_owner(
-        &NodePaths::from_args(cli.config_dir.clone(), cli.state_dir.clone()),
-        matches!(cli.cmd, Cmd::Setup { .. }),
+    let paths = NodePaths::from_args(cli.config_dir.clone(), cli.state_dir.clone());
+    // The backup file is the asker's, in the asker's folders: it is opened
+    // as the user who ran sudo (crate::caller_file), not as the node's.
+    if crate::service::becomes_owner(&paths) {
+        use crate::caller_file::{Job, prepare};
+        match &cli.cmd {
+            Cmd::Backup {
+                file, overwrite, ..
+            } => prepare(Job::Write {
+                path: file.clone(),
+                overwrite: *overwrite,
+            })?,
+            Cmd::Restore { file, .. } => prepare(Job::Read(file.clone()))?,
+            _ => {}
+        }
+    }
+    crate::service::become_owner(&paths, matches!(cli.cmd, Cmd::Setup { .. }))
+}
+
+/// Set by the desktop app's broker on Windows for the commands it runs: the
+/// SID of the app's user. The broker runs as the administrator who answered
+/// the UAC prompt, who is another account when the app's user is a standard
+/// user.
+pub const DESKTOP_USER_SID: &str = "NERVE_DESKTOP_USER_SID";
+
+/// The account that ran this command through sudo, else root. On Windows
+/// the account this command runs as, or the desktop app's user for the
+/// app's broker ([`DESKTOP_USER_SID`]). A command the node runs for one of
+/// its owners is that owner's (crate::owner).
+pub(crate) fn invoker() -> String {
+    if let Some(owner) = crate::owner::owner_running() {
+        return owner;
+    }
+    #[cfg(windows)]
+    if let Some(name) = windows_invoker(std::env::var(DESKTOP_USER_SID).ok()) {
+        return name;
+    }
+    invoker_of(
+        std::env::var("SUDO_USER").ok(),
+        std::env::var("PKEXEC_UID").ok(),
+        crate::account::name_of,
     )
 }
 
-/// The account that ran this command through sudo, else root. On Windows
-/// the account this command runs as.
-fn invoker() -> String {
-    #[cfg(windows)]
-    if let Ok(me) = crate::win_user::current_user() {
-        return me;
+/// Who makes a change, for the audit: the [`invoker`], and without sudo or
+/// pkexec the account that started this command, which is root only when
+/// it was.
+pub(crate) fn changed_by() -> String {
+    let who = invoker();
+    #[cfg(unix)]
+    if who == "root" {
+        let uid = *STARTED_AS.get_or_init(own_real_uid);
+        if uid != 0 {
+            return crate::account::name_of(uid).unwrap_or_else(|| format!("uid {uid}"));
+        }
     }
-    std::env::var("SUDO_USER")
-        .ok()
+    who
+}
+
+/// The real user id this process started with, before
+/// [`settle_user`] made it the node's user.
+#[cfg(unix)]
+static STARTED_AS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn own_real_uid() -> u32 {
+    // SAFETY: a plain getter.
+    unsafe { libc::getuid() }
+}
+
+/// [`invoker`] on Windows: the desktop app's user when its broker names
+/// one by SID (`app_user`), else the account this command runs as.
+#[cfg(windows)]
+fn windows_invoker(app_user: Option<String>) -> Option<String> {
+    app_user
+        .and_then(|sid| crate::win_user::name_of_sid(&sid).ok())
+        .or_else(|| crate::win_user::current_user().ok())
+}
+
+/// [`invoker`] from `SUDO_USER`, else `PKEXEC_UID`: polkit's pkexec, with
+/// which the desktop app asks for root, names the user who asked by uid.
+fn invoker_of(
+    sudo_user: Option<String>,
+    pkexec_uid: Option<String>,
+    name_of: impl Fn(u32) -> Option<String>,
+) -> String {
+    sudo_user
         .filter(|u| !u.is_empty())
+        .or_else(|| {
+            pkexec_uid
+                .and_then(|u| u.trim().parse::<u32>().ok())
+                .filter(|u| *u != 0)
+                .and_then(name_of)
+        })
         .unwrap_or_else(|| "root".into())
 }
 
@@ -1199,6 +1563,19 @@ pub fn service_log(cli: &Cli) -> Option<PathBuf> {
     }
     let paths = NodePaths::from_args(cli.config_dir.clone(), cli.state_dir.clone());
     crate::service::is_service_node(&paths).then(|| paths.log_file())
+}
+
+/// `service status` as JSON (crate::service::service_status): the
+/// installed service's state as this machine's service manager says it.
+pub(crate) fn service_status(layout: &Layout) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    let state = {
+        use crate::winsvc::WinSystem;
+        crate::win_host::WinHost.service_state()?
+    };
+    #[cfg(not(windows))]
+    let state = crate::service::unit_status(layout, &Host)?;
+    Ok(crate::service::service_status(layout, state.as_ref()))
 }
 
 /// The rule of the other owner commands (docs/dev/spec/node-local.md §5):
@@ -1299,14 +1676,22 @@ fn limits_lines(v: &Value) -> Vec<String> {
     lines
 }
 
-/// What `status` says when no daemon answered. With a control socket
-/// (Unix) that means none runs; without one a running node cannot be told
-/// apart from a stopped one.
-fn no_daemon_status(socket: bool) -> String {
-    if socket {
-        "daemon: not running".into()
-    } else {
-        format!("daemon: not known (no control socket on Windows); a change {NEXT_START}")
+/// The running node's status: over the control socket, on Windows over its
+/// pipe; `None` when no node runs.
+async fn live_status(paths: &NodePaths) -> Result<Option<Value>, String> {
+    #[cfg(unix)]
+    let r = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await;
+    #[cfg(windows)]
+    let r = crate::pipe::call(paths, "status", json!({})).await;
+    #[cfg(not(any(unix, windows)))]
+    let r: Result<Value, String> = {
+        let _ = paths;
+        Err(nerve_transport::ctl::NOT_RUNNING.to_string())
+    };
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -1323,8 +1708,17 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Center(CenterCmd::Add { link, name, yes }) => {
             let link = PairLink::parse(&link)?;
             w(out, crate::pair::preview(&link, name.as_deref()));
-            if !yes && !confirm(&mut std::io::stdin().lock(), out)? {
-                return Err("not paired".into());
+            if !yes {
+                // Asked only when the pairing can work: the center answers,
+                // its certificate is the pinned one and the code is open.
+                let check = crate::pair::check(&paths, &link).await?;
+                if !check.ready() {
+                    return Err(check.said());
+                }
+                w(out, check.said());
+                if !confirm(&mut std::io::stdin().lock(), out)? {
+                    return Err("not paired".into());
+                }
             }
             let e = crate::pair::pair(&paths, &link, name.as_deref()).await?;
             w(out, format!("paired with {} as {}", e.url, e.name));
@@ -1475,76 +1869,72 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             Ok(())
         }
         Cmd::Status => {
-            #[cfg(unix)]
-            match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
-                Ok(v) => {
+            // On Windows the node answers over its control pipe.
+            if let Some(v) = live_status(&paths).await? {
+                w(
+                    out,
+                    format!(
+                        "daemon: running (confinement {})",
+                        v["confinement"].as_str().unwrap_or("?")
+                    ),
+                );
+                if let Some(why) = v["folder_commands_off"].as_str() {
+                    w(out, format!("folder mode runs no command: {why}"));
+                }
+                for line in limits_lines(&v["command_limits"]) {
+                    w(out, line);
+                }
+                if v["locked"] == true {
+                    w(
+                        out,
+                        "LOCKED (panic): nothing runs until `nerve-node unlock`".into(),
+                    );
+                }
+                for c in v["centers"].as_array().into_iter().flatten() {
                     w(
                         out,
                         format!(
-                            "daemon: running (confinement {})",
-                            v["confinement"].as_str().unwrap_or("?")
+                            "{}  {}  mode {}",
+                            c["name"].as_str().unwrap_or_default(),
+                            c["status"].as_str().unwrap_or_default(),
+                            c["mode"].as_str().unwrap_or_default(),
                         ),
                     );
-                    if let Some(why) = v["folder_commands_off"].as_str() {
-                        w(out, format!("folder mode runs no command: {why}"));
-                    }
-                    for line in limits_lines(&v["command_limits"]) {
-                        w(out, line);
-                    }
-                    if v["locked"] == true {
-                        w(
-                            out,
-                            "LOCKED (panic): nothing runs until `nerve-node unlock`".into(),
-                        );
-                    }
-                    for c in v["centers"].as_array().into_iter().flatten() {
-                        w(
-                            out,
-                            format!(
-                                "{}  {}  mode {}",
-                                c["name"].as_str().unwrap_or_default(),
-                                c["status"].as_str().unwrap_or_default(),
-                                c["mode"].as_str().unwrap_or_default(),
-                            ),
-                        );
-                    }
-                    for p in v["providers"].as_array().into_iter().flatten() {
-                        let caps: Vec<&str> = p["capabilities"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str)
-                            .collect();
-                        w(
-                            out,
-                            format!(
-                                "provider {} attached: {}",
-                                p["name"].as_str().unwrap_or_default(),
-                                caps.join(", ")
-                            ),
-                        );
-                    }
-                    let relay = &v["relay"];
-                    if relay["listen"].is_string() {
-                        let tunnels = relay["tunnels"].as_array().map_or(0, Vec::len);
-                        w(
-                            out,
-                            format!(
-                                "relay: {}, {tunnels} tunnels open (`nerve-node relay ls` names them)",
-                                relay["status"].as_str().unwrap_or_default()
-                            ),
-                        );
-                    }
-                    return Ok(());
                 }
-                Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
-                Err(_) => {}
+                for p in v["providers"].as_array().into_iter().flatten() {
+                    let caps: Vec<&str> = p["capabilities"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect();
+                    w(
+                        out,
+                        format!(
+                            "provider {} attached: {}",
+                            p["name"].as_str().unwrap_or_default(),
+                            caps.join(", ")
+                        ),
+                    );
+                }
+                let relay = &v["relay"];
+                if relay["listen"].is_string() {
+                    let tunnels = relay["tunnels"].as_array().map_or(0, Vec::len);
+                    w(
+                        out,
+                        format!(
+                            "relay: {}, {tunnels} tunnels open (`nerve-node relay ls` names them)",
+                            relay["status"].as_str().unwrap_or_default()
+                        ),
+                    );
+                }
+                return Ok(());
             }
             let cfg = SettingsStore::peek_with(
                 &paths.config_file(),
                 &crate::secrets::NodeSecrets::for_cli(&paths),
             )?;
-            w(out, no_daemon_status(cfg!(unix)));
+            w(out, "daemon: not running".into());
             let limits =
                 crate::cgroup::status(&cfg.limits.command, &Err("the node does not run".into()));
             if let Some(line) = limits_lines(&limits).first() {
@@ -1668,7 +2058,47 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             w(out, "unlocked".into());
             Ok(())
         }
-        Cmd::Audit { follow, denied } => audit(&paths, follow, denied, out).await,
+        Cmd::Audit {
+            clear: Some(AuditCmd::Clear),
+            ..
+        } => {
+            // A command of a center must not wipe what it did from the
+            // owner's sight.
+            owner_check(&[&paths]).await?;
+            let who = changed_by();
+            AuditLog::new(paths.audit_log())
+                .clear(&who)
+                .map_err(|e| format!("{}: {e}", paths.audit_log().display()))?;
+            w(
+                out,
+                format!(
+                    "audit cleared; the entries so far are kept in {}",
+                    AuditLog::new(paths.audit_log()).old_path().display()
+                ),
+            );
+            Ok(())
+        }
+        Cmd::Audit {
+            clear: None,
+            follow,
+            denied,
+            last,
+        } => audit(&paths, follow, denied, last, false, out).await,
+        Cmd::Log {
+            clear: Some(LogCmd::Clear),
+            ..
+        } => {
+            owner_check(&[&paths]).await?;
+            clear_log(&paths, &changed_by())?;
+            w(out, "log cleared".into());
+            Ok(())
+        }
+        Cmd::Log {
+            clear: None,
+            follow,
+            last,
+            problems,
+        } => log_cmd(&paths, follow, last, problems, false, out).await,
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
         Cmd::Relay(c) => relay_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
@@ -1690,6 +2120,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             };
             let r = crate::backup::backup(&paths, &cfg, &file, &pass, &opts)?;
             crate::backup::print_backup(&r, &file, out);
+            json::also("backup", crate::backup::backup_data(&r, &file));
             Ok(())
         }
         Cmd::Restore {
@@ -1700,7 +2131,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             passphrase_file,
         } => {
             owner_check(&[&paths]).await?;
-            let bytes = nerve_transport::backup::read_file(&file)?;
+            let bytes = crate::caller_file::read(&file)?;
             let kind = nerve_transport::backup::kind_of(&bytes)?;
             if kind != nerve_transport::backup::Kind::Node {
                 return Err(format!(
@@ -1713,6 +2144,13 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 .transpose()?;
             let pass = crate::prompt::passphrase(passphrase_file.as_deref(), out, false)?;
             let parsed = crate::backup::open(&bytes, &pass)?;
+            // An owner restores what an owner may change, nothing that
+            // picks the account or program commands run as.
+            if crate::owner::owner_running().is_some()
+                && let Some(key) = crate::backup::root_only_change(&paths, &parsed)
+            {
+                return Err(crate::owner::restore_needs_admin(key));
+            }
             let opts = crate::backup::RestoreOpts {
                 replace,
                 secret_storage: storage,
@@ -1720,6 +2158,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             };
             let r = crate::backup::restore(&paths, &parsed, &opts)?;
             crate::backup::print_restore(&r, &parsed, out);
+            json::also("restored", crate::backup::restore_data(&r, &parsed));
             Ok(())
         }
         Cmd::Install => {
@@ -1756,7 +2195,10 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 )
             }
         }
-        Cmd::Setup { create_user } => {
+        Cmd::Setup {
+            create_user,
+            account_only,
+        } => {
             owner_check(&[&paths]).await?;
             // Windows takes the account of the commands, and its password,
             // at install.
@@ -1777,10 +2219,14 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 },
                 None => crate::keyring_setup::HostKeyring::this_program(),
             };
+            let ask = |name| Setup {
+                create_user: name,
+                account_only,
+            };
             setup(
                 &paths,
                 machine,
-                create_user.as_deref(),
+                ask(create_user.as_deref()),
                 &keyring,
                 &mut input,
                 out,
@@ -1794,10 +2240,57 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             return crate::winsvc::update(&layout, &crate::win_host::WinHost, from.as_deref(), out)
                 .await;
             #[cfg(not(windows))]
-            crate::service::update(&layout, &Host, from.as_deref(), out).await
+            crate::service::update(&layout, &Host, from.as_deref(), &invoker(), out).await
+        }
+        Cmd::Service(ServiceCmd::Status) => {
+            let v = service_status(&Layout::system())?;
+            let state = match v["state"].as_str() {
+                None => "not installed as a service".to_string(),
+                Some(state) => {
+                    let boot = match v["enabled"].as_bool() {
+                        Some(true) => ", starts with the machine",
+                        Some(false) => ", does not start with the machine",
+                        None => "",
+                    };
+                    format!("{state}{boot}")
+                }
+            };
+            let version = v["version"]
+                .as_str()
+                .map_or_else(String::new, |v| format!(" (version {v})"));
+            let program = if v["present"] == true {
+                format!("{}{version}", v["program"].as_str().unwrap_or_default())
+            } else {
+                format!("none at {}", v["program"].as_str().unwrap_or_default())
+            };
+            writeln!(out, "service: {state}\nprogram: {program}").map_err(|e| e.to_string())
+        }
+        Cmd::Service(c) => {
+            let action = match c {
+                ServiceCmd::Start => crate::service::ServiceAction::Start,
+                ServiceCmd::Stop => crate::service::ServiceAction::Stop,
+                _ => crate::service::ServiceAction::Restart,
+            };
+            let layout = Layout::system();
+            // An owner without root does not reach the control socket; the
+            // service manager lets the owner's own session only, not a
+            // command of the node, start and stop it (crate::owner).
+            if crate::rights::full_rights() {
+                owner_check(&[&layout.paths]).await?;
+            }
+            #[cfg(windows)]
+            return crate::winsvc::control(&layout, &crate::win_host::WinHost, action, out);
+            #[cfg(not(windows))]
+            crate::service::control(&layout, &Host, action, out)
         }
         Cmd::Uninstall { purge } => {
             let layout = Layout::system();
+            // The desktop app took this node over: its service, parts and
+            // program are the app's, so the app's own uninstall removes it
+            // all, and its checks are its own.
+            if let Some(app) = crate::service::app_beside(&layout) {
+                return crate::service::hand_over_uninstall(&app, purge, out);
+            }
             owner_check(&[&layout.paths]).await?;
             // The node run by hand: the one named, or the one in this
             // user's default folders.
@@ -1831,16 +2324,25 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
 /// commands: `create_user` names it (and makes it) instead of asking. Keys
 /// in the system keyring need one that answers; `keyring` checks it, and
 /// installs one when the owner says so ([`crate::keyring_setup`]).
+/// What `setup` was told on its command line.
+#[derive(Clone, Copy, Default)]
+pub struct Setup<'a> {
+    /// The account commands run as, made if it is not there.
+    pub create_user: Option<&'a str>,
+    /// Choose that account and end, asking nothing.
+    pub account_only: bool,
+}
+
 pub async fn setup(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
-    create_user: Option<&str>,
+    told: Setup<'_>,
     keyring: &dyn crate::keyring_setup::Keyring,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let mut steps = Vec::new();
-    let r = setup_steps(paths, machine, create_user, keyring, input, out, &mut steps).await;
+    let r = setup_steps(paths, machine, told, keyring, input, out, &mut steps).await;
     let log = AuditLog::new(paths.audit_log());
     if let Err(e) = log.node("setup", &steps, r.as_ref().err().map(String::as_str)) {
         let _ = writeln!(out, "the audit log cannot be written: {e}");
@@ -1924,12 +2426,13 @@ async fn account_chosen(
 async fn setup_steps(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
-    create_user: Option<&str>,
+    told: Setup<'_>,
     keyring: &dyn crate::keyring_setup::Keyring,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     steps: &mut Vec<String>,
 ) -> Result<(), String> {
+    let create_user = told.create_user;
     if create_user.is_some() && machine.is_none() {
         return Err(
             "--create-user chooses the account commands run as on a node installed as a service (`sudo nerve-node install`); this node runs them as its own user".into(),
@@ -1940,7 +2443,8 @@ async fn setup_steps(
     // into files below. The installed node on Windows asks none: the keyring
     // setup reaches is not the service's.
     let no_keyring = crate::secrets::no_keyring(paths);
-    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring
+    if !told.account_only
+        && crate::secrets::stated_storage(paths) == SecretStorage::Keyring
         && no_keyring != Some(crate::secrets::NoKeyring::WindowsService)
     {
         let me = crate::keyring_setup::me()?;
@@ -1952,6 +2456,10 @@ async fn setup_steps(
         let c = crate::service::create_account(sys, paths, name, &invoker(), out)?;
         let chosen = (c.made || cfg.machine.user.as_deref() != Some(name)).then_some(c);
         account_chosen(paths, chosen, out, steps).await?;
+        // A program that sets the account alone, such as the desktop app.
+        if told.account_only {
+            return Ok(());
+        }
     }
     let _ = writeln!(out, "Set up this node. Enter keeps what is in [brackets].");
     let current = crate::descriptor::node_name(&cfg);
@@ -2401,12 +2909,7 @@ async fn sudo_cmd(paths: &NodePaths, c: SudoCmd, out: &mut dyn Write) -> Result<
                 w(out, "sudo: off");
             }
             SudoCmd::Status => {
-                let on = match call(&sock, "sudo.status", json!({})).await {
-                    Ok(v) => v["sudo"] == "on",
-                    // A node that does not run holds no password.
-                    Err(e) if e == NOT_RUNNING => false,
-                    Err(e) => return Err(e),
-                };
+                let on = sudo_is_on(paths).await?;
                 w(out, if on { "sudo: on" } else { "sudo: off" });
             }
         }
@@ -2422,7 +2925,7 @@ async fn sudo_cmd(paths: &NodePaths, c: SudoCmd, out: &mut dyn Write) -> Result<
             }
             SudoCmd::Off => crate::winsudo::off(paths, &WinHost, out).await,
             SudoCmd::Status => {
-                let on = crate::winsudo::status(paths)?;
+                let on = sudo_is_on(paths).await?;
                 w(out, if on { "sudo: on" } else { "sudo: off" });
                 Ok(())
             }
@@ -2435,6 +2938,29 @@ async fn sudo_cmd(paths: &NodePaths, c: SudoCmd, out: &mut dyn Write) -> Result<
             SudoCmd::Status => Ok(()),
             _ => Err("the sudo switch works on Linux and Windows only".into()),
         }
+    }
+}
+
+/// Whether sudo is on: the running node holds the password (on Windows the
+/// signed config says so and the password is kept, crate::winsudo).
+async fn sudo_is_on(paths: &NodePaths) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        match nerve_transport::ctl::call(&paths.ctl_socket(), "sudo.status", json!({})).await {
+            Ok(v) => Ok(v["sudo"] == "on"),
+            // A node that does not run holds no password.
+            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(windows)]
+    {
+        crate::winsudo::status(paths)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = paths;
+        Ok(false)
     }
 }
 
@@ -2554,7 +3080,16 @@ fn audit_line(v: &Value) -> String {
         other => other.to_string(),
     };
     if v.get("changes").is_some() {
-        return format!("{}  settings v{} by {}", s("ts"), s("version"), s("by"));
+        // A local change names the account that made it, when known.
+        let user = v["user"]
+            .as_str()
+            .map_or_else(String::new, |u| format!(" ({u})"));
+        return format!(
+            "{}  settings v{} by {}{user}",
+            s("ts"),
+            s("version"),
+            s("by")
+        );
     }
     if v["kind"] == "node" {
         let steps: Vec<String> = v["steps"]
@@ -2596,6 +3131,9 @@ fn audit_line(v: &Value) -> String {
             s("reason")
         );
     }
+    if v["kind"] == "audit" {
+        return format!("{}  audit {} by {}", s("ts"), s("event"), s("user"));
+    }
     if v["kind"] == "key" {
         return format!(
             "{}  {}  key {}: {}",
@@ -2624,15 +3162,22 @@ fn audit_line(v: &Value) -> String {
 /// `--follow` looks again every 500 ms and shows the lines after the last one
 /// it showed, wherever that line is now: in `audit.jsonl.1` after a rotation,
 /// so the old file is finished before the new one, or further up after the
-/// log dropped old refusals.
+/// log dropped old refusals. With `json` the entries are as the log holds
+/// them: one list, or with `follow` one JSON line each.
 async fn audit(
     paths: &NodePaths,
     follow: bool,
     denied: bool,
+    last: Option<usize>,
+    json: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let log = AuditLog::new(paths.audit_log());
+    let mut entries = Vec::new();
     let mut shown = Shown::default();
+    // --last cuts what is there at the start; with --follow every new
+    // entry comes after it.
+    let mut first = true;
     let mut stamp = None;
     loop {
         // Both files as they are now; the same as at the last look is
@@ -2650,24 +3195,179 @@ async fn audit(
         let lines = log
             .lines()
             .map_err(|e| format!("{}: {e}", log.path().display()))?;
-        for line in &lines[shown.next(&lines)..] {
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            let refused = v["decision"].as_str() == Some("forbidden")
-                || v["event"].as_str() == Some("refused");
-            if denied && !refused {
-                continue;
+        let mut new: Vec<Value> = lines[shown.next(&lines)..]
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|v| {
+                !denied
+                    || v["decision"].as_str() == Some("forbidden")
+                    || v["event"].as_str() == Some("refused")
+            })
+            .collect();
+        if first && let Some(n) = last {
+            new.drain(..new.len().saturating_sub(n));
+        }
+        first = false;
+        for v in new {
+            match (json, follow) {
+                (false, _) => {
+                    let _ = writeln!(out, "{}", audit_line(&v));
+                }
+                (true, false) => entries.push(v),
+                (true, true) => {
+                    let _ = writeln!(out, "{v}");
+                }
             }
-            let _ = writeln!(out, "{}", audit_line(&v));
         }
         shown.saw(&lines);
         if !follow {
+            if json {
+                let _ = writeln!(out, "{}", json!({ "entries": entries }));
+            }
             return Ok(());
         }
         let _ = out.flush();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// `log clear`: the node's log and its moved-aside file emptied, and one
+/// line in it of who did it. The running node writes on at the end of the
+/// emptied file.
+fn clear_log(paths: &NodePaths, who: &str) -> Result<(), String> {
+    let file = paths.log_file();
+    let mut old = file.clone().into_os_string();
+    old.push(".1");
+    match std::fs::remove_file(&old) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("{}: {e}", Path::new(&old).display()));
+        }
+        _ => {}
+    }
+    let line = nerve_transport::log::Entry {
+        ts: nerve_proto::msg::now_ms(),
+        level: nerve_transport::log::Level::Info,
+        node: None,
+        node_id: None,
+        msg: format!("the log was cleared by {who}"),
+    };
+    let mut line = serde_json::to_vec(&line).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).truncate(true);
+    match o.open(&file) {
+        Ok(mut f) => f.write_all(&line),
+        // No log yet: nothing to clear, and no line either.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+    .map_err(|e| format!("{}: {e}", file.display()))
+}
+
+/// `log`: the node's log file, the moved-aside one first (docs/user/logs.md).
+/// `--follow` looks again every 500 ms and reads what was added to the file,
+/// or the new file from its start once the old one was moved aside. With
+/// `json` the lines are as the file holds them: one list, or with `follow`
+/// one JSON line each.
+async fn log_cmd(
+    paths: &NodePaths,
+    follow: bool,
+    last: Option<usize>,
+    problems: bool,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let file = paths.log_file();
+    let read = |p: &Path| match std::fs::read(p) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{}: {e}", p.display())),
+    };
+    let mut old = file.clone().into_os_string();
+    old.push(".1");
+    let mut bytes = read(Path::new(&old))?;
+    let current = read(&file)?;
+    let mut at = current.len();
+    // The file's first bytes tell it from the one that replaces it, which
+    // can be as long already.
+    let head = |b: &[u8]| b[..b.len().min(64)].to_vec();
+    let mut first = head(&current);
+    // A line the node is still writing waits for its end, also at the
+    // start: read now, its first half would be no line, and the rest,
+    // read later, none either.
+    let whole = current
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| i + 1);
+    bytes.extend_from_slice(&current[..whole]);
+    let mut rest: Vec<u8> = current[whole..].to_vec();
+    // --problems: errors and warnings only, before --last counts them.
+    let parse = |bytes: &[u8]| -> Vec<Value> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| !problems || matches!(v["level"].as_str(), Some("error" | "warn")))
+            .collect()
+    };
+    let mut lines = parse(&bytes);
+    if let Some(n) = last {
+        lines.drain(..lines.len().saturating_sub(n));
+    }
+    let show = |out: &mut dyn Write, v: &Value| {
+        let _ = if json {
+            writeln!(out, "{v}")
+        } else {
+            writeln!(out, "{}", log_line(v))
+        };
+    };
+    if json && !follow {
+        let _ = writeln!(out, "{}", json!({ "entries": lines }));
+        return Ok(());
+    }
+    for v in &lines {
+        show(out, v);
+    }
+    if !follow {
+        return Ok(());
+    }
+    loop {
+        let _ = out.flush();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = read(&file)?;
+        if now.len() < at || !now.starts_with(&first) {
+            // Moved aside: what the old file got after the last look, then
+            // the new file from its start.
+            let moved = read(Path::new(&old))?;
+            rest.extend_from_slice(moved.get(at..).unwrap_or_default());
+            at = 0;
+        }
+        if first.len() < 64 {
+            first = head(&now);
+        }
+        rest.extend_from_slice(&now[at..]);
+        at = now.len();
+        let Some(end) = rest.iter().rposition(|b| *b == b'\n') else {
+            continue;
+        };
+        let done: Vec<u8> = rest.drain(..=end).collect();
+        for v in parse(&done) {
+            show(out, &v);
+        }
+    }
+}
+
+/// One line of the log for people: the time, the level, the message.
+fn log_line(v: &Value) -> String {
+    let mut line = format!(
+        "{}  {}  {}",
+        v["ts"].as_u64().unwrap_or_default(),
+        v["level"].as_str().unwrap_or_default(),
+        v["msg"].as_str().unwrap_or_default()
+    );
+    if let Some(n) = v["node"].as_str() {
+        line.push_str(&format!(" ({n})"));
+    }
+    line
 }
 
 /// Where `audit --follow` is: the last line it looked at, how many copies
@@ -2883,7 +3583,34 @@ fn keyring_turns_commands_off(
 /// Nothing here prints, logs or audits a value.
 async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Result<(), String> {
     match c {
-        ProxyCmd::Set { url, pin, headers } => {
+        ProxyCmd::Set {
+            url,
+            pin,
+            mut headers,
+            password_stdin,
+            headers_stdin,
+        } => {
+            let mut stdin_password = None;
+            if password_stdin || headers_stdin {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                    .map_err(|e| format!("cannot read stdin: {e}"))?;
+                let (password, more) = stdin_secrets(&text, password_stdin, headers_stdin);
+                stdin_password = password;
+                headers.extend(more);
+            }
+            // A relay's link holds the proxy URL with this node's login and
+            // the pin: one paste (docs/user/relay.md).
+            let (url, pin) =
+                if nerve_proto::link::strip_prefix_ci(url.trim(), "nerve://relay").is_some() {
+                    let link = nerve_proto::link::RelayLink::parse(&url)?;
+                    if pin.as_ref().is_some_and(|p| *p != link.pin) {
+                        return Err("the relay link carries the pin; give no other --pin".into());
+                    }
+                    (link.proxy_url(), Some(link.pin))
+                } else {
+                    (url, pin)
+                };
             let mut hs: Vec<(String, String)> = Vec::new();
             for (i, h) in headers.iter().enumerate() {
                 // Not echoed: without its colon the whole line may be the secret.
@@ -2896,7 +3623,18 @@ async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Resul
                 }
                 hs.push((k, v.trim().to_string()));
             }
-            let (url, login) = split_credentials(&url)?;
+            let (url, mut login) = split_credentials(&url)?;
+            if let Some(password) = stdin_password {
+                match &mut login {
+                    Some((_, p)) if p.is_empty() => *p = password,
+                    Some(_) => {
+                        return Err("the proxy URL has a password already; with --password-stdin give the user name alone, http://user@host:port".into());
+                    }
+                    None => {
+                        return Err("--password-stdin needs a proxy URL with a user name: http://user@host:port".into());
+                    }
+                }
+            }
             let https = url.to_ascii_lowercase().starts_with("https://");
             let (now, _) = read_config(paths).await?;
             let storage = now.machine.secret_storage;
@@ -3132,7 +3870,11 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             .await;
             Ok(())
         }
-        RelayCmd::Add { name, centers } => {
+        RelayCmd::Add {
+            name,
+            centers,
+            address,
+        } => {
             if !nerve_proto::valid_node_name(&name) {
                 return Err(format!(
                     "{name:?} is not a relay node name: 1 to 32 characters of a-z, 0-9 and -"
@@ -3140,6 +3882,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             }
             let (now, _) = read_config(paths).await?;
             relay_centers(&now, &centers)?;
+            let at = link_address(now.relay.listen.as_deref(), address.as_deref())?;
             let (pin, made) = relay_pin(paths, &now, now.relay.listen.as_deref())?;
             let (token, hash) = crate::relay::new_token();
             let cfg = edit(paths, |c| {
@@ -3168,17 +3911,23 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                     ),
                 );
             }
-            let at = relay_address(cfg.relay.listen.as_deref());
             w(
                 out,
-                format!("relay node {name} added; its token, shown only now:"),
+                format!("relay node {name} added; its link, shown only now:"),
             );
-            w(out, format!("  {token}"));
+            relay_link(out, &name, &token, &at, &pin, address.is_none());
             w(out, format!("it may reach {}", reach_of(&centers)));
-            w(out, format!("on {name}, run:"));
-            w(
-                out,
-                format!("  nerve-node proxy set 'https://{name}:{token}@{at}' --pin {pin}"),
+            json::also(
+                "token",
+                link_json(
+                    &name,
+                    &token,
+                    &at,
+                    &pin,
+                    &centers,
+                    made && now.relay.pin.is_some(),
+                    cfg.relay.listen.is_none(),
+                ),
             );
             if cfg.relay.listen.is_none() {
                 w(
@@ -3232,8 +3981,9 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             relay_in_force(paths, out, None).await;
             Ok(())
         }
-        RelayCmd::Token { name } => {
+        RelayCmd::Token { name, address } => {
             let (now, _) = read_config(paths).await?;
+            let at = link_address(now.relay.listen.as_deref(), address.as_deref())?;
             let (pin, made) = relay_pin(paths, &now, now.relay.listen.as_deref())?;
             let (token, hash) = crate::relay::new_token();
             let cfg = edit(paths, |c| {
@@ -3259,20 +4009,26 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                 );
             }
             let node = cfg.relay.node(&name).expect("set above");
-            let at = relay_address(cfg.relay.listen.as_deref());
             // Whether the old token is dead is the running node's to say
             // (`relay_in_force`): on Windows it takes the change at its next
             // start.
             w(
                 out,
-                format!("relay node {name} has a new token, shown only now:"),
+                format!("relay node {name} has a new token; its link, shown only now:"),
             );
-            w(out, format!("  {token}"));
+            relay_link(out, &name, &token, &at, &pin, address.is_none());
             w(out, format!("it may reach {}", reach_of(&node.centers)));
-            w(out, format!("on {name}, run:"));
-            w(
-                out,
-                format!("  nerve-node proxy set 'https://{name}:{token}@{at}' --pin {pin}"),
+            json::also(
+                "token",
+                link_json(
+                    &name,
+                    &token,
+                    &at,
+                    &pin,
+                    &node.centers,
+                    made && now.relay.pin.is_some(),
+                    cfg.relay.listen.is_none(),
+                ),
             );
             if cfg.relay.listen.is_none() {
                 w(
@@ -3426,6 +4182,7 @@ async fn relay_in_force(paths: &NodePaths, out: &mut dyn Write, now: Option<&str
         }
     } else if cfg!(windows) {
         let _ = writeln!(out, "{RELAY_AT_NEXT_START}");
+        waits_for_next_start();
     }
 }
 
@@ -3503,15 +4260,88 @@ fn relay_pin(
     Ok((id.pin(), true))
 }
 
-/// Where a relayed node finds the relay, for the line `relay add` shows:
-/// the listening address, or a placeholder where it listens on every
-/// address or is not set.
-fn relay_address(listen: Option<&str>) -> String {
-    match listen.and_then(|l| l.parse::<std::net::SocketAddr>().ok()) {
-        Some(a) if !a.ip().is_unspecified() => a.to_string(),
-        Some(a) => format!("<address of this machine>:{}", a.port()),
-        None => "<address of this machine>:<port>".into(),
+/// The port a relay link names when the relay has no address to listen on
+/// yet: the one docs/user/relay.md uses.
+const RELAY_PORT: u16 = 7490;
+
+/// Where a relayed node finds the relay, for its link: `given` (with the
+/// relay's port when it names none), else the address the relay listens on,
+/// else this machine's host name, at the port it listens on.
+pub fn link_address(listen: Option<&str>, given: Option<&str>) -> Result<String, String> {
+    use nerve_proto::link::valid_host_port;
+    let listen = listen.and_then(|l| l.parse::<std::net::SocketAddr>().ok());
+    let port = listen.map_or(RELAY_PORT, |a| a.port());
+    let at = match given.map(str::trim) {
+        Some(g) if valid_host_port(g) => g.to_string(),
+        Some(g) if g.parse::<std::net::Ipv6Addr>().is_ok() => format!("[{g}]:{port}"),
+        Some(g) => format!("{g}:{port}"),
+        None => match listen {
+            Some(a) if !a.ip().is_unspecified() => a.to_string(),
+            _ => format!("{}:{port}", crate::descriptor::host_name()),
+        },
+    };
+    if let Some(g) = given
+        && !valid_host_port(&at)
+    {
+        return Err(format!(
+            "--address {g:?}: a host name or address, with or without :PORT"
+        ));
     }
+    Ok(at)
+}
+
+/// The lines that hand a relayed node its link: the link, and how the other
+/// node takes it. `guessed`: the address is this program's guess, which the
+/// owner may need to give.
+fn relay_link(out: &mut dyn Write, name: &str, token: &str, at: &str, pin: &str, guessed: bool) {
+    let link = nerve_proto::link::RelayLink {
+        address: at.into(),
+        node: name.into(),
+        token: token.into(),
+        pin: pin.into(),
+    }
+    .render();
+    let _ = writeln!(out, "  {link}");
+    let _ = writeln!(
+        out,
+        "on {name}, paste it in the desktop app (Relay, Connect), or run:"
+    );
+    let _ = writeln!(out, "  nerve-node proxy set '{link}'");
+    if guessed {
+        let _ = writeln!(
+            out,
+            "the link reaches this machine as {at}; if {name} knows it by another name or address, make a new link with `relay token {name} --address <it>`"
+        );
+    }
+}
+
+/// What `relay add` and `relay token` give a program besides their lines.
+fn link_json(
+    name: &str,
+    token: &str,
+    at: &str,
+    pin: &str,
+    centers: &[String],
+    new_pin: bool,
+    relay_off: bool,
+) -> Value {
+    let link = nerve_proto::link::RelayLink {
+        address: at.into(),
+        node: name.into(),
+        token: token.into(),
+        pin: pin.into(),
+    };
+    json!({
+        "node": name,
+        "token": token,
+        "address": at,
+        "link": link.render(),
+        "proxy": link.proxy_url(),
+        "pin": pin,
+        "reach": reach_of(centers),
+        "new_pin": new_pin,
+        "relay_off": relay_off,
+    })
 }
 
 const PROXY_AUTHORIZATION: &str = "Proxy-Authorization";
@@ -3527,6 +4357,27 @@ fn keys_place(storage: SecretStorage) -> &'static str {
 /// Splits a user name and password off a proxy URL
 /// (`http://user:pass@host:port`), percent-escapes decoded. Errors never quote
 /// the URL once it holds an `@`.
+/// What `proxy set` reads from stdin: with `password`, the first line is
+/// the password; with `headers`, every other line that is not empty is a
+/// header.
+fn stdin_secrets(text: &str, password: bool, headers: bool) -> (Option<String>, Vec<String>) {
+    let mut lines = text.lines().map(|l| l.trim_end_matches('\r'));
+    let pw = if password {
+        Some(lines.next().unwrap_or_default().to_string())
+    } else {
+        None
+    };
+    let hs = if headers {
+        lines
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (pw, hs)
+}
+
 fn split_credentials(url: &str) -> Result<(String, Option<(String, String)>), String> {
     let Some(at) = url.rfind('@') else {
         return Ok((url.to_string(), None));
@@ -3584,7 +4435,13 @@ async fn accept(paths: &NodePaths) -> Result<u64, String> {
         ));
     }
     #[cfg(unix)]
-    match nerve_transport::ctl::call(&paths.ctl_socket(), "config.accept", json!({})).await {
+    match nerve_transport::ctl::call(
+        &paths.ctl_socket(),
+        "config.accept",
+        json!({"user": changed_by()}),
+    )
+    .await
+    {
         Ok(v) => return Ok(v["version"].as_u64().unwrap_or_default()),
         Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
         Err(_) => {}
@@ -3675,6 +4532,61 @@ fn table_at<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_secrets_come_from_stdin() {
+        let text = "s3cret pass\r\nProxy-Authorization: Bearer x\n\nX-Team: a\n";
+        assert_eq!(
+            stdin_secrets(text, true, true),
+            (
+                Some("s3cret pass".into()),
+                vec!["Proxy-Authorization: Bearer x".into(), "X-Team: a".into()]
+            )
+        );
+        assert_eq!(stdin_secrets("X-A: 1\nX-B: 2", false, true).1.len(), 2);
+        assert_eq!(
+            stdin_secrets("pw\nX-A: 1", true, false),
+            (Some("pw".into()), vec![])
+        );
+        assert_eq!(stdin_secrets("", true, false).0.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_invoker_is_who_ran_sudo_or_pkexec() {
+        let alice = |uid: u32| (uid == 1000).then(|| "alice".to_string());
+        assert_eq!(
+            invoker_of(Some("bob".into()), Some("1000".into()), alice),
+            "bob"
+        );
+        assert_eq!(invoker_of(None, Some("1000".into()), alice), "alice");
+        assert_eq!(
+            invoker_of(Some(String::new()), Some("1000".into()), alice),
+            "alice"
+        );
+        assert_eq!(invoker_of(None, Some("1001".into()), alice), "root");
+        assert_eq!(invoker_of(None, Some("0".into()), alice), "root");
+        assert_eq!(invoker_of(None, None, alice), "root");
+    }
+
+    /// On Windows the desktop app's broker names the app's user by SID, and
+    /// that user is the one who asked, not the account the broker runs as
+    /// (an administrator who answered the UAC prompt).
+    #[cfg(windows)]
+    #[test]
+    fn the_invoker_on_windows_is_the_apps_user_the_broker_names() {
+        // LOCAL SERVICE: an account that never runs this test.
+        let other = "S-1-5-19";
+        let name = crate::win_user::name_of_sid(other).unwrap();
+        let me = crate::win_user::current_user().unwrap();
+        assert_ne!(name, me);
+        assert_eq!(windows_invoker(Some(other.into())), Some(name));
+        assert_eq!(windows_invoker(None), Some(me.clone()));
+        // A SID without an account names nobody: then this command's user.
+        assert_eq!(
+            windows_invoker(Some("S-1-5-21-1-2-3-4242".into())),
+            Some(me)
+        );
+    }
 
     /// A folder in a home the node's user may not look into (the installed
     /// node's CLI runs as `nerve`) is kept as given, in its normal form;
@@ -4604,14 +5516,18 @@ mod tests {
         create_user: Option<&str>,
         answers: &str,
     ) -> (Result<(), String>, String) {
+        let told = Setup {
+            create_user,
+            account_only: false,
+        };
         let keyring = crate::keyring_setup::tests::FakeKeyring::new(true);
-        setup_keyring(paths, machine, create_user, &keyring, answers)
+        setup_keyring(paths, machine, told, &keyring, answers)
     }
 
     fn setup_keyring(
         paths: &NodePaths,
         machine: Option<&dyn crate::service::System>,
-        create_user: Option<&str>,
+        told: Setup<'_>,
         keyring: &dyn crate::keyring_setup::Keyring,
         answers: &str,
     ) -> (Result<(), String>, String) {
@@ -4622,12 +5538,7 @@ mod tests {
         let mut out = Vec::new();
         let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
         let r = rt.block_on(super::setup(
-            paths,
-            machine,
-            create_user,
-            keyring,
-            &mut input,
-            &mut out,
+            paths, machine, told, keyring, &mut input, &mut out,
         ));
         (r, String::from_utf8(out).unwrap())
     }
@@ -4639,8 +5550,9 @@ mod tests {
     fn setup_creates_the_account_of_the_commands_when_asked() {
         use crate::service::System;
         let cli = Cli::try_parse_from(["nerve-node", "setup", "--create-user", "bob"]).unwrap();
-        assert!(matches!(cli.cmd, Cmd::Setup { create_user: Some(ref n) } if n == "bob"));
+        assert!(matches!(cli.cmd, Cmd::Setup { create_user: Some(ref n), .. } if n == "bob"));
         assert!(Cli::try_parse_from(["nerve-node", "setup", "--create-user"]).is_err());
+        assert!(Cli::try_parse_from(["nerve-node", "setup", "--account-only"]).is_err());
         let (_d, paths) = setup(&["home"]);
         let sys = crate::service::tests::Fake::new();
         // Name, the keys stay in files, no link, user mode for the one
@@ -4680,6 +5592,49 @@ mod tests {
                 .as_deref(),
             Some("bob")
         );
+    }
+
+    /// `setup --create-user NAME --account-only`, the desktop app's way to
+    /// the account: the account and nothing else, asking nothing. With the
+    /// keys in a keyring that does not answer it changes nothing, since the
+    /// config cannot be read or signed then, and neither offers a keyring
+    /// nor makes the account.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_chooses_only_the_account_when_told() {
+        let (_d, paths) = setup(&["home"]);
+        let sys = crate::service::tests::Fake::new();
+        let told = Setup {
+            create_user: Some("carol"),
+            account_only: true,
+        };
+        let keyring = crate::keyring_setup::tests::FakeKeyring::new(false);
+        run(
+            &paths,
+            &["config", "set", "machine.secret_storage", "keyring"],
+        )
+        .unwrap();
+        crate::secrets::store::set_unreachable(true);
+        let (r, out) = setup_keyring(&paths, Some(&sys), told, &keyring, "");
+        crate::secrets::store::set_unreachable(false);
+        let e = r.unwrap_err();
+        assert!(e.contains("cannot be reached"), "{e}");
+        assert!(!out.contains("Install it now"), "{out}");
+        assert!(keyring.installed.borrow().is_empty());
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        run(&paths, &["config", "set", "machine.secret_storage", "file"]).unwrap();
+
+        let (r, out) = setup_keyring(&paths, Some(&sys), told, &keyring, "");
+        r.unwrap();
+        assert!(out.contains("commands run as carol"), "{out}");
+        assert!(!out.contains("Name of this node"), "{out}");
+        assert!(
+            sys.calls()
+                .contains(&"useradd carol /home/carol".to_string())
+        );
+        let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key()).unwrap();
+        assert_eq!(cfg.machine.user.as_deref(), Some("carol"));
+        assert!(cfg.node.name.is_none());
     }
 
     fn node_audit(paths: &NodePaths) -> Vec<Value> {
@@ -4846,6 +5801,31 @@ mod tests {
     /// refuses the keyring and changes nothing, and setup does not ask
     /// where the keys go but takes keys left in the keyring into files.
     #[test]
+    fn config_get_says_whether_the_keyring_can_hold_the_keys() {
+        let (_d, paths) = setup(&["home"]);
+        crate::secrets::for_tests::pretend_windows_service(&paths);
+        let said = run(
+            &paths,
+            &["--json", "config", "get", "machine.secret_storage"],
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(said.trim()).unwrap();
+        assert_eq!(v["value"], "file");
+        assert_eq!(v["keyring"]["usable"], false, "{v}");
+        assert_eq!(v["keyring"]["reason"], "windows-service");
+        assert!(
+            v["keyring"]["why"]
+                .as_str()
+                .unwrap()
+                .contains("Credential Manager")
+        );
+        // Another key says nothing of it.
+        let said = run(&paths, &["--json", "config", "get", "log.level"]).unwrap();
+        let v: Value = serde_json::from_str(said.trim()).unwrap();
+        assert!(v.get("keyring").is_none(), "{v}");
+    }
+
+    #[test]
     fn the_installed_node_on_windows_keeps_its_keys_in_files() {
         let (_d, paths) = setup(&["home"]);
         let key = nerve_transport::keys::NodeKey::generate().unwrap();
@@ -4948,7 +5928,7 @@ mod tests {
         pretend_landlock(&paths, Landlock::Abi(5));
         crate::secrets::store::set_unreachable(true);
         let k = crate::keyring_setup::tests::FakeKeyring::new(false);
-        let (r, out) = setup_keyring(&paths, None, None, &k, "y\n\n\n");
+        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "y\n\n\n");
         crate::secrets::store::set_unreachable(false);
         r.unwrap();
         assert!(out.contains("Install it now? [y/N]"), "{out}");
@@ -4964,13 +5944,13 @@ mod tests {
         let (_d, paths) = setup(&[]);
         crate::secrets::store::set_unreachable(true);
         let k = crate::keyring_setup::tests::FakeKeyring::new(false);
-        let (r, out) = setup_keyring(&paths, None, None, &k, "\nkeyring\nn\n");
+        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "\nkeyring\nn\n");
         let e = r.unwrap_err();
         assert!(e.contains("no system keyring answers"), "{e}");
         assert!(out.contains("Install it now? [y/N]"), "{out}");
         assert!(k.installed.borrow().is_empty());
         assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
-        let (r, out) = setup_keyring(&paths, None, None, &k, "\nkeyring\ny\n\n");
+        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "\nkeyring\ny\n\n");
         r.unwrap();
         assert_eq!(k.installed.borrow().len(), 1);
         assert!(out.contains("the system keyring answers"), "{out}");
@@ -5123,7 +6103,7 @@ mod tests {
         ready.recv().unwrap();
         // The keyring answers setup: nothing to install.
         let k = crate::keyring_setup::tests::FakeKeyring::new(true);
-        let (r, _) = setup_keyring(&paths, None, None, &k, "\nkeyring\n");
+        let (r, _) = setup_keyring(&paths, None, Setup::default(), &k, "\nkeyring\n");
         let e = r.unwrap_err();
         assert!(
             e.contains("restart it, then run `nerve-node setup` again"),
@@ -5132,7 +6112,7 @@ mod tests {
         assert!(k.installed.borrow().is_empty());
         let sys = crate::service::tests::Fake::new();
         // Name, the account question of the installed node, the keys.
-        let (r, out) = setup_keyring(&paths, Some(&sys), None, &k, "\n\nkeyring\n");
+        let (r, out) = setup_keyring(&paths, Some(&sys), Setup::default(), &k, "\n\nkeyring\n");
         assert!(
             sys.calls()
                 .contains(&format!("systemctl restart {}", crate::service::UNIT_NAME)),
@@ -5176,11 +6156,11 @@ mod tests {
         .unwrap();
         crate::secrets::store::set_unreachable(true);
         let k = crate::keyring_setup::tests::FakeKeyring::new(false);
-        let (r, out) = setup_keyring(&paths, None, None, &k, "\n");
+        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "\n");
         assert!(r.unwrap_err().contains("no system keyring answers"));
         assert!(!out.contains("Name of this node"), "{out}");
         assert!(run(&paths, &["status"]).is_err());
-        let (r, out) = setup_keyring(&paths, None, None, &k, "y\n\n\n\n");
+        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "y\n\n\n\n");
         r.unwrap();
         assert!(out.contains("Name of this node"), "{out}");
         assert!(run(&paths, &["status"]).is_ok());
@@ -5749,12 +6729,25 @@ mod tests {
         assert_eq!(load(&paths).relay.listen.as_deref(), Some("0.0.0.0:7491"));
 
         let out = run(&paths, &["relay", "add", "lab-pc"]).unwrap();
-        let token = out.lines().nth(1).unwrap().trim().to_string();
+        // One link holds all the other node needs: the relay's address (the
+        // host name here, as the relay listens on every address), the
+        // node's name and token, and the pin.
+        let link = out.lines().nth(1).unwrap().trim().to_string();
+        let parsed = nerve_proto::link::RelayLink::parse(&link).unwrap();
+        let token = parsed.token.clone();
         assert_eq!(token.len(), 43, "{out}");
+        assert_eq!(parsed.node, "lab-pc");
+        assert_eq!(parsed.pin, pin);
+        let host = crate::descriptor::host_name();
+        assert_eq!(parsed.address, format!("{host}:7491"));
         assert!(
             out.contains(&format!(
-                "it may reach every https center of this node\non lab-pc, run:\n  nerve-node proxy set 'https://lab-pc:{token}@<address of this machine>:7491' --pin {pin}\n"
+                "on lab-pc, paste it in the desktop app (Relay, Connect), or run:\n  nerve-node proxy set '{link}'\nthe link reaches this machine as {host}:7491;"
             )),
+            "{out}"
+        );
+        assert!(
+            out.contains("it may reach every https center of this node\n"),
             "{out}"
         );
         let file = std::fs::read_to_string(paths.config_file()).unwrap();
@@ -5849,9 +6842,17 @@ mod tests {
         // A new token keeps the node's centers and limits; the old one
         // stops working.
         let before = load(&paths).relay.node("lab-2").unwrap().clone();
-        let out = run(&paths, &["relay", "token", "lab-2"]).unwrap();
-        let token2 = out.lines().nth(1).unwrap().trim().to_string();
+        let out = run(
+            &paths,
+            &["relay", "token", "lab-2", "--address", "relay.example"],
+        )
+        .unwrap();
+        let link = nerve_proto::link::RelayLink::parse(out.lines().nth(1).unwrap()).unwrap();
+        let token2 = link.token.clone();
         assert_eq!(token2.len(), 43, "{out}");
+        // The address given, at the relay's port; no guess to warn about.
+        assert_eq!(link.address, "relay.example:7491");
+        assert!(!out.contains("make a new link"), "{out}");
         assert!(
             out.contains("it may reach the centers work, home, home-b\n"),
             "{out}"
@@ -6433,7 +7434,10 @@ mod tests {
         };
         let rule = card("rule");
         let rule_verbs: Vec<&str> = rule.verbs.iter().map(|v| v.name.as_str()).collect();
-        assert_eq!(rule_verbs, ["rule add", "rule rm", "rule ls"]);
+        assert_eq!(
+            rule_verbs,
+            ["rule add", "rule rm", "rule ls", "rule edit", "rule guard"]
+        );
         assert_eq!(rule.holds, ["rule"]);
         assert!(
             rule.verbs[0].usage.contains("<LIST>"),
@@ -6671,7 +7675,7 @@ mod tests {
         append(decided(1, "fs", "read", "first", "allowed"));
         let seen = Seen::default();
         let mut out = seen.clone();
-        let follow = audit(&paths, true, false, &mut out);
+        let follow = audit(&paths, true, false, None, false, &mut out);
         let writer = async {
             seen.until("first").await;
             append(decided(2, "fs", "read", "before-the-rotation", "allowed"));
@@ -6699,5 +7703,757 @@ mod tests {
             ],
             "{text}"
         );
+    }
+
+    fn json_of(paths: &NodePaths, args: &[&str]) -> Value {
+        let mut a = vec!["--json"];
+        a.extend_from_slice(args);
+        let out = run(paths, &a).unwrap();
+        assert_eq!(out.lines().count(), 1, "one JSON line: {out}");
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"))
+    }
+
+    /// The read commands print their data as JSON for the desktop app,
+    /// which never reads the text meant for people.
+    #[test]
+    fn the_read_commands_print_json() {
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        run(
+            &paths,
+            &["folder", "add", &work.display().to_string(), "+r", "+x"],
+        )
+        .unwrap();
+        run(&paths, &["rule", "add", "allow", "git status"]).unwrap();
+        run(&paths, &["rule", "add", "deny", "rm", "--wildcard"]).unwrap();
+        run(&paths, &["cap", "set", "fs.write", "off"]).unwrap();
+        run(&paths, &["mode", "set", "folder"]).unwrap();
+
+        let v = json_of(&paths, &["status"]);
+        assert_eq!(v["daemon"], "not running", "{v}");
+        assert_eq!(v["locked"], false, "{v}");
+        assert_eq!(v["sudo"], "off", "{v}");
+        assert_eq!(v["centers"][0]["name"], "home", "{v}");
+        assert_eq!(v["centers"][0]["mode"], "folder", "{v}");
+        assert!(v["centers"][0]["status"].is_null(), "{v}");
+        assert!(v["command_limits"]["memory_mb"].is_u64(), "{v}");
+
+        let v = json_of(&paths, &["center", "ls"]);
+        let c = &v["centers"][0];
+        assert_eq!(
+            (
+                &c["name"],
+                &c["url"],
+                &c["mode"],
+                &c["settings"],
+                &c["paused"]
+            ),
+            (
+                &json!("home"),
+                &json!("http://127.0.0.1:1"),
+                &json!("folder"),
+                &json!("off"),
+                &json!(false)
+            ),
+            "{v}"
+        );
+
+        let v = json_of(&paths, &["folder", "ls"]);
+        assert_eq!(v["center"], "home");
+        let f = &v["folders"][0];
+        assert_eq!(
+            (&f["rights"], &f["read"], &f["write"], &f["execute"]),
+            (&json!("r-x"), &json!(true), &json!(false), &json!(true)),
+            "{v}"
+        );
+
+        let v = json_of(&paths, &["rule", "ls"]);
+        assert_eq!(v["allow"], json!(["exec.run:git status"]), "{v}");
+        assert_eq!(v["deny"], json!(["exec.run:rm *"]), "{v}");
+        assert_eq!(v["sudo"], json!([]), "{v}");
+        let v = json_of(&paths, &["rule", "ls", "deny"]);
+        assert!(v.get("allow").is_none() && v["deny"].is_array(), "{v}");
+
+        let v = json_of(&paths, &["cap", "ls"]);
+        assert_eq!(v["caps"], json!({"fs.write": "off"}), "{v}");
+
+        let v = json_of(&paths, &["config", "get", "center.home.policy.mode"]);
+        assert_eq!(
+            v,
+            json!({"key": "center.home.policy.mode", "value": "folder"})
+        );
+        let v = json_of(&paths, &["config", "get", "center.home.policy.allow"]);
+        assert_eq!(v["value"], json!(["exec.run:git status"]), "{v}");
+
+        assert_eq!(json_of(&paths, &["proxy", "ls"]), json!({"proxy": null}));
+        let v = json_of(&paths, &["relay", "ls"]);
+        assert!(v["listen"].is_null() && v["tunnels"].is_null(), "{v}");
+        assert_eq!(v["nodes"], json!([]), "{v}");
+        assert_eq!(json_of(&paths, &["sudo", "status"]), json!({"sudo": "off"}));
+    }
+
+    /// The other commands give the lines they print, so a program can show
+    /// them, and say nothing else on stdout.
+    #[test]
+    fn a_change_with_json_gives_its_lines() {
+        let (_d, paths) = setup(&["home"]);
+        let v = json_of(&paths, &["mode", "set", "user"]);
+        let m = v["messages"].as_array().unwrap();
+        assert_eq!(m[0], "home: mode user", "{v}");
+        assert!(m[1].as_str().unwrap().contains(NEXT_START), "{v}");
+        // As data too, for a program that offers the restart.
+        assert_eq!(v["next_start"], true, "{v}");
+        assert_eq!(load(&paths).center("home").unwrap().policy.mode, Mode::User);
+        // The same again changes nothing, and says no such thing.
+        let v = json_of(&paths, &["mode", "set", "user"]);
+        assert!(v.get("next_start").is_none(), "{v}");
+        // A change prints what others chose, such as a command a center
+        // sent: the same words in it are no such thing either.
+        let odd = format!("echo {NEXT_START}");
+        run(&paths, &["rule", "add", "deny", &odd]).unwrap();
+        let v = json_of(&paths, &["rule", "add", "deny", &odd]);
+        assert!(
+            v["messages"][0].as_str().unwrap().contains(NEXT_START),
+            "{v}"
+        );
+        assert!(v.get("next_start").is_none(), "{v}");
+        assert!(!takes_at_next_start(v["messages"][0].as_str().unwrap()));
+
+        // A relay token: the lines, and what the other node needs as data.
+        run(&paths, &["relay", "set", "0.0.0.0:7491"]).unwrap();
+        let v = json_of(&paths, &["relay", "add", "lab-pc"]);
+        let t = &v["token"];
+        let token = t["token"].as_str().unwrap();
+        assert_eq!(t["node"], "lab-pc", "{v}");
+        assert_eq!(t["pin"], json!(load(&paths).relay.pin), "{v}");
+        assert!(
+            t["proxy"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("https://lab-pc:{token}@")),
+            "{v}"
+        );
+        let link = nerve_proto::link::RelayLink::parse(t["link"].as_str().unwrap()).unwrap();
+        assert_eq!(link.token, token, "{v}");
+        assert_eq!(t["address"], link.address.as_str(), "{v}");
+        let v = json_of(
+            &paths,
+            &["relay", "token", "lab-pc", "--address", "10.0.0.2:9000"],
+        );
+        assert_ne!(v["token"]["token"].as_str().unwrap(), token, "{v}");
+        assert_eq!(v["token"]["address"], "10.0.0.2:9000", "{v}");
+        assert!(run(&paths, &["relay", "token", "lab-pc", "--address", "a b"]).is_err());
+        // The relayed node takes the link whole: the relay as its proxy,
+        // its login, and the pin.
+        let (_d2, other) = setup(&[]);
+        let out = run(
+            &other,
+            &["proxy", "set", v["token"]["link"].as_str().unwrap()],
+        )
+        .unwrap();
+        assert!(out.starts_with("proxy https://10.0.0.2:9000\n"), "{out}");
+        let c = load(&other).connection;
+        assert_eq!(c.proxy.as_deref(), Some("https://10.0.0.2:9000"));
+        assert_eq!(c.login.as_deref(), Some("lab-pc"));
+        assert_eq!(c.pin, load(&paths).relay.pin);
+        let e = run(
+            &other,
+            &[
+                "proxy",
+                "set",
+                v["token"]["link"].as_str().unwrap(),
+                "--pin",
+                &"B".repeat(43),
+            ],
+        )
+        .unwrap_err();
+        assert!(e.contains("carries the pin"), "{e}");
+    }
+
+    /// Without --yes, `center add --json` shows what the owner confirms and
+    /// pairs nothing: the desktop app asks, then runs it with --yes.
+    #[test]
+    fn center_add_json_without_yes_only_shows_the_link() {
+        let (_d, paths) = setup(&[]);
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let v = json_of(
+            &paths,
+            &[
+                "center",
+                "add",
+                "nerve://pair?center=https%3A%2F%2Fc.example%3A8443&code=abc&pin=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "--name",
+                "lab",
+            ],
+        );
+        assert_eq!(v["paired"], false, "{v}");
+        assert_eq!(v["preview"]["center"], "https://c.example:8443", "{v}");
+        assert_eq!(v["preview"]["tls"], true, "{v}");
+        assert_eq!(v["preview"]["pin"], "A".repeat(43), "{v}");
+        assert_eq!(v["preview"]["name"], "lab", "{v}");
+        // The check found no center there: the app offers no Pair.
+        assert_eq!(v["check"]["ready"], false, "{v}");
+        assert!(v["check"]["problem"].is_string(), "{v}");
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        let e = run(&paths, &["--json", "center", "add", "nerve://x"]).unwrap_err();
+        assert!(e.contains("nerve://pair?"), "{e}");
+    }
+
+    #[test]
+    fn audit_json_gives_the_entries_as_the_log_holds_them() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(
+            paths.audit_log(),
+            decided(1, "fs", "read", "/srv/a", "allowed")
+                + &decided(2, "exec", "run", "ls", "forbidden"),
+        )
+        .unwrap();
+        let v = json_of(&paths, &["audit"]);
+        let e = v["entries"].as_array().unwrap();
+        assert_eq!(e.len(), 2, "{v}");
+        assert_eq!(
+            (&e[0]["target"], &e[1]["decision"]),
+            (&json!("/srv/a"), &json!("forbidden"))
+        );
+        let v = json_of(&paths, &["audit", "--denied"]);
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1, "{v}");
+        // The newest only, after --denied picked.
+        let v = json_of(&paths, &["audit", "--last", "1"]);
+        assert_eq!(v["entries"][0]["target"], "ls", "{v}");
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1, "{v}");
+        std::fs::write(
+            paths.audit_log(),
+            decided(1, "exec", "run", "a", "forbidden")
+                + &decided(2, "exec", "run", "b", "forbidden")
+                + &decided(3, "fs", "read", "/c", "allowed"),
+        )
+        .unwrap();
+        let v = json_of(&paths, &["audit", "--denied", "--last", "1"]);
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["entries"][0]["target"], "b", "{v}");
+        let out = run(&paths, &["audit", "--last", "2"]).unwrap();
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(out.contains("fs.read  /c"), "{out}");
+    }
+
+    /// `rule guard` puts the guard's deny rules that a pairing lacks on its
+    /// deny list, keeps what is there, and says so when nothing is missing.
+    #[test]
+    fn rule_guard_adds_the_missing_deny_rules_of_the_guard() {
+        let (_d, paths) = setup(&["home"]);
+        let deny = || load(&paths).centers[0].policy.deny.clone();
+        run(&paths, &["rule", "add", "deny", "rm", "--wildcard"]).unwrap();
+        run(
+            &paths,
+            &[
+                "config",
+                "add",
+                "center.home.policy.deny",
+                nerve_policy::rules::GUARD[2],
+            ],
+        )
+        .unwrap();
+        let out = run(&paths, &["rule", "guard"]).unwrap();
+        let n = nerve_policy::rules::GUARD.len() - 1;
+        assert!(out.contains(&format!("added {n} deny rules")), "{out}");
+        let d = deny();
+        assert_eq!(d.len(), n + 2, "{d:?}");
+        assert_eq!(d[0], "exec.run:rm *");
+        for g in nerve_policy::rules::GUARD {
+            assert_eq!(d.iter().filter(|r| r == g).count(), 1, "{g}: {d:?}");
+        }
+        let e = run(&paths, &["rule", "guard", "--center", "home"]).unwrap_err();
+        assert!(
+            e.contains("has every deny rule of the guard already"),
+            "{e}"
+        );
+        assert_eq!(deny(), d);
+    }
+
+    /// `rule edit` changes one entry in its place, on any list and a rule of
+    /// the guard too, as one change in the audit.
+    #[test]
+    fn rule_edit_changes_an_entry_in_place_as_one_change() {
+        let (_d, paths) = setup(&["home"]);
+        let policy = || load(&paths).centers[0].policy.clone();
+        let changes = || {
+            nerve_policy::audit::AuditLog::new(paths.audit_log())
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "settings")
+                .count()
+        };
+        for (list, rule) in [
+            ("allow", "git status"),
+            ("allow", "cargo test"),
+            ("allow", "ls"),
+            ("sudo", "sudo apt update"),
+        ] {
+            run(&paths, &["rule", "add", list, rule]).unwrap();
+        }
+        let before = changes();
+        // A plain command line becomes the rule `add` makes of it.
+        let out = run(
+            &paths,
+            &[
+                "rule",
+                "edit",
+                "allow",
+                "exec.run:cargo test",
+                "cargo test --workspace",
+            ],
+        )
+        .unwrap();
+        assert!(
+            out.contains("\"exec.run:cargo test\" is \"exec.run:cargo test --workspace\" now"),
+            "{out}"
+        );
+        assert_eq!(
+            policy().allow,
+            [
+                "exec.run:git status",
+                "exec.run:cargo test --workspace",
+                "exec.run:ls"
+            ]
+        );
+        assert_eq!(changes(), before + 1);
+        // An entry in the form `ls` shows goes as it is; one that is on the
+        // list already is not there twice.
+        run(
+            &paths,
+            &["rule", "edit", "allow", "exec.run:ls", "fs.read:/srv/*"],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &[
+                "rule",
+                "edit",
+                "allow",
+                "fs.read:/srv/*",
+                "exec.run:git status",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            policy().allow,
+            ["exec.run:cargo test --workspace", "exec.run:git status"]
+        );
+        // The sudo list takes the command with or without its sudo.
+        run(
+            &paths,
+            &["rule", "edit", "sudo", "sudo apt update", "apt upgrade"],
+        )
+        .unwrap();
+        assert_eq!(policy().sudo_allow, ["sudo apt upgrade"]);
+        // A rule of the guard is edited like any other.
+        let guard = nerve_policy::rules::GUARD[0];
+        run(&paths, &["config", "add", "center.home.policy.deny", guard]).unwrap();
+        run(
+            &paths,
+            &["rule", "edit", "deny", guard, "exec.run:nerve-node *"],
+        )
+        .unwrap();
+        assert_eq!(policy().deny, ["exec.run:nerve-node *"]);
+        // What is not there, the same again, a bad pattern: refused, and
+        // nothing changes.
+        let now = policy();
+        let n = changes();
+        for (args, says) in [
+            (
+                &["rule", "edit", "allow", "exec.run:nope", "x"][..],
+                "is not on",
+            ),
+            (
+                &[
+                    "rule",
+                    "edit",
+                    "deny",
+                    "exec.run:nerve-node *",
+                    "exec.run:nerve-node *",
+                ],
+                "that already",
+            ),
+            (
+                &[
+                    "rule",
+                    "edit",
+                    "deny",
+                    "exec.run:nerve-node *",
+                    "fs.read:[z-a]",
+                ],
+                "fs.read:[z-a]",
+            ),
+            (
+                &["rule", "edit", "deny", "exec.run:nerve-node *", " "],
+                "empty",
+            ),
+        ] {
+            let e = run(&paths, args).unwrap_err();
+            assert!(e.contains(says), "{args:?}: {e}");
+        }
+        assert_eq!(policy(), now);
+        assert_eq!(changes(), n);
+    }
+
+    /// `rule add --action` makes the rule an audit button makes for an entry
+    /// of that action, and `rule rm` takes the same arguments.
+    #[test]
+    fn rule_add_with_an_action_makes_the_audit_buttons_rule() {
+        let (_d, paths) = setup(&["home"]);
+        let policy = || load(&paths).centers[0].policy.clone();
+        run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "allow",
+                "/srv/data/a.txt",
+                "--action",
+                "fs.read",
+            ],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "deny",
+                "/srv/data/a.txt",
+                "--action",
+                "fs.write",
+                "--wildcard",
+            ],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "allow",
+                "",
+                "--action",
+                "settings.read",
+                "--wildcard",
+            ],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "deny",
+                "make all",
+                "--action",
+                "exec.run",
+                "--wildcard",
+            ],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "sudo",
+                "sudo apt update",
+                "--action",
+                "exec.run",
+                "--wildcard",
+            ],
+        )
+        .unwrap();
+        assert_eq!(policy().allow, ["fs.read:/srv/data/a.txt", "settings"]);
+        assert_eq!(policy().deny, ["fs.write:/srv/data/*", "exec.run:make *"]);
+        assert_eq!(policy().sudo_allow, ["sudo apt *"]);
+        // The same as the center's buttons for the same entries.
+        for (list, cap, action, target, wildcard) in [
+            ("allow", "fs", "read", "/srv/data/a.txt", false),
+            ("deny", "fs", "write", "/srv/data/a.txt", true),
+            ("deny", "exec", "run", "make all", true),
+        ] {
+            let rule = rules::rule_for(cap, action, target, wildcard).unwrap();
+            let l = if list == "allow" {
+                policy().allow
+            } else {
+                policy().deny
+            };
+            assert!(l.contains(&rule), "{rule}");
+        }
+        run(
+            &paths,
+            &[
+                "rule",
+                "rm",
+                "deny",
+                "/srv/data/a.txt",
+                "--action",
+                "fs.write",
+                "--wildcard",
+            ],
+        )
+        .unwrap();
+        assert_eq!(policy().deny, ["exec.run:make *"]);
+
+        let e = run(
+            &paths,
+            &["rule", "add", "sudo", "/etc/x", "--action", "fs.read"],
+        )
+        .unwrap_err();
+        assert!(e.contains("sudo commands"), "{e}");
+        let e = run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "allow",
+                "sudo apt update",
+                "--action",
+                "exec.run",
+            ],
+        )
+        .unwrap_err();
+        assert!(e.contains("sudo list"), "{e}");
+        let e = run(&paths, &["rule", "add", "allow", "x", "--action", "read"]).unwrap_err();
+        assert!(e.contains("capability and action"), "{e}");
+        let cut = format!(
+            "{}… [cut at {n} of {} characters]",
+            "a".repeat(nerve_policy::audit::TARGET_MAX_CHARS),
+            nerve_policy::audit::TARGET_MAX_CHARS + 5,
+            n = nerve_policy::audit::TARGET_MAX_CHARS
+        );
+        let e = run(
+            &paths,
+            &["rule", "add", "deny", &cut, "--action", "exec.run"],
+        )
+        .unwrap_err();
+        assert!(e.contains("cut"), "{e}");
+    }
+
+    fn logged(ts: u64, level: &str, msg: &str) -> String {
+        format!("{}\n", json!({"ts": ts, "level": level, "msg": msg}))
+    }
+
+    #[test]
+    fn log_shows_the_moved_file_first_and_the_newest_with_last() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(
+            paths.state_dir.join("log.jsonl.1"),
+            logged(1, "info", "node started"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.log_file(),
+            logged(2, "warn", "link dropped") + &logged(3, "error", "cannot connect"),
+        )
+        .unwrap();
+        let out = run(&paths, &["log"]).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "1  info  node started",
+                "2  warn  link dropped",
+                "3  error  cannot connect"
+            ]
+        );
+        let v = json_of(&paths, &["log", "--last", "2"]);
+        assert_eq!(v["entries"][0]["msg"], "link dropped", "{v}");
+        assert_eq!(v["entries"].as_array().unwrap().len(), 2, "{v}");
+        // The problems only, the newest first counted: the warning that
+        // came before more lines than --last is still found.
+        std::fs::write(
+            paths.log_file(),
+            logged(2, "warn", "link dropped")
+                + &logged(3, "info", "linked")
+                + &logged(4, "info", "linked again"),
+        )
+        .unwrap();
+        let v = json_of(&paths, &["log", "--problems", "--last", "1"]);
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["entries"][0]["msg"], "link dropped", "{v}");
+        let out = run(&paths, &["log", "--problems"]).unwrap();
+        assert_eq!(out, "2  warn  link dropped\n");
+        // No log yet is no error.
+        let empty = NodePaths::new(d.path().join("c2"), d.path().join("s2"));
+        assert_eq!(json_of(&empty, &["log"]), json!({"entries": []}));
+    }
+
+    /// `log clear` empties the log and its older file and says who did it;
+    /// `audit clear` keeps the entries so far as the older file, and the
+    /// audit shows only the entry of the clearing then. Neither takes
+    /// arguments of the reading form.
+    #[test]
+    fn log_and_audit_clear_start_afresh_and_say_who() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        // No log yet: nothing to clear, and no error.
+        run(&paths, &["log", "clear"]).unwrap();
+        assert!(!paths.log_file().exists());
+        std::fs::write(
+            paths.state_dir.join("log.jsonl.1"),
+            logged(1, "info", "node started"),
+        )
+        .unwrap();
+        std::fs::write(paths.log_file(), logged(2, "warn", "link dropped")).unwrap();
+        let out = run(&paths, &["log", "clear"]).unwrap();
+        assert_eq!(out, "log cleared\n");
+        assert!(!paths.state_dir.join("log.jsonl.1").exists());
+        let v = json_of(&paths, &["log"]);
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{v}");
+        let who = changed_by();
+        assert_eq!(
+            entries[0]["msg"],
+            format!("the log was cleared by {who}"),
+            "{v}"
+        );
+
+        let log = AuditLog::new(paths.audit_log());
+        log.settings("local", 1, &[]).unwrap();
+        log.settings("local", 2, &[]).unwrap();
+        let before = std::fs::read(paths.audit_log()).unwrap();
+        let v = json_of(&paths, &["audit", "clear"]);
+        assert!(
+            v["messages"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("audit cleared; the entries so far are kept in "),
+            "{v}"
+        );
+        assert_eq!(std::fs::read(log.old_path()).unwrap(), before);
+        let v = json_of(&paths, &["audit"]);
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{v}");
+        assert_eq!(entries[0]["event"], "cleared");
+        assert_eq!(entries[0]["user"], who.as_str());
+        let out = run(&paths, &["audit"]).unwrap();
+        assert!(out.ends_with(&format!("audit cleared by {who}\n")), "{out}");
+        for args in [
+            &["audit", "clear", "--last", "2"][..],
+            &["log", "--follow", "clear"],
+        ] {
+            assert!(run(&paths, args).is_err(), "{args:?}");
+        }
+    }
+
+    /// `log --follow` goes on with the new file once the old one is moved
+    /// aside, the lines written to the old one before that included.
+    #[tokio::test]
+    async fn log_follow_goes_on_after_the_file_is_moved_aside() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let file = paths.log_file();
+        let append = |line: String| {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file)
+                .unwrap();
+            f.write_all(line.as_bytes()).unwrap();
+        };
+        append(logged(1, "info", "first"));
+        let seen = Seen::default();
+        let mut out = seen.clone();
+        let follow = log_cmd(&paths, true, Some(5), false, true, &mut out);
+        let writer = async {
+            seen.until("first").await;
+            append(logged(2, "info", "before-the-move"));
+            std::fs::rename(&file, paths.state_dir.join("log.jsonl.1")).unwrap();
+            append(logged(3, "info", "after-the-move"));
+            seen.until("after-the-move").await;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        };
+        tokio::select! {
+            r = follow => panic!("follow ended: {r:?}"),
+            () = writer => {}
+        }
+        let text = seen.text();
+        let msgs: Vec<String> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["msg"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            msgs,
+            ["first", "before-the-move", "after-the-move"],
+            "{text}"
+        );
+    }
+
+    /// A line half written when `log --follow` starts is shown once it is
+    /// whole, not lost.
+    #[tokio::test]
+    async fn log_follow_waits_for_a_line_half_written_at_its_start() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let file = paths.log_file();
+        let append = |text: &str| {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file)
+                .unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+        };
+        let half = logged(2, "info", "half-written");
+        let (start, end) = half.split_at(half.len() / 2);
+        append(&logged(1, "info", "first"));
+        append(start);
+        let seen = Seen::default();
+        let mut out = seen.clone();
+        let follow = log_cmd(&paths, true, None, false, true, &mut out);
+        let writer = async {
+            seen.until("first").await;
+            append(end);
+            seen.until("half-written").await;
+        };
+        tokio::select! {
+            r = follow => panic!("follow ended: {r:?}"),
+            () = writer => {}
+            () = tokio::time::sleep(Duration::from_secs(5)) => {
+                panic!("the line written in two halves never came: {}", seen.text())
+            }
+        }
+    }
+
+    /// `cap ls --json` names what `cap set` switches, so the app need not.
+    #[test]
+    fn cap_ls_json_names_the_switchable_capabilities() {
+        let (_d, paths) = setup(&["home"]);
+        run(&paths, &["cap", "set", "exec", "off"]).unwrap();
+        let v = json_of(&paths, &["cap", "ls"]);
+        let known = &v["known"];
+        assert!(
+            known["fs"].as_array().unwrap().contains(&json!("read")),
+            "{v}"
+        );
+        assert!(
+            known["exec"].as_array().unwrap().contains(&json!("run")),
+            "{v}"
+        );
+        assert!(
+            known.get("settings").is_none() && known.get("node").is_none(),
+            "{v}"
+        );
+        assert_eq!(v["caps"], json!({"exec": "off"}));
     }
 }

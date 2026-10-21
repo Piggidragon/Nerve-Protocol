@@ -28,6 +28,9 @@ pub const PROTOCOL_VERSION: &str = "0";
 
 /// The HTTP path a node pairs on.
 pub const PAIR_PATH: &str = "/nerve/v0/pair";
+/// The HTTP path a node asks on whether a pairing code is still open,
+/// without using it (docs/dev/spec/protocol.md §3.2).
+pub const PAIR_CHECK_PATH: &str = "/nerve/v0/pair/check";
 /// The HTTP path a node opens its WebSocket link on.
 pub const CONNECT_PATH: &str = "/nerve/v0/connect";
 /// The upgrade header that names the node on `CONNECT_PATH`.

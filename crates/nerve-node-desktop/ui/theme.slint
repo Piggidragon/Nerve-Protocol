@@ -1,0 +1,127 @@
+// The design tokens of the node's desktop app: every colour, size, space and
+// radius the pages use comes from here, so a page never picks its own and
+// the app keeps one look. Light and dark follow the system's colour scheme
+// (Palette.color-scheme), which the app can also set.
+
+import { Palette } from "std-widgets.slint";
+
+// What a colour means where it is used: a state, a decision, a button.
+export enum Tone { neutral, accent, ok, warn, danger }
+
+export global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+
+    // Surfaces, from the window down to what sits on a card.
+    out property <color> window: dark ? #0f1116 : #f4f5f9;
+    // The sidebar carries a hint of the accent, so the app is not grey on
+    // grey.
+    out property <color> sidebar: dark ? #0d0f18 : #eceef8;
+    out property <color> surface: dark ? #171a21 : #ffffff;
+    out property <color> surface-alt: dark ? #1c2029 : #f6f7fb;
+    out property <color> inset: dark ? #0f1116 : #f1f3f8;
+    out property <color> hover: dark ? #ffffff0d : #0f172a0a;
+    out property <color> pressed: dark ? #ffffff17 : #0f172a14;
+    out property <color> selected: dark ? #ffffff12 : #ffffff;
+    out property <color> scrim: dark ? #000000a6 : #0b0d1266;
+
+    // Lines.
+    out property <color> border: dark ? #262a32 : #e1e4ea;
+    out property <color> border-strong: dark ? #363b46 : #c9ced7;
+
+    // Text. Each meets WCAG AA (4.5:1) on every surface above, the faint
+    // one too: no text of the app is too pale to read.
+    out property <color> text: dark ? #eceef2 : #12151c;
+    out property <color> text-muted: dark ? #b4bbc7 : #4a5262;
+    out property <color> text-faint: dark ? #8a93a2 : #5f6776;
+
+    // The app's own colour.
+    out property <color> accent: dark ? #8b96ff : #4655d4;
+    out property <color> accent-hover: dark ? #9ea8ff : #3b49c2;
+    out property <color> accent-pressed: dark ? #7884f2 : #323fae;
+    out property <color> accent-soft: dark ? #232849 : #eceefc;
+    out property <color> accent-text: dark ? #b0b8ff : #3542b8;
+    out property <color> on-accent: dark ? #0d1022 : #ffffff;
+
+    // States.
+    out property <color> ok: dark ? #4cd294 : #17784d;
+    out property <color> ok-soft: dark ? #13301f : #e4f4eb;
+    out property <color> warn: dark ? #eab554 : #93590a;
+    out property <color> warn-soft: dark ? #33280f : #fcf1dd;
+    out property <color> danger: dark ? #ff7a81 : #c0353d;
+    out property <color> danger-hover: dark ? #ff888e : #b3323a;
+    out property <color> danger-pressed: dark ? #f0646b : #9c2b32;
+    out property <color> danger-soft: dark ? #3a1b1e : #fbeaeb;
+    out property <color> on-danger: dark ? #1f0b0d : #ffffff;
+
+    // The strong colour of a tone, for text, icons and dots.
+    public pure function tone(t: Tone) -> color {
+        if (t == Tone.accent) { return accent-text; }
+        if (t == Tone.ok) { return ok; }
+        if (t == Tone.warn) { return warn; }
+        if (t == Tone.danger) { return danger; }
+        return text-muted;
+    }
+
+    // The soft colour of a tone, for the background behind it.
+    public pure function tone-soft(t: Tone) -> color {
+        if (t == Tone.accent) { return accent-soft; }
+        if (t == Tone.ok) { return ok-soft; }
+        if (t == Tone.warn) { return warn-soft; }
+        if (t == Tone.danger) { return danger-soft; }
+        return surface-alt;
+    }
+}
+
+// The type scale.
+export global Type {
+    out property <length> caption: 12px;
+    out property <length> small: 13px;
+    out property <length> body: 14px;
+    out property <length> lead: 15px;
+    out property <length> heading: 16px;
+    out property <length> title: 22px;
+    out property <length> display: 26px;
+
+    out property <int> regular: 400;
+    out property <int> medium: 500;
+    out property <int> semibold: 600;
+    out property <int> bold: 700;
+
+    // Commands, paths and rules: the system's monospace font, which the app
+    // looks up when it starts (src/app.rs).
+    in-out property <string> mono: "monospace";
+}
+
+// Spaces between and inside things, on a 4 px grid.
+export global Space {
+    out property <length> xxs: 2px;
+    out property <length> xs: 4px;
+    out property <length> sm: 8px;
+    out property <length> md: 12px;
+    out property <length> lg: 16px;
+    out property <length> xl: 20px;
+    out property <length> xxl: 24px;
+    out property <length> page: 32px;
+    out property <length> section: 28px;
+}
+
+export global Radius {
+    out property <length> sm: 6px;
+    out property <length> md: 8px;
+    out property <length> lg: 12px;
+    out property <length> xl: 16px;
+    out property <length> pill: 999px;
+}
+
+// Fixed sizes of the shell and the controls.
+export global Size {
+    out property <length> control: 34px;
+    out property <length> control-sm: 28px;
+    // A text field: a little taller than a button, for the text's room.
+    out property <length> field: 38px;
+    out property <length> icon: 16px;
+    out property <length> icon-lg: 20px;
+    out property <length> sidebar: 236px;
+    out property <length> content-max: 980px;
+    out property <length> dialog: 520px;
+}

@@ -893,6 +893,12 @@ pub struct CenterPolicy {
     /// is followed wherever its path leads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub places: Vec<String>,
+    /// The `sockets` list of a pre-release of the desktop app (socket files a
+    /// `folder` mode command could reach outside its folders), which is gone:
+    /// read and dropped, so a file or a center's document that has it still
+    /// loads, and never written back.
+    #[serde(default, rename = "sockets", skip_serializing)]
+    pub dropped_sockets: serde::de::IgnoredAny,
     /// `cap` or `cap.action` → setting; `cap.action` wins over `cap`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub caps: BTreeMap<String, CapSetting>,
@@ -1871,6 +1877,20 @@ sudo_allow = ["sudo apt update"]
             NodeConfig::parse("[machine]\nsudo = \"on\"\nsudo_path = \"/usr/bin/sudo\"\n").unwrap();
         assert_eq!(on.machine.sudo, Sudo::On);
         assert_eq!(NodeConfig::parse(&on.to_toml()).unwrap(), on);
+    }
+
+    /// A pairing's `sockets` of a pre-release still loads, and is gone once
+    /// the file is written again.
+    #[test]
+    fn a_file_with_the_dropped_sockets_list_loads_without_it() {
+        let c = NodeConfig::parse(&center(
+            "mode = \"folder\"\nsockets = [\"/run/docker.sock\"]",
+        ))
+        .unwrap();
+        let p = &c.centers[0].policy;
+        assert_eq!(p.mode, Mode::Folder);
+        assert!(!c.to_toml().contains("sockets"), "{}", c.to_toml());
+        assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
     }
 
     #[test]

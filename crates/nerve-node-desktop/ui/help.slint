@@ -1,0 +1,430 @@
+// Help: the app's keys and the command reference: every nerve-node command
+// by topic or from A to Z, to filter, each one opening on its arguments, an
+// example and the place in the app that does the same (src/reference.rs).
+// Each action in the app runs one of these commands. Every part opens and
+// closes on its own: opening one leaves the others as they are.
+
+import { Theme, Type, Space, Radius, Tone } from "theme.slint";
+import { Page, RefRow } from "data.slint";
+import { Manual, Store, Prefs } from "store.slint";
+import {
+    Button, ButtonKind, Card, PageHeader, PageFrame, Divider, Code, Fit, Reveal, Expander,
+    TextField, Segmented, Icon, Pill, FocusRing,
+} from "widgets.slint";
+
+// One command of the reference: its name and first sentence on a line;
+// open, the rest of what it does, how it is written, its arguments, an
+// example, and the button to the place in the app that does the same.
+component CommandRow inherits Rectangle {
+    in property <RefRow> item;
+    in property <bool> topic;
+    property <bool> open: root.item.open;
+    background: root.open ? Theme.surface : Theme.surface-alt;
+    border-radius: Radius.md;
+    border-width: 1px;
+    border-color: root.open ? Theme.accent.transparentize(0.4) : Theme.border-strong;
+    height: self.preferred-height;
+    VerticalLayout {
+        Rectangle {
+            accessible-role: button;
+            accessible-label: root.item.name;
+            accessible-expandable: true;
+            accessible-expanded: root.open;
+            accessible-action-default => {
+                Manual.ref-toggle(root.item.name);
+            }
+            FocusRing {
+                x: -3px;
+                y: -3px;
+                width: parent.width + 6px;
+                height: parent.height + 6px;
+                shown: focus.has-focus;
+            }
+            HorizontalLayout {
+                padding-left: Space.lg;
+                padding-right: Space.md;
+                padding-top: 9px;
+                padding-bottom: 9px;
+                spacing: Space.md;
+                Text {
+                    width: 168px;
+                    text: root.item.name;
+                    color: Theme.accent-text;
+                    font-size: Type.small;
+                    font-weight: Type.semibold;
+                    font-family: Type.mono;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.item.line;
+                    color: Theme.text;
+                    font-size: Type.small;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                if root.topic: VerticalLayout {
+                    alignment: center;
+                    Pill {
+                        text: root.item.topic;
+                        tone: Tone.neutral;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: root.open ? @image-url("icons/chev.svg") : @image-url("icons/chev-right.svg");
+                        colorize: root.open ? Theme.accent-text : Theme.text-muted;
+                    }
+                }
+            }
+            TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    Manual.ref-toggle(root.item.name);
+                }
+            }
+            focus := FocusScope {
+                focus-on-click: false;
+                key-pressed(event) => {
+                    if (event.text == " " || event.text == Key.Return) {
+                        Manual.ref-toggle(root.item.name);
+                        return accept;
+                    }
+                    reject
+                }
+            }
+        }
+        Reveal {
+            shown: root.open;
+            VerticalLayout {
+                padding-left: Space.lg;
+                padding-right: Space.lg;
+                padding-bottom: Space.lg;
+                spacing: Space.md;
+                Divider { }
+                Reveal {
+                    shown: root.item.about != "";
+                    Text {
+                        text: root.item.about;
+                        color: Theme.text;
+                        font-size: Type.small;
+                        wrap: word-wrap;
+                    }
+                }
+                Code {
+                    text: root.item.usage;
+                }
+                Reveal {
+                    shown: root.item.args.length > 0;
+                    VerticalLayout {
+                        spacing: 6px;
+                        for a in root.item.args: Fit {
+                            HorizontalLayout {
+                                spacing: Space.md;
+                                Text {
+                                    width: 200px;
+                                    text: a.name;
+                                    color: Theme.text;
+                                    font-size: Type.caption;
+                                    font-family: Type.mono;
+                                    wrap: char-wrap;
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: a.about;
+                                    color: Theme.text-muted;
+                                    font-size: Type.caption;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: "Example";
+                        color: Theme.text-muted;
+                        font-size: Type.caption;
+                        font-weight: Type.semibold;
+                    }
+                    Code {
+                        text: root.item.example;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    Text {
+                        text: root.item.in-app ? "In the app:"
+                            : root.item.place != "" ? root.item.place
+                            : "Not in the app: the service runs the node.";
+                        color: Theme.text-muted;
+                        font-size: Type.small;
+                        vertical-alignment: center;
+                    }
+                    if root.item.in-app: Button {
+                        text: root.item.place;
+                        icon: @image-url("icons/arrow-right.svg");
+                        kind: ButtonKind.secondary;
+                        small: true;
+                        clicked => {
+                            Manual.ref-go(root.item.page, root.item.tab);
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// An answer: plain text, as long as it needs.
+component Answer inherits Text {
+    color: Theme.text-muted;
+    font-size: Type.body;
+    wrap: word-wrap;
+}
+
+// A key or keys, and what they do.
+component KeyRow {
+    in property <string> keys;
+    in property <string> does;
+    HorizontalLayout {
+        spacing: Space.lg;
+        Rectangle {
+            width: 150px;
+            HorizontalLayout {
+                alignment: start;
+                Rectangle {
+                    background: Theme.inset;
+                    border-radius: Radius.sm;
+                    border-width: 1px;
+                    border-color: Theme.border-strong;
+                    HorizontalLayout {
+                        padding-left: 7px;
+                        padding-right: 7px;
+                        padding-top: 2px;
+                        padding-bottom: 2px;
+                        Text {
+                            text: root.keys;
+                            color: Theme.text;
+                            font-size: Type.small;
+                            font-family: Type.mono;
+                        }
+                    }
+                }
+            }
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.does;
+            color: Theme.text-muted;
+            font-size: Type.body;
+            vertical-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// The head of a topic of the reference: a click opens or closes its
+// commands.
+component GroupHead inherits Rectangle {
+    in property <string> name;
+    in property <int> count;
+    in property <bool> open;
+    callback toggled();
+    accessible-role: button;
+    accessible-label: root.name;
+    accessible-expandable: true;
+    accessible-expanded: root.open;
+    accessible-action-default => {
+        root.toggled();
+    }
+    FocusRing {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        shown: focus.has-focus;
+    }
+    HorizontalLayout {
+        spacing: Space.sm;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.open ? @image-url("icons/chev.svg") : @image-url("icons/chev-right.svg");
+                colorize: Theme.accent-text;
+            }
+        }
+        Text {
+            text: root.name;
+            color: Theme.accent-text;
+            font-size: Type.body;
+            font-weight: Type.semibold;
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            alignment: center;
+            Pill {
+                text: root.count;
+                tone: Tone.accent;
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+    }
+    TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => {
+            root.toggled();
+        }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.toggled();
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+export component HelpPage inherits PageFrame {
+    gap: Space.md;
+    PageHeader {
+        icon: @image-url("icons/help.svg");
+        title: "Help";
+        Button {
+            text: "User guide";
+            icon: @image-url("icons/external.svg");
+            kind: ButtonKind.ghost;
+            clicked => {
+                Platform.open-url("https://github.com/Piggidragon/Nerve-Protocol/tree/main/docs/user");
+            }
+        }
+    }
+    Rectangle {
+        height: Space.xs;
+    }
+    Expander {
+        title: "Keyboard shortcuts";
+        open: Manual.keys-open;
+        toggled => {
+            Manual.keys-open = !Manual.keys-open;
+        }
+        icon: @image-url("icons/keyboard.svg");
+        KeyRow {
+            keys: "Ctrl+1 … Ctrl+8";
+            does: "Overview, Centers, Relay, Permissions, Audit, Log, Settings, Help";
+        }
+        KeyRow {
+            keys: "Ctrl+R, F5";
+            does: "Read the page again";
+        }
+        KeyRow {
+            keys: "Esc";
+            does: "Close a dialog";
+        }
+        KeyRow {
+            keys: "Enter";
+            does: "The dialog's main button";
+        }
+        KeyRow {
+            keys: "Tab, Shift+Tab";
+            does: "The next or the last control";
+        }
+        KeyRow {
+            keys: "Space";
+            does: "Press a button, tick a box";
+        }
+        KeyRow {
+            keys: "← →";
+            does: "Choose in a row of choices or tabs";
+        }
+    }
+    Expander {
+        title: "Command reference";
+        open: Manual.commands-open;
+        toggled => {
+            Manual.commands-open = !Manual.commands-open;
+        }
+        icon: @image-url("icons/terminal.svg");
+        Answer {
+            text: "Every action here runs one of these nerve-node commands, with the same checks and audit records.";
+        }
+        HorizontalLayout {
+            spacing: Space.md;
+            padding-top: Space.xs;
+            TextField {
+                horizontal-stretch: 1;
+                text <=> Manual.ref-filter;
+                placeholder: "Filter: pair, folder, sudo…";
+                label: "Filter the commands";
+                edited => {
+                    Manual.ref-update();
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Segmented {
+                    options: ["By topic", "A to Z"];
+                    current: Manual.ref-by-name ? 1 : 0;
+                    chosen(i) => {
+                        Manual.ref-by-name = i == 1;
+                        Manual.ref-update();
+                    }
+                }
+            }
+        }
+        Text {
+            text: "A command about one center takes --center <CENTER> when more than one is paired.";
+            color: Theme.text-muted;
+            font-size: Type.caption;
+            wrap: word-wrap;
+        }
+        Reveal {
+            shown: Manual.ref-groups.length == 0;
+            Text {
+                text: "No command matches.";
+                color: Theme.text-muted;
+                font-size: Type.small;
+            }
+        }
+        for g in Manual.ref-groups: Fit {
+            VerticalLayout {
+                padding-top: Space.sm;
+                Reveal {
+                    shown: g.name != "";
+                    GroupHead {
+                        name: g.name;
+                        count: g.rows.length;
+                        open: g.open;
+                        toggled => {
+                            Manual.ref-group-toggle(g.name);
+                        }
+                    }
+                }
+                Reveal {
+                    shown: g.open;
+                    gap: g.name != "" ? 6px : 0px;
+                    VerticalLayout {
+                        spacing: 6px;
+                        for r in g.rows: CommandRow {
+                            item: r;
+                            topic: g.name == "";
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

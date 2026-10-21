@@ -27,27 +27,37 @@ no call runs on the relay for a node it carries.
 
 ## On the relay
 
-Turn the relay on and give the other node a token:
+Turn the relay on and give the other node a link:
 
 ```sh
 nerve-node relay set 0.0.0.0:7490
-nerve-node relay add lab-pc
+nerve-node relay add lab-pc --address relay.example
 ```
 
 `relay set` makes the relay's certificate the first time and shows its pin.
-`relay add` shows the token once, and the line to run on the other node:
+`relay add` makes the node's token and shows it once, in a link that holds
+all the other node needs: the relay's address, the node's name and token,
+and the pin.
 
 ```
-relay node lab-pc added; its token, shown only now:
-  0123456789abcdefghijklmnopqrstuvwxyz0123456
+relay node lab-pc added; its link, shown only now:
+  nerve://relay?address=relay.example%3A7490&node=lab-pc&token=0123…&pin=q1Q3tvgE…
+on lab-pc, paste it in the desktop app (Relay, Connect), or run:
+  nerve-node proxy set 'nerve://relay?address=relay.example%3A7490&node=lab-pc&token=0123…&pin=q1Q3tvgE…'
 it may reach every https center of this node
-on lab-pc, run:
-  nerve-node proxy set 'https://lab-pc:0123…@<address of this machine>:7490' --pin q1Q3tvgE…
 ```
 
-The relay keeps only a hash of the token in `node.toml`. If you lose the
-token, or think it leaked, give the node a new one:
-`nerve-node relay token lab-pc`. The old token stops working, its tunnels
+`--address` is where the other node reaches this machine, a host name or
+address, with `:PORT` when it is not the port the relay listens on. Without
+it the link names the address the relay listens on, or, when that is every
+address (`0.0.0.0`), this machine's host name, and says so. In the desktop
+app, the Relay page does the same: **Add a node** shows the link with a Copy
+button.
+
+The relay keeps only a hash of the token in `node.toml`, so it cannot show
+the link again. If you lose the link, or think it leaked, give the node a new
+one: `nerve-node relay token lab-pc` (with `--address` as for `relay add`).
+The other node pastes the new link. The old token stops working, its tunnels
 end, and the node keeps its centers and its limits. (`relay rm`, then
 `relay add`, makes the node anew, without them.) On Windows the running
 relay takes the new token only when it starts again: restart it, or the old
@@ -80,13 +90,16 @@ shows each node's list.
 
 ## On the relayed node
 
-Run the line `relay add` showed, with the relay's address in place of
-`<address of this machine>`, then pair as usual:
+Paste the link: in the desktop app on the Relay page (**Connect through a
+relay**), or in a terminal. Then pair as usual:
 
 ```sh
-nerve-node proxy set 'https://lab-pc:<token>@relay.example:7490' --pin <pin>
+nerve-node proxy set 'nerve://relay?address=...&node=lab-pc&token=...&pin=...'
 nerve-node center add 'nerve://pair?center=...&code=...&pin=...'
 ```
+
+The link is the relay as this node's proxy: the same as `proxy set
+'https://lab-pc:<token>@relay.example:7490' --pin <pin>`.
 
 The pairing goes through the relay too. The center's URL in the pairing link
 must be the one the relay is paired with, the same host name or address and
@@ -244,6 +257,6 @@ Firewall must let other machines reach the relay's port.
   name `b` too. The relay tells an address in any spelling apart from
   others, but not a name from the address it resolves to: pair the relay's
   centers at one name or address each.
-- The `proxy set` line holds the token, so your shell keeps it in its
-  history (fish, bash, PowerShell's `ConsoleHost_history.txt`). Delete it
+- The link holds the token, and so does the `proxy set` line: your shell
+  keeps it in its history (fish, bash, PowerShell's `ConsoleHost_history.txt`). Delete it
   from there after you ran it.

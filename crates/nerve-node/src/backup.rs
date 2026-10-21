@@ -64,7 +64,51 @@ pub struct BackupReport {
     /// The keys in the file, as a message names them.
     pub saved: Vec<String>,
     /// What was not taken, and why.
-    pub left_out: Vec<String>,
+    pub left_out: Vec<LeftOut>,
+}
+
+/// A key a backup did not take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftOut {
+    /// The key, as a message names it.
+    pub what: String,
+    pub why: Why,
+}
+
+/// Why a backup did not take a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// It does not fit the config.
+    DoesNotFit,
+    /// It is in the system keyring, and the backup was not told to take it.
+    Keyring,
+    /// This node has none.
+    Missing,
+}
+
+impl Why {
+    /// Its name in `backup --json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Why::DoesNotFit => "does-not-fit",
+            Why::Keyring => "keyring",
+            Why::Missing => "missing",
+        }
+    }
+}
+
+impl std::fmt::Display for LeftOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = &self.what;
+        match self.why {
+            Why::DoesNotFit => write!(f, "{what} (it does not fit the config, so it was left out)"),
+            Why::Keyring => write!(
+                f,
+                "{what} (it is in the system keyring; --include-keyring takes it out)"
+            ),
+            Why::Missing => write!(f, "{what} (this node has none)"),
+        }
+    }
 }
 
 /// Writes the backup of the node `cfg` describes at `paths` to `file`.
@@ -78,7 +122,7 @@ pub fn backup(
     pass.check_new()?;
     let (contents, report) = collect(paths, cfg, opts.include_keyring)?;
     let bytes = backup::seal_with(&contents, pass, opts.rounds)?;
-    backup::write_file(file, &bytes, opts.overwrite)?;
+    crate::caller_file::write(file, &bytes, opts.overwrite)?;
     Ok(report)
 }
 
@@ -127,13 +171,18 @@ fn collect(
                 files.insert(name, t);
                 report.saved.push(what);
             }
-            Fetch::Text(_) => report.left_out.push(format!(
-                "{what} (it does not fit the config, so it was left out)"
-            )),
-            Fetch::Keyring => report.left_out.push(format!(
-                "{what} (it is in the system keyring; --include-keyring takes it out)"
-            )),
-            Fetch::Missing => report.left_out.push(format!("{what} (this node has none)")),
+            Fetch::Text(_) => report.left_out.push(LeftOut {
+                what,
+                why: Why::DoesNotFit,
+            }),
+            Fetch::Keyring => report.left_out.push(LeftOut {
+                what,
+                why: Why::Keyring,
+            }),
+            Fetch::Missing => report.left_out.push(LeftOut {
+                what,
+                why: Why::Missing,
+            }),
         }
     };
 
@@ -372,6 +421,20 @@ pub struct RestoreReport {
     pub kept: Vec<String>,
     /// Things the owner should know, one line each.
     pub notes: Vec<String>,
+    /// The notes that ask the owner to set something again, by their
+    /// index in `notes`: what (`proxy`, `sudo`, `sudo-file`, `pin`,
+    /// `relay`) and for which center. A program words these itself, with
+    /// its own way to do it (`restore --json`).
+    pub fixes: Vec<(usize, &'static str, Option<String>)>,
+}
+
+impl RestoreReport {
+    /// The last note asks for `what` to be set again.
+    fn fix(&mut self, what: &'static str, center: Option<&str>) {
+        if let Some(i) = self.notes.len().checked_sub(1) {
+            self.fixes.push((i, what, center.map(str::to_string)));
+        }
+    }
 }
 
 /// What the folders hold before a restore.
@@ -392,6 +455,17 @@ fn inspect(paths: &NodePaths) -> Target {
         Ok(c) => Target::Node(Box::new(c)),
         Err(e) => Target::Unreadable(e),
     }
+}
+
+/// The first setting of [`crate::owner::ROOT_ONLY`] that restoring `b`
+/// would change at `paths`; a config here that cannot be read counts as
+/// none set.
+pub fn root_only_change(paths: &NodePaths, b: &Parsed) -> Option<&'static str> {
+    let here = match inspect(paths) {
+        Target::Node(c) => *c,
+        Target::Empty | Target::Unreadable(_) => NodeConfig::default(),
+    };
+    crate::owner::root_only_change(&here, &b.cfg)
 }
 
 /// The pairings of a config: which node it is, to the centers.
@@ -492,6 +566,7 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
         report.notes.push(
             "the proxy is left out of the restored config, with its pin, password and header values: set it again on this machine with `nerve-node proxy set`, which needs the address, the `--pin` of an https:// proxy and its login. For a relay, `nerve-node relay token <name>` on the relay prints the command with a new token and the pin".into(),
         );
+        report.fix("proxy", None);
     }
     // The password of the sudo switch is in no backup and never at rest on
     // Linux: a node restored with the switch on would claim it.
@@ -500,6 +575,7 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
         report.notes.push(
             "the sudo switch is off: its password is not in a backup. `nerve-node sudo on` turns it on".into(),
         );
+        report.fix("sudo", None);
     }
     // A pairing whose keys were rotated after the backup was made: the config
     // here is further along (it counts more rotations) and names the keys
@@ -556,6 +632,7 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
                     "the pin of center {} here is another one than the backup's: the restore takes the backup's. If the node cannot link, set the center's pin with `nerve-node config set center.{}.pin <pin>`",
                     e.name, e.name
                 ));
+                report.fix("pin", Some(&e.name));
             } else if h.pin_rotations == e.pin_rotations
                 && h.pin == e.pin
                 && let Some(backed_up) = &e.old_pin
@@ -634,10 +711,13 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
                 "{} is deleted: the sudo switch is off, so the administrator's password it held is not kept",
                 crate::winsudo::SUDO_FILE
             )),
-            Err(e) => report.notes.push(format!(
-                "the sudo switch is off, but the administrator's password it held could not be deleted ({e}): delete {}, or run `nerve-node sudo on` and `sudo off`",
-                crate::winsudo::SUDO_FILE
-            )),
+            Err(e) => {
+                report.notes.push(format!(
+                    "the sudo switch is off, but the administrator's password it held could not be deleted ({e}): delete {}, or run `nerve-node sudo on` and `sudo off`",
+                    crate::winsudo::SUDO_FILE
+                ));
+                report.fix("sudo-file", None);
+            }
         }
     }
     let _ = AuditLog::new(paths.audit_log()).config(
@@ -738,9 +818,12 @@ fn write_keys<'a>(
             match here(Key::RelayTls, &fits) {
                 Some((place, text)) if place != to => put(Key::RelayTls, &text)?,
                 Some(_) => {}
-                None => report.notes.push(
-                    "the relay's TLS key is not in the backup and not here: the relay does not listen until `nerve-node relay set <address>` makes a new key and pin, which the nodes behind it must take".into(),
-                ),
+                None => {
+                    report.notes.push(
+                        "the relay's TLS key is not in the backup and not here: the relay does not listen until `nerve-node relay set <address>` makes a new key and pin, which the nodes behind it must take".into(),
+                    );
+                    report.fix("relay", None);
+                }
             }
         }
         (None, None) => {}
@@ -801,6 +884,7 @@ fn write_keys<'a>(
                 } else {
                     "the proxy's password is not in the backup and not here: run `nerve-node proxy set` again".into()
                 });
+                report.fix("proxy", None);
             }
         }
         (None, None) => {}
@@ -854,13 +938,20 @@ fn write_keys<'a>(
                 report.notes.push(
                     "the proxy's header values here are not for the proxy and header names that the restored config names, so they were deleted: run `nerve-node proxy set` again".into(),
                 );
+                report.fix("proxy", None);
             }
-            Some(_) => report.notes.push(
-                "the proxy's header values were left out of the backup (they are in the keyring), and the ones here lack a value the restored config names: run `nerve-node proxy set` again".into(),
-            ),
-            None => report.notes.push(
-                "the proxy's header values were left out of the backup (they are in the keyring); if this machine's keyring lacks them too, run `nerve-node proxy set` again".into(),
-            ),
+            Some(_) => {
+                report.notes.push(
+                    "the proxy's header values were left out of the backup (they are in the keyring), and the ones here lack a value the restored config names: run `nerve-node proxy set` again".into(),
+                );
+                report.fix("proxy", None);
+            }
+            None => {
+                report.notes.push(
+                    "the proxy's header values were left out of the backup (they are in the keyring); if this machine's keyring lacks them too, run `nerve-node proxy set` again".into(),
+                );
+                report.fix("proxy", None);
+            }
         }
     }
     if let Some(map) = &b.proxy_headers {
@@ -956,6 +1047,47 @@ pub fn print_backup(r: &BackupReport, file: &Path, out: &mut dyn std::io::Write)
     );
 }
 
+/// What a backup did, as data: the file, the centers, the keys it took,
+/// and the ones it left out with why.
+pub fn backup_data(r: &BackupReport, file: &Path) -> serde_json::Value {
+    let left_out: Vec<serde_json::Value> = r
+        .left_out
+        .iter()
+        .map(|l| serde_json::json!({"what": l.what, "why": l.why.as_str()}))
+        .collect();
+    serde_json::json!({
+        "file": file.display().to_string(),
+        "centers": r.centers,
+        "saved": r.saved,
+        "left_out": left_out,
+    })
+}
+
+/// What a restore did, as data: the centers, the keys kept or missing,
+/// and each note with what it asks to be set again (`fix`, `center`).
+pub fn restore_data(r: &RestoreReport, b: &Parsed) -> serde_json::Value {
+    let notes: Vec<serde_json::Value> = r
+        .notes
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let fix = r.fixes.iter().find(|f| f.0 == i);
+            serde_json::json!({
+                "text": text,
+                "fix": fix.map(|f| f.1),
+                "center": fix.and_then(|f| f.2.clone()),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "centers": r.centers,
+        "kept": r.kept,
+        "no_key": r.no_key,
+        "notes": notes,
+        "program": b.program,
+    })
+}
+
 /// Says what a restore did and what comes next.
 pub fn print_restore(r: &RestoreReport, b: &Parsed, out: &mut dyn std::io::Write) {
     let _ = writeln!(
@@ -983,9 +1115,16 @@ pub fn print_restore(r: &RestoreReport, b: &Parsed, out: &mut dyn std::io::Write
     for n in &r.notes {
         let _ = writeln!(out, "  {n}");
     }
+    // For an owner the node restores while it is stopped and starts again
+    // by itself (crate::owner).
+    let start = if crate::owner::owner_running().is_some() {
+        "The node starts again with it now."
+    } else {
+        "Start the node."
+    };
     let _ = writeln!(
         out,
-        "Start the node. It keeps the pins and the keys it had, so a center that still knows it takes it back; check the folders and the account that commands run as (docs/user/backup.md)."
+        "{start} It keeps the pins and the keys it had, so a center that still knows it takes it back; check the folders and the account that commands run as (docs/user/backup.md)."
     );
 }
 
@@ -1201,7 +1340,7 @@ mod tests {
         assert!(report.saved.is_empty(), "{report:?}");
         assert_eq!(report.left_out.len(), 1);
         assert!(
-            report.left_out[0].contains("--include-keyring"),
+            report.left_out[0].to_string().contains("--include-keyring"),
             "{report:?}"
         );
         assert!(parsed.keys.is_empty());
@@ -2198,7 +2337,10 @@ mod tests {
         set("http://proxy-a.example:3128", &["Proxy-Authorization"]);
         let (_f, parsed, report) = roundtrip(&n, false);
         assert!(
-            report.left_out.iter().any(|l| l.contains("header values")),
+            report
+                .left_out
+                .iter()
+                .any(|l| l.what.contains("header values")),
             "{report:?}"
         );
 
@@ -2876,7 +3018,7 @@ mod tests {
             report
                 .left_out
                 .iter()
-                .any(|l| l.contains("header values") && l.contains("--include-keyring")),
+                .any(|l| l.what.contains("header values") && l.why == Why::Keyring),
             "{report:?}"
         );
         assert!(without.proxy_headers.is_none());

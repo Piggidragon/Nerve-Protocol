@@ -1,21 +1,26 @@
 # Install
 
-Put `nerve-center` on the machine where your agent harness runs. Put
-`nerve-node` on every machine the agent may use. They can share a machine.
+Put `nerve-center` on the machine where your agent harness runs. Put a node
+on every machine the agent may use: `nerve-node`, or on a machine with a
+desktop `nerve-node-desktop`, the node with an app
+([desktop app](desktop.md)). A center and a node can share a machine.
 
 ## Download
 
 Get the programs from
 [Releases](https://github.com/Piggidragon/Nerve-Protocol/releases). Each
-release has six programs and a `SHA256SUMS` file.
+release has eight programs and a `SHA256SUMS` file.
 
 | System | Files |
 |---|---|
-| Linux, x86_64 | `nerve-center-x86_64-linux`, `nerve-node-x86_64-linux` |
+| Linux, x86_64 | `nerve-center-x86_64-linux`, `nerve-node-x86_64-linux`, `nerve-node-desktop-x86_64-linux` |
 | Linux, ARM 64-bit | `nerve-center-aarch64-linux`, `nerve-node-aarch64-linux` |
-| Windows, x86_64 | `nerve-center-x86_64-windows.exe`, `nerve-node-x86_64-windows.exe` |
+| Windows, x86_64 | `nerve-center-x86_64-windows.exe`, `nerve-node-x86_64-windows.exe`, `nerve-node-desktop-x86_64-windows.exe` |
 
-The Linux programs are static and need no libraries. The Windows programs
+`nerve-node-desktop` is the node with a desktop app, which installs itself
+when you open it ([desktop app](desktop.md)).
+
+The Linux programs except the desktop app are static and need no libraries. The Windows programs
 need no Visual C++ runtime. The programs are not signed, so check them
 against `SHA256SUMS`.
 

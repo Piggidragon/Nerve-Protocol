@@ -550,6 +550,20 @@ pub fn for_call(
     build(cfg, entry, now_ms, false, true, provided)
 }
 
+/// The capabilities and their actions that `cap set` switches for `entry`,
+/// the node's own: what a call may name with every switch on, the implicit
+/// ones aside.
+pub fn switchable(cfg: &NodeConfig, entry: &CenterEntry) -> Vec<(String, Vec<String>)> {
+    let mut all = entry.clone();
+    all.policy.caps.clear();
+    for_call(cfg, &all, 0, &[])
+        .capabilities
+        .into_iter()
+        .filter(|c| c.provider == "node" && !IMPLICIT.contains(&c.id.as_str()))
+        .map(|c| (c.id, c.actions.into_keys().collect()))
+        .collect()
+}
+
 fn build(
     cfg: &NodeConfig,
     entry: &CenterEntry,

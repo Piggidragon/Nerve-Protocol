@@ -1,0 +1,340 @@
+// Audit: every decision of the node, newest first (or oldest), filtered and
+// counted, with the four buttons of issue #23 on a call: allow, allow as
+// wildcard, deny, deny as wildcard.
+// They write the rule `nerve-node rule add --action` writes, the one the
+// center's audit page writes.
+
+import { Theme, Type, Space, Radius, Tone } from "theme.slint";
+import { Load, AuditRow } from "data.slint";
+import { Store } from "store.slint";
+import {
+    Button, ButtonKind, Card, Pill, IconTile, Banner, Loading, PageHeader, PageFrame,
+    EmptyState, Divider, Segmented, Code, Reveal, Fit, MoreFoot, TextField, Picker,
+} from "widgets.slint";
+
+component AuditEntry {
+    in property <AuditRow> entry;
+    property <bool> waiting: Store.busy == "audit-" + root.entry.index;
+    HorizontalLayout {
+        padding-left: Space.xl;
+        padding-right: Space.xl;
+        padding-top: Space.lg;
+        padding-bottom: Space.lg;
+        spacing: Space.lg;
+        VerticalLayout {
+            alignment: start;
+            IconTile {
+                size: 32px;
+                tone: root.entry.tone;
+                icon: root.entry.kind == "call" ? (root.entry.tone == Tone.danger ? @image-url("icons/ban.svg") : @image-url("icons/check.svg"))
+                    : root.entry.kind == "settings" ? @image-url("icons/sliders.svg")
+                    : root.entry.kind == "relay" ? @image-url("icons/globe.svg")
+                    : root.entry.kind == "key" ? @image-url("icons/key.svg")
+                    : root.entry.kind == "config" ? @image-url("icons/edit.svg")
+                    : root.entry.kind == "audit" ? @image-url("icons/trash.svg")
+                    : @image-url("icons/info.svg");
+            }
+        }
+        // Its parts come and go with the entry, each with the gap above it
+        // (see Reveal).
+        VerticalLayout {
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: Space.sm;
+                Text {
+                    text: root.entry.title;
+                    color: Theme.text;
+                    font-size: Type.body;
+                    font-weight: Type.semibold;
+                    font-family: root.entry.kind == "call" ? Type.mono : "";
+                    vertical-alignment: center;
+                }
+                if root.entry.badge != "": VerticalLayout {
+                    alignment: center;
+                    Pill {
+                        text: root.entry.badge;
+                        tone: root.entry.tone;
+                    }
+                }
+                if root.entry.center != "": Text {
+                    text: root.entry.center;
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    min-width: min(40px, self.preferred-width);
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: root.entry.when;
+                    color: Theme.text-faint;
+                    font-size: Type.caption;
+                    vertical-alignment: center;
+                    accessible-label: root.entry.when-exact;
+                }
+            }
+            Reveal {
+                shown: root.entry.target != "";
+                gap: Space.sm;
+                Code {
+                    text: root.entry.target;
+                }
+            }
+            Reveal {
+                shown: root.entry.detail != "";
+                gap: Space.sm;
+                Text {
+                    text: root.entry.detail;
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
+            }
+            Reveal {
+                shown: root.entry.rules;
+                gap: Space.sm + 2px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+                    Button {
+                        text: "Allow";
+                        icon: @image-url("icons/check.svg");
+                        small: true;
+                        enabled: !root.waiting;
+                        clicked => {
+                            Store.audit-rule(root.entry.index, "allow", false);
+                        }
+                    }
+                    Button {
+                        text: "Allow as wildcard";
+                        small: true;
+                        enabled: !root.waiting;
+                        clicked => {
+                            Store.audit-rule(root.entry.index, "allow", true);
+                        }
+                    }
+                    Rectangle {
+                        width: Space.xs;
+                    }
+                    Button {
+                        text: "Deny";
+                        icon: @image-url("icons/ban.svg");
+                        kind: ButtonKind.danger-soft;
+                        small: true;
+                        enabled: !root.waiting;
+                        clicked => {
+                            Store.audit-rule(root.entry.index, "deny", false);
+                        }
+                    }
+                    Button {
+                        text: "Deny as wildcard";
+                        kind: ButtonKind.danger-soft;
+                        small: true;
+                        enabled: !root.waiting;
+                        clicked => {
+                            Store.audit-rule(root.entry.index, "deny", true);
+                        }
+                    }
+                }
+            }
+            Reveal {
+                shown: !root.entry.rules && root.entry.rules-why != "";
+                gap: Space.sm;
+                Text {
+                    text: root.entry.rules-why;
+                    color: Theme.text-faint;
+                    font-size: Type.caption;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}
+
+// The filters of the page: what kind of decision (with its count), the
+// order, words to find, a center and an action. They combine.
+component AuditFilters inherits VerticalLayout {
+    spacing: Space.md;
+    HorizontalLayout {
+        spacing: Space.md;
+        Segmented {
+            options: [
+                "All " + Store.audit-counts[0],
+                "Allowed " + Store.audit-counts[1],
+                "Refused " + Store.audit-counts[2],
+                "Changes " + Store.audit-counts[3],
+            ];
+            current: Store.audit-decision;
+            chosen(i) => {
+                Store.audit-decision = i;
+                Store.audit-filtered();
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+        Segmented {
+            options: ["Newest first", "Oldest first"];
+            current: Store.audit-oldest ? 1 : 0;
+            chosen(i) => {
+                Store.audit-oldest = i == 1;
+                Store.audit-filtered();
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: Space.md;
+        TextField {
+            horizontal-stretch: 1;
+            text <=> Store.audit-text;
+            placeholder: "Find in target and reason";
+            label: "Find in target and reason";
+            edited => {
+                Store.audit-filtered();
+            }
+        }
+        Picker {
+            options: Store.audit-center-options;
+            current: Store.audit-center;
+            label: "Center";
+            chosen(i) => {
+                Store.audit-center = i;
+                Store.audit-filtered();
+            }
+        }
+        Picker {
+            options: Store.audit-action-options;
+            current: Store.audit-action;
+            label: "Action";
+            chosen(i) => {
+                Store.audit-action = i;
+                Store.audit-filtered();
+            }
+        }
+    }
+}
+
+export component AuditPage inherits PageFrame {
+    gap: 0;
+    property <bool> filtered: Store.audit-decision != 0 || Store.audit-center != 0 || Store.audit-action != 0 || Store.audit-text != "";
+    PageHeader {
+        icon: @image-url("icons/audit.svg");
+        title: "Audit";
+        error-title: "The audit log could not be read";
+        error: Store.audit-error;
+        error-action: "Try again";
+        error-acted => {
+            Store.refresh-audit();
+        }
+        Button {
+            text: "Refresh";
+            icon: @image-url("icons/refresh.svg");
+            kind: ButtonKind.ghost;
+            clicked => {
+                Store.reload();
+            }
+        }
+        Button {
+            text: "Clear";
+            icon: @image-url("icons/trash.svg");
+            kind: ButtonKind.ghost;
+            busy: Store.busy == "audit-clear";
+            clicked => {
+                Store.audit-clear();
+            }
+        }
+    }
+
+    if Store.audit-load == Load.loading && Store.audit-read == 0: Loading {
+        text: "Reading the audit log…";
+    }
+
+    Reveal {
+        shown: Store.audit-read > 0;
+        gap: Space.xl;
+        AuditFilters { }
+    }
+
+    Reveal {
+        shown: Store.audit-read > 0;
+        gap: Space.md;
+        HorizontalLayout {
+            spacing: Space.md;
+            Text {
+                horizontal-stretch: 1;
+                text: Store.audit-summary;
+                color: Theme.text-muted;
+                font-size: Type.small;
+                vertical-alignment: center;
+            }
+            if root.filtered: Button {
+                text: "Reset filters";
+                kind: ButtonKind.ghost;
+                small: true;
+                clicked => {
+                    Store.audit-decision = 0;
+                    Store.audit-center = 0;
+                    Store.audit-action = 0;
+                    Store.audit-text = "";
+                    Store.audit-filtered();
+                }
+            }
+        }
+    }
+
+    Reveal {
+        shown: Store.audit-load == Load.ready && Store.audit-read == 0;
+        gap: Space.xxl;
+        Card {
+            EmptyState {
+                icon: @image-url("icons/audit.svg");
+                title: "Nothing decided yet";
+                text: "Each call of a center and each change of a setting shows here.";
+            }
+        }
+    }
+
+    Reveal {
+        shown: Store.audit-read > 0 && Store.audit.length == 0;
+        gap: Space.lg;
+        Card {
+            EmptyState {
+                icon: @image-url("icons/audit.svg");
+                title: "No entry matches";
+                text: "Change or reset the filters.";
+            }
+        }
+    }
+
+    Reveal {
+        shown: Store.audit.length > 0;
+        gap: Space.lg;
+        Card {
+            pad: 0;
+            gap: 0;
+            for row[i] in Store.audit: Fit {
+                Divider {
+                    visible: i > 0;
+                    height: i > 0 ? 1px : 0;
+                }
+                AuditEntry {
+                    entry: row;
+                }
+            }
+        }
+    }
+
+    Reveal {
+        shown: Store.audit-foot != "";
+        gap: Space.lg;
+        MoreFoot {
+            text: Store.audit-foot;
+            more: Store.audit-more-left;
+            clicked => {
+                Store.audit-more();
+            }
+        }
+    }
+}

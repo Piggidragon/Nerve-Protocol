@@ -48,11 +48,21 @@ pub fn sudo_warning(name: &str) -> String {
     )
 }
 
+/// What [`invoker_warning`] says of that account; the desktop app, which
+/// asks for root through pkexec, says it in its own words.
+pub const RAN_SUDO: &str = "is the account that ran sudo, the one its owner logs in as";
+
+/// How `install` ends the line saying that it chose no account for the
+/// commands, on Linux and on Windows; the desktop app says it in its own
+/// words.
+pub const NO_ACCOUNT_SETUP: &str = "`sudo nerve-node setup` chooses one";
+pub const NO_ACCOUNT_INSTALL: &str = "`nerve-node install` asks again";
+
 /// The warning for the account that ran `sudo`: the account its owner logs
 /// in as, whatever its sudo asks for.
 pub fn invoker_warning(name: &str) -> String {
     format!(
-        "Warning: {name} is the account that ran sudo, the one its owner logs in as; the commands of a center run as it, so they can use its own programs (a tmux or screen server, its systemd user session) to reach what its owner does with sudo, and every command is then root. You are responsible for what commands do."
+        "Warning: {name} {RAN_SUDO}; the commands of a center run as it, so they can use its own programs (a tmux or screen server, its systemd user session) to reach what its owner does with sudo, and every command is then root. You are responsible for what commands do."
     )
 }
 
@@ -375,6 +385,28 @@ fn lookup_nss(name: &str) -> Result<Option<Account>, String> {
         }
     }
     Ok(Some(a))
+}
+
+/// The name of the account with `uid`, from the system's account database.
+pub fn name_of(uid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let _ = uid;
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let o = plain("getent")
+            .args(["passwd", &uid.to_string()])
+            .output()
+            .ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        parse_passwd(&String::from_utf8_lossy(&o.stdout))
+            .filter(|a| a.uid == uid)
+            .map(|a| a.name)
+    }
 }
 
 /// One line of `getent passwd`.

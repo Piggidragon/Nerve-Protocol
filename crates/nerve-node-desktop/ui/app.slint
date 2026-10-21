@@ -1,0 +1,397 @@
+// The window: the sidebar of pages, the page, and the dialogs over it.
+
+import { Palette } from "std-widgets.slint";
+import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
+import {
+    Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
+    HelpArg, RefRow, RefGroup, RelayNodeRow, TunnelRow, Pick, Limit,
+} from "data.slint";
+import { Store, Perm, Logs, Manual, Prefs, Install } from "store.slint";
+import { NavItem, StatusDot, Toast, Banner, Reveal, SchemeSwitch } from "widgets.slint";
+import { OverviewPage } from "overview.slint";
+import { CentersPage } from "centers.slint";
+import { RelayPage } from "relay.slint";
+import { AuditPage } from "audit.slint";
+import { PermissionsPage } from "permissions.slint";
+import { LogPage } from "log.slint";
+import { SettingsPage } from "settings.slint";
+import { HelpPage } from "help.slint";
+import { SetupDialog } from "setup.slint";
+import {
+    PairDialog, ConfirmDialog, AboutDialog, ModeDialog, FolderDialog, SudoDialog, ProxyDialog,
+    OnceDialog, BackupDialog, RestoreDialog, ElevateDialog, UpdateDialog, UninstallDialog,
+    MissingDialog, RelayNodeDialog, OtherCopyDialog, RelayAddDialog, ConnectDialog,
+} from "dialogs.slint";
+import { InstallerView } from "installer.slint";
+
+export {
+    Store, Perm, Logs, Manual, Prefs, Install, Type, Tone, Page, Load, NodeStatus, CenterRow, AuditRow,
+    PairPreview, FolderRow, CapRow, LogRow, HelpArg, RefRow, RefGroup, RelayNodeRow, TunnelRow,
+    Pick, Limit,
+}
+
+component Sidebar inherits Rectangle {
+    width: Size.sidebar;
+    background: Theme.sidebar;
+    Rectangle {
+        x: parent.width - 1px;
+        width: 1px;
+        background: Theme.border;
+    }
+    VerticalLayout {
+        padding-left: 12px;
+        padding-right: 13px;
+        padding-top: 18px;
+        padding-bottom: 12px;
+        spacing: 2px;
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-bottom: 20px;
+            spacing: 11px;
+            Image {
+                source: @image-url("icons/app.svg");
+                width: 32px;
+                height: 32px;
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+                Text {
+                    text: "Nerve";
+                    color: Theme.text;
+                    font-size: Type.lead;
+                    font-weight: Type.bold;
+                }
+                Text {
+                    text: "Node on this machine";
+                    color: Theme.accent-text;
+                    font-size: Type.caption;
+                }
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/overview.svg");
+            text: "Overview";
+            selected: Store.page == Page.overview;
+            clicked => {
+                Store.show(Page.overview);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/centers.svg");
+            text: "Centers";
+            selected: Store.page == Page.centers;
+            clicked => {
+                Store.show(Page.centers);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/route.svg");
+            text: "Relay";
+            selected: Store.page == Page.relay;
+            clicked => {
+                Store.show(Page.relay);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/shield.svg");
+            text: "Permissions";
+            selected: Store.page == Page.policy;
+            clicked => {
+                Store.show(Page.policy);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/audit.svg");
+            text: "Audit";
+            selected: Store.page == Page.audit;
+            clicked => {
+                Store.show(Page.audit);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/log.svg");
+            text: "Log";
+            selected: Store.page == Page.log;
+            clicked => {
+                Store.show(Page.log);
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+        }
+        NavItem {
+            icon: @image-url("icons/settings.svg");
+            text: "Settings";
+            selected: Store.page == Page.settings;
+            clicked => {
+                Store.show(Page.settings);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/help.svg");
+            text: "Help";
+            selected: Store.page == Page.help;
+            clicked => {
+                Store.show(Page.help);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/info.svg");
+            text: "About";
+            selected: Store.about-open;
+            clicked => {
+                Store.about-open = true;
+            }
+        }
+        Rectangle {
+            height: Space.md;
+        }
+        // The node's state, on every page, in its colour.
+        state := Rectangle {
+            property <Tone> tone: Store.status-load == Load.failed ? Tone.danger : Store.status.tone;
+            border-radius: Radius.md;
+            background: Theme.tone-soft(self.tone);
+            border-width: 1px;
+            border-color: Theme.tone(self.tone).transparentize(0.75);
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 9px;
+                VerticalLayout {
+                    alignment: center;
+                    StatusDot {
+                        tone: state.tone;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+                    Text {
+                        text: Store.status-load == Load.failed ? "No answer"
+                            : Store.status.state == "running" ? "Running"
+                            : Store.status.state == "locked" ? "Locked"
+                            : Store.status.state == "stopped" ? "Not running" : "Asking the node…";
+                        color: Theme.text;
+                        font-size: Type.small;
+                        font-weight: Type.semibold;
+                    }
+                    Text {
+                        // What the node said last is stale once it does
+                        // not answer.
+                        text: Store.status-load == Load.failed ? "State unknown"
+                            : Store.status.state == "" ? "One moment"
+                            : Store.status.centers == 0 ? "No center paired"
+                            : Store.status.state != "running" ? "Not linked"
+                            : Store.status.connected + " of " + Store.status.centers + " centers linked";
+                        color: Theme.text-muted;
+                        font-size: Type.caption;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+        // Light or dark, here at hand rather than in Settings.
+        Rectangle {
+            height: Space.sm;
+        }
+        SchemeSwitch {
+            current: Store.appearance;
+            chosen(i) => {
+                Store.set-appearance(i);
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Nerve";
+    icon: @image-url("icons/app.svg");
+    // The installer is a smaller window than the app. Both fit a screen
+    // of 1280x800 with a panel and the window's title bar; what is longer
+    // scrolls.
+    preferred-width: Install.shown ? 760px : 1180px;
+    preferred-height: 700px;
+    min-width: Install.shown ? 560px : 900px;
+    min-height: Install.shown ? 480px : 580px;
+    background: Theme.window;
+    default-font-size: Type.body;
+
+    // Light or dark for the whole app, the std widgets included; the system's
+    // scheme otherwise.
+    public function set-dark(dark: bool) {
+        Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    public function follow-system() {
+        Palette.color-scheme = ColorScheme.unknown;
+    }
+
+    // A dialog is open: the window's own shortcuts wait, and the focus comes
+    // back to the window when it closes.
+    property <bool> dialog-open: Store.pair-open || Store.confirm-open || Store.about-open
+        || Perm.mode-open || Perm.folder-open || Perm.sudo-open || Prefs.proxy-open
+        || Prefs.once-open || Prefs.relay-edit-open || Prefs.backup-open || Prefs.restore-open
+        || Store.setup-open || Store.elevate-open || Install.update-open || Install.uninstall-open
+        || Store.missing-open || Prefs.relay-add-open || Prefs.connect-open || Install.other-open;
+    changed dialog-open => {
+        if (!self.dialog-open) {
+            keys.focus();
+        }
+    }
+    init => {
+        keys.focus();
+    }
+
+    // The window's shortcuts: Ctrl+1 to Ctrl+8 open the pages in the
+    // sidebar's order, Ctrl+R and F5 read the page again. They come here
+    // from wherever the focus is, unless a field takes the key itself.
+    keys := FocusScope {
+        width: 100%;
+        height: 100%;
+        property <bool> pages: !Install.shown && !root.dialog-open;
+        KeyBinding {
+            keys: @keys(Control + "1");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.overview);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "2");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.centers);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "3");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.relay);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "4");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.policy);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "5");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.audit);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "6");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.log);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "7");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.settings);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "8");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.help);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "r");
+            enabled: keys.pages;
+            activated => {
+                Store.reload();
+            }
+        }
+        KeyBinding {
+            keys: @keys(F5);
+            enabled: keys.pages;
+            activated => {
+                Store.reload();
+            }
+        }
+
+        if Install.shown: InstallerView { }
+
+        if !Install.shown: HorizontalLayout {
+            Sidebar { }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                // On an installed node every page needs the rights the app
+                // asks for; until it has them, this says why and how.
+                Reveal {
+                    shown: Store.elevate-needed;
+                    Rectangle {
+                        background: Theme.window;
+                        VerticalLayout {
+                            padding-left: Space.page;
+                            padding-right: Space.page;
+                            padding-top: Space.lg;
+                            Banner {
+                                tone: Tone.accent;
+                                title: "Administrator rights needed";
+                                text: "You are not an owner of this node.";
+                                action: "Continue…";
+                                acted => {
+                                    Store.elevate-open = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if Store.page == Page.overview: OverviewPage { }
+                if Store.page == Page.centers: CentersPage { }
+                if Store.page == Page.relay: RelayPage { }
+                if Store.page == Page.policy: PermissionsPage { }
+                if Store.page == Page.audit: AuditPage { }
+                if Store.page == Page.log: LogPage { }
+                if Store.page == Page.settings: SettingsPage { }
+                if Store.page == Page.help: HelpPage { }
+            }
+        }
+
+        if Store.pair-open: PairDialog { }
+        if Store.confirm-open: ConfirmDialog { }
+        if Store.about-open: AboutDialog { }
+        if Perm.mode-open: ModeDialog { }
+        if Perm.folder-open: FolderDialog { }
+        if Perm.sudo-open: SudoDialog { }
+        if Prefs.proxy-open: ProxyDialog { }
+        if Prefs.once-open: OnceDialog { }
+        if Prefs.relay-edit-open: RelayNodeDialog { }
+        if Prefs.relay-add-open: RelayAddDialog { }
+        if Prefs.connect-open: ConnectDialog { }
+        if Prefs.backup-open: BackupDialog { }
+        if Prefs.restore-open: RestoreDialog { }
+        if Store.setup-open: SetupDialog { }
+        if Store.elevate-open: ElevateDialog { }
+        if Install.update-open: UpdateDialog { }
+        if Install.uninstall-open: UninstallDialog { }
+        if Store.missing-open: MissingDialog { }
+        if Install.other-open: OtherCopyDialog { }
+    }
+
+    if Store.toast-shown: Toast {
+        text: Store.toast;
+        tone: Store.toast-tone;
+        width: min(440px, root.width - 48px - Size.sidebar);
+        height: self.preferred-height;
+        x: root.width - self.width - 24px;
+        y: root.height - self.height - 24px;
+    }
+    Timer {
+        interval: 5s;
+        running: Store.toast-shown;
+        triggered => {
+            Store.toast-shown = false;
+        }
+    }
+}

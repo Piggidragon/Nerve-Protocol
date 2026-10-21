@@ -92,6 +92,7 @@ model in `checker/` in its state folder ([logging](logging.md),
 | `crates/nerve-policy` | The node's config, the decision engine, rules, protected paths, settings, the audit log |
 | `crates/nerve-sandbox` | Confinement for commands: Landlock on Linux, an AppContainer on Windows |
 | `crates/nerve-node` | The `nerve-node` binary: daemon and CLI |
+| `crates/nerve-node-desktop` | `nerve-node-desktop`, the node with a desktop app in one binary: with arguments it is `nerve-node`, without it opens a window (Slint) that runs `nerve-node --json` for every action; on a node installed as a service through a broker it starts with the rights the desktop gives (pkexec, the UAC prompt). Started from anywhere but its installed place it is its own installer: `install`, `update` and `uninstall` of this program put its parts (menu entry, `nerve://` handler) in place with the node (`nerve_node::edition`), and the service runs it |
 | `crates/nerve-center` | The `nerve-center` binary: links, MCP server, web UI, the action checker (`src/checker/`) |
 | `crates/nerve-conformance` | The conformance suite: center, node and harness parts, an echo node and a fake center |
 

@@ -5,8 +5,9 @@ Pairing links a machine to a center. Do it once per machine and center.
 ## Steps
 
 1. Open the center's web UI (`http://127.0.0.1:7480`). On Overview, press
-   **Pair a machine**. It shows a command, the center's address, a code and a
-   certificate pin.
+   **Pair a machine**. It shows a command and the pairing link, each with a
+   Copy button. With the [desktop app](desktop.md), paste the link there
+   (Centers, **Pair a center**) and skip the command.
 2. On the machine, as a normal user, run the command it shows:
 
    ```sh
@@ -34,9 +35,11 @@ Pairing links a machine to a center. Do it once per machine and center.
    The machine shows as online in the web UI, and the pairing card there
    closes: the code is used up.
 
-The new pairing starts closed: mode `allowlist`, no rule, and the center may
-not change settings. Every call is refused until you allow something
-([modes](modes.md), [rules](rules.md)).
+The new pairing starts closed: mode `allowlist`, no allow rule, and the
+center may not change settings. Every call is refused until you allow
+something ([modes](modes.md), [rules](rules.md)). Its deny list holds the
+guard, which keeps commands off this node itself
+([rules](rules.md#the-guard-against-changing-the-node)).
 
 ## The code
 
@@ -44,6 +47,14 @@ not change settings. Every call is refused until you allow something
   Center (1 to 1440 minutes).
 - It allows 10 tries in all. After that make a new one.
 - A wrong code counts against every open code.
+
+Before it asks you, `center add` checks the link: the center answers (through
+your proxy or relay, if you use one), its certificate is the one the link
+pins, and the code is still valid. If one of these fails, it says why and asks
+nothing: make a new link, or fix the way to the center. The check uses
+nothing up and counts no try. A center that gets many checks with wrong codes
+stops saying whether a code is valid for a while; `center add` then asks all
+the same.
 
 ## Options of `center add`
 

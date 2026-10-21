@@ -307,6 +307,7 @@ pub fn descends_from(pid: u32, ancestor: u32) -> bool {
 
 #[cfg(unix)]
 mod unix {
+    use std::os::fd::OwnedFd;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -356,19 +357,216 @@ mod unix {
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Reply> + Send + 'static,
     {
-        serve_limited(listener, handler, IDLE, MAX_CONNECTIONS).await
+        serve_limited(
+            listener,
+            move |req, peer, _files| handler(req, peer),
+            IDLE,
+            MAX_CONNECTIONS,
+            false,
+        )
+        .await
+    }
+
+    /// [`serve_on`] for a socket any account may reach ([`bind_open`]): the
+    /// handler gets every caller and decides by its [`Peer`] itself. It
+    /// also gets the open files the caller sent with its request
+    /// ([`send_files`]): an owner's own backup file, which the node must
+    /// not open by its path.
+    pub async fn serve_anyone<F, Fut>(listener: UnixListener, handler: F) -> std::io::Result<()>
+    where
+        F: Fn(CtlRequest, Peer, Vec<OwnedFd>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Reply> + Send + 'static,
+    {
+        serve_limited(listener, handler, IDLE, MAX_CONNECTIONS, true).await
+    }
+
+    /// The most files a request may come with; more are closed.
+    const MAX_FILES: usize = 4;
+
+    /// The first bytes of a connection and the files that came with them
+    /// (SCM_RIGHTS), read before the request line is: the kernel gives the
+    /// files only with the bytes they were sent with. `None` when the
+    /// connection ended first.
+    async fn first_with_files(
+        stream: &UnixStream,
+    ) -> std::io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let fd = stream.as_raw_fd();
+        loop {
+            stream.readable().await?;
+            let r = stream.try_io(tokio::io::Interest::READABLE, || {
+                let mut buf = vec![0u8; 64 * 1024];
+                // SAFETY: CMSG_SPACE is a size computation.
+                let space =
+                    unsafe { libc::CMSG_SPACE((MAX_FILES * std::mem::size_of::<i32>()) as u32) };
+                let mut control = vec![0u8; space as usize];
+                let mut iov = libc::iovec {
+                    iov_base: buf.as_mut_ptr().cast(),
+                    iov_len: buf.len(),
+                };
+                // SAFETY: msghdr is plain data; every pointer in it is to a
+                // buffer that lives across the call, with its length.
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control.as_mut_ptr().cast();
+                msg.msg_controllen = control.len() as _;
+                // SAFETY: a recvmsg into the buffers above.
+                let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+                if n < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut files = Vec::new();
+                // SAFETY: the kernel filled `control` up to msg_controllen;
+                // the CMSG macros walk only that, and each descriptor in a
+                // SCM_RIGHTS message is open and now this process's.
+                unsafe {
+                    let mut c = libc::CMSG_FIRSTHDR(&msg);
+                    while !c.is_null() {
+                        if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS
+                        {
+                            let data = libc::CMSG_DATA(c).cast::<i32>();
+                            let len = (*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                            for i in 0..len / std::mem::size_of::<i32>() {
+                                let raw = std::ptr::read_unaligned(data.add(i));
+                                files.push(OwnedFd::from_raw_fd(raw));
+                            }
+                        }
+                        c = libc::CMSG_NXTHDR(&msg, c);
+                    }
+                }
+                buf.truncate(n as usize);
+                Ok((buf, files))
+            });
+            match r {
+                Ok((bytes, _)) if bytes.is_empty() => return Ok(None),
+                Ok(got) => return Ok(Some(got)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Sends `line` on `stream` with `files` attached (SCM_RIGHTS), for
+    /// [`serve_anyone`]: the files go with its first bytes, the rest of the
+    /// line after them.
+    pub async fn send_files(
+        stream: &mut UnixStream,
+        line: &[u8],
+        files: &[std::os::fd::BorrowedFd<'_>],
+    ) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use tokio::io::AsyncWriteExt;
+        if files.len() > MAX_FILES || line.is_empty() {
+            return Err(std::io::Error::other("too many files, or no request"));
+        }
+        let fd = stream.as_raw_fd();
+        let raw: Vec<i32> = files.iter().map(|f| f.as_raw_fd()).collect();
+        let sent = loop {
+            stream.writable().await?;
+            let r = stream.try_io(tokio::io::Interest::WRITABLE, || {
+                let bytes = std::mem::size_of_val(raw.as_slice()) as u32;
+                // SAFETY: CMSG_SPACE is a size computation.
+                let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(bytes) } as usize];
+                let mut iov = libc::iovec {
+                    iov_base: line.as_ptr() as *mut _,
+                    iov_len: line.len(),
+                };
+                // SAFETY: as in first_with_files: plain data pointing at
+                // buffers that live across the call; the one control message
+                // is written within `control`.
+                let n = unsafe {
+                    let mut msg: libc::msghdr = std::mem::zeroed();
+                    msg.msg_iov = &mut iov;
+                    msg.msg_iovlen = 1;
+                    msg.msg_control = control.as_mut_ptr().cast();
+                    msg.msg_controllen = control.len() as _;
+                    let c = libc::CMSG_FIRSTHDR(&msg);
+                    (*c).cmsg_level = libc::SOL_SOCKET;
+                    (*c).cmsg_type = libc::SCM_RIGHTS;
+                    (*c).cmsg_len = libc::CMSG_LEN(bytes) as _;
+                    std::ptr::copy_nonoverlapping(
+                        raw.as_ptr(),
+                        libc::CMSG_DATA(c).cast::<i32>(),
+                        raw.len(),
+                    );
+                    libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL)
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            });
+            match r {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        stream.write_all(&line[sent..]).await
+    }
+
+    /// A connection whose first bytes were read already: they come first.
+    struct Prefixed {
+        first: std::io::Cursor<Vec<u8>>,
+        stream: UnixStream,
+    }
+
+    impl tokio::io::AsyncRead for Prefixed {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let pos = self.first.position() as usize;
+            let left = self.first.get_ref().len() - pos;
+            if left > 0 {
+                let n = left.min(buf.remaining());
+                buf.put_slice(&self.first.get_ref()[pos..pos + n]);
+                self.first.set_position((pos + n) as u64);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Prefixed {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
     }
 
     /// [`serve_on`], with `idle` as the time a connection may wait for its
-    /// request and `max` connections served at once.
+    /// request and `max` connections served at once; with `anyone`, a caller
+    /// of any account is served.
     async fn serve_limited<F, Fut>(
         listener: UnixListener,
         handler: F,
         idle: std::time::Duration,
         max: usize,
+        anyone: bool,
     ) -> std::io::Result<()>
     where
-        F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
+        F: Fn(CtlRequest, Peer, Vec<OwnedFd>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Reply> + Send + 'static,
     {
         let handler = Arc::new(handler);
@@ -410,10 +608,27 @@ mod unix {
                     },
                     Err(_) => return,
                 };
-                if peer.uid != me && peer.uid != 0 {
+                if !anyone && peer.uid != me && peer.uid != 0 {
                     return;
                 }
-                let _ = serve_stream_within(stream, peer, handler, idle).await;
+                let handler = Arc::new(move |req, (peer, files): (Peer, Vec<OwnedFd>)| {
+                    handler(req, peer, files)
+                });
+                if !anyone {
+                    let _ = serve_stream_within(stream, (peer, Vec::new()), handler, idle).await;
+                    return;
+                }
+                // Only the open socket takes files: its callers are other
+                // accounts, who hand over what they opened themselves.
+                let first = tokio::time::timeout(idle, first_with_files(&stream)).await;
+                let Ok(Ok(Some((first, files)))) = first else {
+                    return;
+                };
+                let stream = Prefixed {
+                    first: std::io::Cursor::new(first),
+                    stream,
+                };
+                let _ = serve_stream_within(stream, (peer, files), handler, idle).await;
             });
         }
     }
@@ -451,6 +666,26 @@ mod unix {
         let listener = UnixListener::bind(path)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(listener)
+    }
+
+    /// Binds `path` for every account, mode 0666, in a folder that is there
+    /// already: a socket whose server checks each caller itself
+    /// ([`serve_anyone`]). A stale socket file is replaced; a live one is an
+    /// error.
+    pub async fn bind_open(path: &Path) -> std::io::Result<UnixListener> {
+        if path.exists() {
+            if UnixStream::connect(path).await.is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("{} is in use: is the node running already?", path.display()),
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        let listener = UnixListener::bind(path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
         Ok(listener)
     }
 
@@ -582,6 +817,60 @@ mod unix {
         use super::*;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::sync::mpsc;
+
+        /// A file sent with the request on the open socket reaches the
+        /// handler, open, and only there: the line still reads whole, a
+        /// long one too, and a request without files gets none.
+        #[tokio::test]
+        async fn the_open_socket_hands_over_the_files_sent_with_a_request() {
+            use std::io::{Read, Seek, Write};
+            use std::os::fd::AsFd;
+            let d = tempfile::tempdir().unwrap();
+            let at = d.path().join("owner.sock");
+            let listener = bind_open(&at).await.unwrap();
+            tokio::spawn(serve_anyone(
+                listener,
+                |req: CtlRequest, _peer: Peer, files: Vec<OwnedFd>| async move {
+                    let mut said = Vec::new();
+                    for f in files {
+                        let mut f = std::fs::File::from(f);
+                        let mut s = String::new();
+                        f.rewind().unwrap();
+                        f.read_to_string(&mut s).unwrap();
+                        said.push(s);
+                    }
+                    Reply::Ok(
+                        json!({"files": said, "len": req.params["pad"].as_str().map(str::len)}),
+                    )
+                },
+            ));
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(b"backup bytes").unwrap();
+            for (pad, with) in [(10, true), (200_000, true), (10, false)] {
+                let mut s = UnixStream::connect(&at).await.unwrap();
+                let line = format!(
+                    "{}\n",
+                    json!({"method": "x", "params": {"pad": "p".repeat(pad)}})
+                );
+                if with {
+                    send_files(&mut s, line.as_bytes(), &[file.as_fd()])
+                        .await
+                        .unwrap();
+                } else {
+                    s.write_all(line.as_bytes()).await.unwrap();
+                }
+                let mut answer = String::new();
+                s.read_to_string(&mut answer).await.unwrap();
+                let v: Value = serde_json::from_str(&answer).unwrap();
+                let want: Vec<&str> = if with {
+                    vec!["backup bytes"]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(v["ok"]["files"], json!(want), "{answer}");
+                assert_eq!(v["ok"]["len"], pad, "{answer}");
+            }
+        }
 
         /// A session on a real socket does not wedge when the node writes a
         /// line larger than the socket's buffer while the client writes one
@@ -782,9 +1071,10 @@ mod unix {
             let listener = bind(&p).await.unwrap();
             tokio::spawn(serve_limited(
                 listener,
-                |_, _| async { Reply::Ok(json!("up")) },
+                |_, _, _| async { Reply::Ok(json!("up")) },
                 std::time::Duration::from_millis(200),
                 MAX_CONNECTIONS,
+                false,
             ));
             let mut idle = UnixStream::connect(&p).await.unwrap();
             let mut byte = [0u8; 1];
@@ -805,9 +1095,10 @@ mod unix {
             let listener = bind(&p).await.unwrap();
             tokio::spawn(serve_limited(
                 listener,
-                |_, _| async { Reply::Ok(json!("up")) },
+                |_, _, _| async { Reply::Ok(json!("up")) },
                 std::time::Duration::from_secs(30),
                 2,
+                false,
             ));
             // Two places held without a word; a call over them is told the
             // node is busy, with the request written or not.
@@ -1068,8 +1359,8 @@ mod unix {
 
 #[cfg(unix)]
 pub use unix::{
-    CANNOT_CONNECT, NO_ANSWER, bind, call, follow, node_is_there, request_line, serve, serve_on,
-    token_ok, write_token,
+    CANNOT_CONNECT, NO_ANSWER, bind, bind_open, call, follow, node_is_there, request_line,
+    send_files, serve, serve_anyone, serve_on, token_ok, write_token,
 };
 
 #[cfg(test)]

@@ -1,0 +1,679 @@
+// Permissions: what one center may do on this machine. Its mode, its
+// folders, its command rules, its capability switches, and the sudo switch
+// of the machine. Each change runs one `nerve-node` command.
+
+import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
+import { Load, FolderRow, CapRow } from "data.slint";
+import { Store, Perm } from "store.slint";
+import {
+    Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Divider, IconTile,
+    Segmented, Picker, SectionTitle, OptionTile, Chip, ListRow, TextField, Switch, Icon, Code, Reveal,
+    PathText, ScrollBox,
+} from "widgets.slint";
+
+// A part of the page: its icon in its colour, its title, a line on it,
+// and its rows.
+component Section inherits Card {
+    in property <image> icon;
+    in property <Tone> tone: Tone.accent;
+    in property <string> title;
+    in property <string> text;
+    pad: 0;
+    gap: 0;
+    HorizontalLayout {
+        padding-left: Space.xl;
+        padding-right: Space.xl;
+        padding-top: Space.lg + 2px;
+        padding-bottom: Space.md;
+        spacing: Space.md;
+        VerticalLayout {
+            alignment: start;
+            IconTile {
+                icon: root.icon;
+                tone: root.tone;
+                size: 32px;
+            }
+        }
+        VerticalLayout {
+            spacing: 2px;
+            horizontal-stretch: 1;
+            alignment: center;
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: Type.heading;
+                font-weight: Type.semibold;
+            }
+            Text {
+                text: root.text;
+                color: Theme.text-muted;
+                font-size: Type.small;
+                wrap: word-wrap;
+            }
+        }
+    }
+    @children
+}
+
+component ModeSection inherits Section {
+    icon: @image-url("icons/sliders.svg");
+    title: "Mode";
+    text: "How much " + Perm.center + " may do. Deny rules count in every mode.";
+    HorizontalLayout {
+        padding-left: Space.xl;
+        padding-right: Space.xl;
+        padding-bottom: Space.lg;
+        spacing: Space.md;
+        OptionTile {
+            icon: @image-url("icons/shield.svg");
+            title: "Allowlist";
+            text: "Only what an allow rule names.";
+            selected: Perm.mode == "allowlist";
+            badge: Perm.mode == "allowlist" ? "Now" : "";
+            clicked => {
+                Perm.mode-pick("allowlist");
+            }
+        }
+        OptionTile {
+            icon: @image-url("icons/folder.svg");
+            title: "Folder";
+            text: "What each folder below allows.";
+            selected: Perm.mode == "folder";
+            badge: Perm.mode == "folder" ? "Now" : "";
+            clicked => {
+                Perm.mode-pick("folder");
+            }
+        }
+        OptionTile {
+            icon: @image-url("icons/key.svg");
+            title: "User";
+            text: "Anything you may do, protected files aside.";
+            selected: Perm.mode == "user";
+            badge: Perm.mode == "user" ? "Now" : "";
+            clicked => {
+                Perm.mode-pick("user");
+            }
+        }
+    }
+    Reveal {
+        shown: Perm.mode-until != "";
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.lg;
+            Banner {
+                tone: Tone.accent;
+                text: Perm.mode-until;
+            }
+        }
+    }
+}
+
+component FolderSection inherits Section {
+    icon: @image-url("icons/folder.svg");
+    title: "Folders";
+    text: "What " + Perm.center + " may do in each, in folder mode.";
+    Reveal {
+        shown: Perm.mode != "folder" && Perm.folders.length > 0;
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.md;
+            Banner {
+                tone: Tone.neutral;
+                text: "Folders count in folder mode only.";
+            }
+        }
+    }
+    ScrollBox {
+        rows: Perm.folders.length;
+        for f[i] in Perm.folders: ListRow {
+            first: i == 0;
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    source: @image-url("icons/folder.svg");
+                    colorize: Theme.text-muted;
+                }
+            }
+            // A deep folder keeps its own name in sight.
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                PathText {
+                    text: f.path;
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                alignment: center;
+                Chip {
+                    text: "Read";
+                    label: "Read " + f.path;
+                    on: f.read;
+                    toggled(on) => {
+                        Perm.folder-set(f.path, on, f.write, f.execute);
+                    }
+                }
+                Chip {
+                    text: "Write";
+                    label: "Write " + f.path;
+                    on: f.write;
+                    toggled(on) => {
+                        Perm.folder-set(f.path, f.read, on, f.execute);
+                    }
+                }
+                Chip {
+                    text: "Run";
+                    label: "Run commands in " + f.path;
+                    on: f.execute;
+                    toggled(on) => {
+                        Perm.folder-set(f.path, f.read, f.write, on);
+                    }
+                }
+            }
+            Button {
+                icon: @image-url("icons/trash.svg");
+                kind: ButtonKind.ghost;
+                small: true;
+                accessible-label: "Remove " + f.path;
+                clicked => {
+                    Perm.folder-remove(f.path);
+                }
+            }
+        }
+    }
+    VerticalLayout {
+        if Perm.folders.length > 0: Divider { }
+        HorizontalLayout {
+            padding: Space.lg;
+            padding-left: Space.xl;
+            spacing: Space.md;
+            if Perm.folders.length == 0: Text {
+                text: "No folder yet.";
+                color: Theme.text-muted;
+                font-size: Type.small;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: "Add a folder…";
+                icon: @image-url("icons/plus.svg");
+                small: true;
+                clicked => {
+                    Perm.folder-choose();
+                }
+            }
+        }
+    }
+}
+
+// The rules of one list (0 allow, 1 deny, 2 sudo): each one to edit in
+// place or remove, and a field for a new one. The field's text and its
+// Wildcard switch are the list's own (Perm).
+component RuleList {
+    in property <int> list;
+    in property <[string]> rules;
+    in property <string> placeholder;
+    in-out property <string> new-text;
+    in-out property <bool> new-wild;
+    VerticalLayout {
+        ScrollBox {
+            rows: root.rules.length;
+            for r[i] in root.rules: ListRow {
+                first: i == 0;
+                property <bool> editing: Perm.edit-list == root.list && Perm.edit-index == i;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Reveal {
+                        shown: !editing;
+                        Text {
+                            text: r;
+                            color: Theme.text;
+                            font-size: Type.small;
+                            font-family: Type.mono;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                    Reveal {
+                        shown: editing;
+                        TextField {
+                            text <=> Perm.edit-text;
+                            mono: true;
+                            label: "Rule";
+                            enabled: !Perm.edit-busy;
+                            accepted => {
+                                Perm.rule-edit-save();
+                            }
+                        }
+                    }
+                }
+                if !editing: Button {
+                    icon: @image-url("icons/edit.svg");
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    accessible-label: "Edit " + r;
+                    clicked => {
+                        Perm.edit-text = r;
+                        Perm.edit-index = i;
+                        Perm.edit-list = root.list;
+                    }
+                }
+                if !editing: Button {
+                    icon: @image-url("icons/x.svg");
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    accessible-label: "Remove " + r;
+                    clicked => {
+                        Perm.rule-remove(root.list, r);
+                    }
+                }
+                if editing: Button {
+                    text: "Cancel";
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    clicked => {
+                        Perm.edit-list = -1;
+                    }
+                }
+                if editing: Button {
+                    text: "Save";
+                    kind: ButtonKind.primary;
+                    small: true;
+                    busy: Perm.edit-busy;
+                    enabled: Perm.edit-text != "" && Perm.edit-text != r;
+                    clicked => {
+                        Perm.rule-edit-save();
+                    }
+                }
+            }
+        }
+        if root.rules.length > 0: Divider { }
+        HorizontalLayout {
+            padding: Space.lg;
+            padding-left: Space.xl;
+            spacing: Space.md;
+            TextField {
+                horizontal-stretch: 1;
+                text <=> root.new-text;
+                mono: true;
+                label: "New rule";
+                placeholder: root.placeholder;
+                accepted => {
+                    Perm.rule-add(root.list);
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    Switch {
+                        checked: root.new-wild;
+                        label: "Wildcard";
+                        toggled(on) => {
+                            root.new-wild = on;
+                        }
+                    }
+                    Text {
+                        text: "Wildcard";
+                        color: Theme.text-muted;
+                        font-size: Type.small;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            Button {
+                text: "Add";
+                icon: @image-url("icons/plus.svg");
+                kind: ButtonKind.primary;
+                enabled: root.new-text != "";
+                clicked => {
+                    Perm.rule-add(root.list);
+                }
+            }
+        }
+    }
+}
+
+// The command rules that count in the center's mode: in allowlist mode the
+// allow list, with the deny rules as its exceptions below, closed; in
+// folder and user mode the deny list, and a line on the allow rules, which
+// count there not at all.
+component RuleSection inherits Section {
+    property <bool> allowlist: Perm.mode == "allowlist";
+    icon: root.allowlist ? @image-url("icons/check.svg") : @image-url("icons/ban.svg");
+    tone: root.allowlist ? Tone.ok : Tone.danger;
+    title: root.allowlist ? "Allowed commands" : "Forbidden commands";
+    text: root.allowlist ? "Only a command an allow rule names may run."
+        : "A command a deny rule names never runs, in any mode.";
+    Reveal {
+        shown: root.allowlist;
+        RuleList {
+            list: 0;
+            rules: Perm.allow;
+            placeholder: "git status";
+            new-text <=> Perm.allow-text;
+            new-wild <=> Perm.allow-wild;
+        }
+    }
+    Reveal {
+        shown: !root.allowlist;
+        RuleList {
+            list: 1;
+            rules: Perm.deny;
+            placeholder: "git push --force";
+            new-text <=> Perm.deny-text;
+            new-wild <=> Perm.deny-wild;
+        }
+    }
+    // Allowlist mode: the deny rules, as exceptions, behind their head.
+    Reveal {
+        shown: root.allowlist;
+        VerticalLayout {
+            Divider { }
+            Rectangle {
+                accessible-role: button;
+                accessible-label: "Exceptions";
+                accessible-expandable: true;
+                accessible-expanded: Perm.except-open;
+                accessible-action-default => {
+                    Perm.except-open = !Perm.except-open;
+                }
+                HorizontalLayout {
+                    padding-left: Space.xl;
+                    padding-right: Space.lg;
+                    padding-top: Space.md;
+                    padding-bottom: Space.md;
+                    spacing: Space.sm;
+                    VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            source: Perm.except-open ? @image-url("icons/chev.svg") : @image-url("icons/chev-right.svg");
+                            colorize: Theme.text-muted;
+                        }
+                    }
+                    Text {
+                        text: "Exceptions: deny rules (" + Perm.deny.length + ")";
+                        color: Theme.text;
+                        font-size: Type.small;
+                        font-weight: Type.semibold;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Never run, even when an allow rule names them.";
+                        color: Theme.text-muted;
+                        font-size: Type.small;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        Perm.except-open = !Perm.except-open;
+                    }
+                }
+            }
+            // On a tint of their own, so they do not read as allow rules.
+            // Inside the card's line, its foot rounded as the card is.
+            Reveal {
+                shown: Perm.except-open;
+                VerticalLayout {
+                    padding-left: 1px;
+                    padding-right: 1px;
+                    padding-bottom: 1px;
+                    Rectangle {
+                        background: Theme.surface-alt;
+                        border-bottom-left-radius: Radius.lg - 1px;
+                        border-bottom-right-radius: Radius.lg - 1px;
+                        VerticalLayout {
+                            Divider { }
+                            RuleList {
+                                list: 1;
+                                rules: Perm.deny;
+                                placeholder: "git push --force";
+                                new-text <=> Perm.deny-text;
+                                new-wild <=> Perm.deny-wild;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Folder and user mode: the allow rules wait for allowlist mode.
+    Reveal {
+        shown: !root.allowlist && Perm.allow.length > 0;
+        VerticalLayout {
+            Divider { }
+            HorizontalLayout {
+                padding-left: Space.xl;
+                padding-right: Space.lg;
+                padding-top: Space.md;
+                padding-bottom: Space.md;
+                spacing: Space.sm;
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: @image-url("icons/info.svg");
+                        colorize: Theme.text-muted;
+                    }
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: "Allow rules count only in allowlist mode (" + Perm.allow.length + " kept).";
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}
+
+component CapSection inherits Section {
+    icon: @image-url("icons/plug.svg");
+    title: "Capabilities";
+    text: "Off: " + Perm.center + " may not use it. Hidden: it does not see it.";
+    ScrollBox {
+        rows: Perm.caps.length;
+        for c[i] in Perm.caps: ListRow {
+            first: i == 0;
+            HorizontalLayout {
+                horizontal-stretch: 1;
+                padding-left: c.action ? Space.xl : 0;
+                spacing: Space.sm;
+                Text {
+                    text: c.name;
+                    color: c.action ? Theme.text-muted : Theme.text;
+                    font-size: Type.small;
+                    font-weight: c.action ? Type.regular : Type.semibold;
+                    font-family: Type.mono;
+                    vertical-alignment: center;
+                }
+                if c.set: VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    Pill {
+                        text: "set here";
+                        tone: Tone.neutral;
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+            }
+            Segmented {
+                options: ["On", "Off", "Hidden"];
+                current: c.setting;
+                chosen(s) => {
+                    Perm.cap-set(c.name, s);
+                }
+            }
+        }
+    }
+}
+
+// Sudo: the machine's switch, and the center's sudo list, which counts
+// while sudo is on.
+component SudoSection inherits Section {
+    icon: @image-url("icons/key.svg");
+    tone: Perm.sudo-on ? Tone.warn : Tone.accent;
+    title: "Sudo";
+    text: Perm.sudo-on ? "On, for every center: the commands of " + Perm.center + "'s sudo list below run with sudo."
+        : "Off: nothing runs with sudo. Its list waits below.";
+    HorizontalLayout {
+        padding-left: Space.xl;
+        padding-right: Space.xl;
+        padding-bottom: Space.lg;
+        spacing: Space.md;
+        VerticalLayout {
+            alignment: center;
+            Pill {
+                text: Perm.sudo-on ? "On" : "Off";
+                tone: Perm.sudo-on ? Tone.warn : Tone.neutral;
+                dot: true;
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+        if !Perm.sudo-on: Button {
+            text: "Turn on…";
+            icon: @image-url("icons/key.svg");
+            small: true;
+            clicked => {
+                Perm.sudo-ask();
+            }
+        }
+        if Perm.sudo-on: Button {
+            text: "Turn off";
+            small: true;
+            clicked => {
+                Perm.sudo-off();
+            }
+        }
+    }
+    Divider { }
+    RuleList {
+        list: 2;
+        rules: Perm.sudo-list;
+        placeholder: "sudo apt update";
+        new-text <=> Perm.sudo-text;
+        new-wild <=> Perm.sudo-wild;
+    }
+}
+
+export component PermissionsPage inherits PageFrame {
+    gap: 0;
+    PageHeader {
+        icon: @image-url("icons/shield.svg");
+        title: "Permissions";
+        error-title: "What " + Perm.center + " may do could not be read";
+        error: Perm.error;
+        error-action: "Try again";
+        error-acted => {
+            Perm.refresh();
+        }
+        Button {
+            text: "Refresh";
+            icon: @image-url("icons/refresh.svg");
+            kind: ButtonKind.ghost;
+            clicked => {
+                Store.reload();
+            }
+        }
+    }
+
+    Reveal {
+        shown: Store.status.state != "" && Perm.centers.length == 0;
+        gap: Space.xxl;
+        Card {
+            EmptyState {
+                icon: @image-url("icons/shield.svg");
+                title: "No center paired yet";
+                text: "Pair a center, then choose here what it may do.";
+                Button {
+                    text: "Pair a center";
+                    icon: @image-url("icons/plus.svg");
+                    kind: ButtonKind.primary;
+                    clicked => {
+                        Store.pair-start();
+                    }
+                }
+            }
+        }
+    }
+
+    Reveal {
+        shown: Perm.centers.length > 1;
+        gap: Space.xxl;
+        HorizontalLayout {
+            alignment: start;
+            spacing: Space.md;
+            Text {
+                text: "Center";
+                color: Theme.text-muted;
+                font-size: Type.small;
+                vertical-alignment: center;
+            }
+            // A few centers side by side; more in a list, which names each
+            // in full instead of squeezing them all.
+            if Perm.centers.length <= 4: Segmented {
+                options: Perm.centers;
+                current: Perm.current;
+                chosen(i) => {
+                    Perm.pick(i);
+                }
+            }
+            if Perm.centers.length > 4: Picker {
+                options: Perm.centers;
+                current: Perm.current;
+                label: "Center";
+                chosen(i) => {
+                    Perm.pick(i);
+                }
+            }
+        }
+    }
+
+    if Perm.centers.length > 0 && Perm.load == Load.loading && Perm.caps.length == 0: Loading { }
+
+    Reveal {
+        shown: Perm.centers.length > 0 && Perm.caps.length > 0;
+        gap: Space.xxl;
+        VerticalLayout {
+            // A pairing from before the guard, or one whose guard rules were
+            // removed: one click puts them back.
+            Reveal {
+                shown: Perm.guard-missing;
+                VerticalLayout {
+                    padding-bottom: Space.xxl;
+                    Banner {
+                        tone: Tone.warn;
+                        title: "No guard against changing this node";
+                        text: "Deny rules that keep " + Perm.center + "'s commands off Nerve itself. They catch mistakes; an account of their own for commands is the real protection.";
+                        action: Perm.guard-busy ? "" : "Add the guard";
+                        acted => {
+                            Perm.guard-add();
+                        }
+                    }
+                }
+            }
+          VerticalLayout {
+            spacing: Space.xxl;
+            ModeSection { }
+            FolderSection { }
+            RuleSection { }
+            CapSection { }
+            SudoSection { }
+          }
+        }
+    }
+}

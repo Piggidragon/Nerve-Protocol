@@ -147,6 +147,20 @@ async fn audit_shows(paths: &NodePaths, text: &str) -> bool {
     false
 }
 
+/// Waits until the rotation to `new` is settled: the node keeps the new key
+/// first and deletes the copy aside after, so a test that saw the first may
+/// be early for the second.
+async fn settled(paths: &NodePaths, new: &str) {
+    for _ in 0..200 {
+        if key(paths).public_hex() == new && !paths.next_key_file("lab").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(key(paths).public_hex(), new);
+    assert!(!paths.next_key_file("lab").exists());
+}
+
 fn audit(paths: &NodePaths) -> String {
     std::fs::read_to_string(paths.audit_log()).unwrap_or_default()
 }
@@ -317,14 +331,7 @@ async fn an_unanswered_rotation_is_sent_again_on_the_next_link() {
     conn.notify(method::KEY_ROTATED, json!({"public_key": new}))
         .await
         .unwrap();
-    for _ in 0..200 {
-        if key(&paths).public_hex() == new {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(key(&paths).public_hex(), new);
-    assert!(!paths.next_key_file("lab").exists());
+    settled(&paths, &new).await;
     drop(daemon);
 }
 
@@ -350,14 +357,7 @@ async fn a_late_answer_settles_the_rotation() {
     conn.notify(method::KEY_ROTATED, json!({"public_key": new}))
         .await
         .unwrap();
-    for _ in 0..200 {
-        if key(&paths).public_hex() == new {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(key(&paths).public_hex(), new);
-    assert!(!paths.next_key_file("lab").exists());
+    settled(&paths, &new).await;
     assert!(audit(&paths).contains("\"event\":\"node-key\""));
     drop(daemon);
 }
@@ -397,14 +397,7 @@ async fn a_refused_hello_is_tried_with_the_new_key_kept_aside() {
     drop(inc);
     // The next hello is signed with the new key, under the same node id.
     let _conn = link(&mut center, &new, Some(ROTATE)).await;
-    for _ in 0..200 {
-        if key(&paths).public_hex() == new {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(key(&paths).public_hex(), new);
-    assert!(!paths.next_key_file("lab").exists());
+    settled(&paths, &new).await;
     drop(daemon);
 }
 

@@ -1,7 +1,11 @@
 # Linux and Windows
 
-Both programs run on Linux (x86_64, aarch64) and Windows (x86_64). The node
-behaves the same except where this page says so.
+The center and the node run on Linux (x86_64, aarch64) and Windows (x86_64),
+the [desktop app](desktop.md) (`nerve-node-desktop`, the node with an app) on
+Linux x86_64 and Windows x86_64. The node behaves the same except where this
+page says so. The Linux programs are static and run on any distribution; the
+desktop app is not, and needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
+Fedora 36 and later) and fontconfig.
 
 | | Linux | Windows |
 |---|---|---|
@@ -29,12 +33,13 @@ behaves the same except where this page says so.
 - A `folder` mode command cannot read or change the node's settings through
   its control socket: the node answers only programs that can read its token
   in the state folder, which the mode's sandbox keeps from a command. This
-  holds as far as the sandbox does. While the commands run as the node's own
-  user, `folder` mode is no boundary against that user's other programs. A
-  command can ask any of them that runs commands for whoever connects to its
-  socket to run a program outside the sandbox: the user's systemd and D-Bus
-  session (`systemd-run --user`), a tmux or screen server, and others. Such a
-  program is the user's own process and reads the node's files and token.
+  holds as far as the sandbox does, and the sandbox holds the command's own
+  processes only. While the commands run as the node's own user or as an
+  owner, `folder` mode is no boundary against that user's other programs:
+  one that runs things on request runs what the command asks outside the
+  sandbox, as the user's own process, which reads the node's files and
+  token. That is the owner's to answer for; a separate account (below) is
+  the boundary.
 - A command of `allowlist` or `user` mode has no sandbox, so it can read the
   token and the node's files as the account it runs as can. The node refuses
   its requests only from processes that stay below the command, and a command

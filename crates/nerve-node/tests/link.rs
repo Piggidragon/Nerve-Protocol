@@ -710,6 +710,45 @@ async fn run_in(conn: &mut Conn<TcpStream>, cwd: &Path, command: &str) -> Value 
     .expect("the command runs")
 }
 
+/// A new pairing comes with the guard's deny rules: in user mode, which
+/// allows every command, one that drives the node itself is refused, and
+/// others run (owner's decision of 2026-10-20).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_pairing_refuses_commands_that_drive_the_node_itself() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        assert_eq!(p.deny, nerve_policy::rules::GUARD.to_vec());
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+    let home = dir.path().join("home");
+    let r = run_in(&mut conn, &home, "echo fine").await;
+    assert_eq!(r["exit_code"], 0, "{r}");
+    for command in [
+        "nerve-node config set machine.user root",
+        "cat /etc/nerve/node.toml",
+    ] {
+        let r = conn
+            .call(
+                "invoke",
+                json!({"cap": "exec", "action": "run",
+                       "args": {"command": command, "cwd": home.display().to_string()}}),
+                WAIT,
+            )
+            .await
+            .unwrap();
+        let e = r.expect_err(command);
+        assert!(
+            e.to_string().contains("is denied (exec.run:"),
+            "{command}: {e}"
+        );
+    }
+    node.stop().await;
+}
+
 /// A command with `w` on a folder replaces a folder inside it, one with
 /// rights of its own, by a link to a place no folder names (issue #74). The
 /// next command's rules must not grant the nested folder's rights there:

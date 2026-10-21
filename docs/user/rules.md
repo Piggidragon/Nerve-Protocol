@@ -34,14 +34,47 @@ A deny rule matches the whole command line. It does not see `rm` inside
 files. In `folder` and `user` mode it guards against mistakes. It is not a
 sandbox.
 
-## List and remove rules
+## The guard against changing the node
+
+Every new pairing starts with deny rules that keep its commands off this
+node itself: a command that runs `nerve-node` or `nerve-node-desktop` (at
+the start of a command, after `sudo`, or by a path, `.exe` too), a command
+line that names the node's socket or pipes or its config and state folders
+(`/etc/nerve`, `/var/lib/nerve`, `~/.config/nerve`, `~/.local/state/nerve`,
+`%ProgramData%\Nerve`), and a write into those folders. The name alone is
+not refused: `cargo build -p nerve-node` and `journalctl -u nerve-node` run.
+`rule ls deny` shows them; remove any you do not want.
+
+```sh
+nerve-node rule guard --center lab   # puts back the ones a pairing lacks
+```
+
+A pairing made before the guard has none: `rule guard` adds them, and the
+desktop app offers it on **Permissions**.
+
+The guard catches an agent's mistakes, such as an agent that tries to give
+itself more rights. It does not stop a command written to get around it (a
+name built at run time, a copy of the program). The real protection is that
+commands run as an account of their own, which may not change the node
+([service](service.md)), and the node's own folders, which no rule or mode
+opens ([protected paths](protected-paths.md)).
+
+## List, change and remove rules
 
 ```sh
 nerve-node rule ls            # all three lists
 nerve-node rule ls allow
+nerve-node rule edit allow 'exec.run:git status' 'git status --short'
 nerve-node rule rm allow 'git status'
 nerve-node rule rm allow 'git status' --wildcard
 ```
+
+`rule edit` changes one entry in its place, as one change in the audit: the
+entry as `rule ls` prints it, then what it becomes. That is an entry in the
+same form (`'exec.run:git *'`, `'fs.read:~/notes/*'`), or a plain command
+line, which becomes the rule `rule add` makes of it. It works on every list,
+and on the rules of the guard too. The desktop app's Permissions page edits a
+rule the same way (the pencil beside it).
 
 `rule rm` takes the same arguments as `rule add`. It also takes an entry as
 `rule ls` prints it, such as `'exec.run:git *'`. When the arguments could mean two entries on the list, `rule rm`
@@ -64,6 +97,15 @@ nerve-node config add center.lab.policy.deny  'fs:~/private/*'
 
 The web UI's [Audit](web-ui.md#audit) page writes the same rules with four
 buttons. That needs the [settings grant](settings-grant.md).
+
+`--action` makes the rule such a button makes for an audit entry of that
+action: the entry's path, or the folder it is in with `--wildcard`. An action
+without a path takes `''`, and covers its capability with `--wildcard`.
+
+```sh
+nerve-node rule add allow /srv/data/report.txt --action fs.read
+nerve-node rule add deny /srv/data/report.txt --action fs.write --wildcard   # fs.write:/srv/data/*
+```
 
 ## Rule syntax
 

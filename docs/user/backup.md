@@ -243,10 +243,37 @@ live link per node, so stop the old node before the new one connects.
 ## On a node installed as a service
 
 The command runs as the user `nerve` after `sudo` (see [service](service.md)),
-so it writes and reads the backup, and the file `--passphrase-file` names, as
-`nerve`. Name a backup in a folder `nerve` can use, such as
-`/var/lib/nerve/state/nerve.bak`, and copy it from there as root. Typing the
-passphrase needs no file.
+but it opens the backup file as you, the user who ran `sudo`: name one in
+your own folders, such as `~/nerve.bak`. A backup written there is yours,
+readable by you only. Where you may not open the file, the owner of its
+folder opens it: in a root shell (`sudo -i`, which still knows who ran
+`sudo`) a file in `/root` is root's, and one in `/var/lib/nerve/state` is
+written as `nerve`, as before 0.0.6. Run as root without `sudo`, it opens
+the file as root. The file `--passphrase-file` names is read as `nerve`;
+typing the passphrase needs no file.
+
+An owner of the installed node (see [service](service.md#use-the-commands))
+needs no `sudo` for either:
+
+```sh
+nerve-node backup ~/nerve.bak
+nerve-node restore ~/nerve.bak
+```
+
+Your own `nerve-node` opens the file, as you, and hands the open file to the
+running node with the command (on Windows it sends the file's bytes): the
+node never opens a path in your folders itself. It asks the passphrase here
+too, or reads `--passphrase-file` as you. A backup is put in place once it is
+complete. For a restore the node stops, restores and starts again by itself,
+so it must run when you start it. A backup that would change
+`machine.user`, `machine.allow_root`, `machine.sudo_path` or `machine.shell`
+is refused to an owner: restore it with `sudo` (on Windows from an
+administrator's terminal).
+
+The desktop app does this for an owner without a question; it asks for the
+administrator only for such a backup. For someone who is no owner it works
+as `sudo` above, without the second try: a file you may not open is refused
+there.
 
 ## On a center installed as a service
 

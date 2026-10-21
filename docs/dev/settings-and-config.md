@@ -153,6 +153,72 @@ which serves `status`, `folder.add`, `folder.set` and `folder.rm` only
 change the CLI signs `node.toml` itself, and the change applies at the next
 start.
 
+## The owners' way in
+
+The installed node has owners besides root: on Linux the members of the group
+`nerve-admin`, on Windows the SIDs in the service's registry value
+`Parameters\Owners`. `install` adds the user who ran it; `update` adds the
+one who updates where there was none; `uninstall` removes the group (and the
+polkit files and the service helper), and on Windows the service with its key. Membership is looked
+up by name at each request, so it counts without a new login.
+
+The running node serves them a second endpoint (`crate::owner`): on Linux
+`/run/nerve-node/owner.sock`, mode 0666 in the unit's `RuntimeDirectory=`
+(0755), the account decided by the peer's credentials; on Windows the pipe
+`\\.\pipe\nerve-node-owner`, whose DACL names SYSTEM, the administrators and the
+owners, read at the node's start. It takes `status` (anyone: `{"running":
+true}`) and `cli {args, cwd}`: the node refuses anyone who is no owner, on
+Linux a request without the owner token, a caller below a command it runs,
+one with `no_new_privs` (Linux; every confined command keeps it) or in a
+command's job (Windows), the commands that stay root's (`run`, `install`,
+`update`, `uninstall`, `service`, `setup`, `sudo on`), and a `backup` or
+`restore` without the file the caller opened itself.
+
+The owner token keeps the processes of a `folder` mode command that runs as
+an owner off the socket; a program of the owner's that runs things on request
+is not held by the sandbox and reads the token for it, which is the owner's
+to answer for (user docs, desktop.md "Administrator rights"). It is a new
+random one at each start, written whole and renamed into place as
+`owner.token` beside the socket before the socket is made, 0640
+`nerve:nerve-admin` (the unit's `SupplementaryGroups=nerve-admin` lets the
+node give the file to that group; without it the file is 0600 and the node
+logs why its owners cannot use it), compared in constant time, removed at
+the stop. The owner's CLI reads it after it connects and sends it as
+`"token"`; a session older than its owner's membership reads it through
+`sg nerve-admin` (`owner::read_token`). The socket's folder is in
+`Shared::sealed`, the folders a confined command gets no rule and no folder
+for, so Landlock keeps the file from the command however it builds the
+path, while `/run`'s other entries stay readable; it is not in the folders a
+command's account must not enter (`account::out_of_reach`), since every
+account enters it for the socket. The checks of the caller's process come
+after the token: they read `/proc/<pid>` of the process that connected,
+which may be gone by the time the request comes (a child connects and
+exits, the command sends on the connection), so they are a second layer
+only. On Windows the pipe's DACL names no package, so no AppContainer opens
+it, the same check a token file would get; the pipe has no token. Then it runs its own program with
+`--config-dir`, `--state-dir` and those arguments as its own user, with
+`NERVE_OWNER=<name>`, and passes the caller's input and the program's output
+and exit code through the connection (`{"in"}`/`{"eof"}` up, `{"out"}`,
+`{"err"}`, `{"exit"}` down). The program is the CLI after `become_owner`: it
+holds the token, its changes go through the store as any, and with
+`NERVE_OWNER` set it refuses a change of `machine.user`, `machine.allow_root`,
+`machine.sudo_path` or `machine.shell`, and names the owner in the audit
+(`"user"` beside `"by": "local"`). The node's log has a line at info for
+each owner's command that can change something (its words, and for `config`
+the setting's name, never a value); the reads (`status`, `audit`, `log`, the
+`ls` and `get` commands), which the desktop app makes every few seconds, are
+at debug. The CLI forwards there by itself when the node is installed and it
+may not open its folders.
+
+The owners' commands are as safe as the owners' accounts. A center's command
+that runs as an owner's account (`machine.user` is the owner's, as `install`
+sets it by default) without a sandbox (`user` and `allowlist` mode) reads
+the token and is that owner, as is one that gets a process started outside
+the node's tree and sandbox (`systemd-run --user`, tmux, the task
+scheduler). That is the owner's choice of mode and account, documented and
+not enforced (the guard's deny rules and the center's checker catch
+mistakes only); the desktop app warns about it.
+
 ## The log level
 
 `log.level` (`error`, `warn`, `info`, `debug`; `info` unless set) is a machine

@@ -1,0 +1,176 @@
+// What the pages show, as the app makes it from the CLI's JSON answers
+// (src/view.rs). The pages only lay it out.
+
+import { Tone } from "theme.slint";
+
+export enum Page { overview, centers, relay, policy, audit, log, settings, help }
+
+// What the app knows of something it asks the node for.
+export enum Load { loading, ready, failed }
+
+export struct NodeStatus {
+    // running, stopped, locked
+    state: string,
+    title: string,
+    detail: string,
+    tone: Tone,
+    confinement: string,
+    centers: int,
+    connected: int,
+    sudo-on: bool,
+    limits: string,
+    // Commands run without their limits: why, in one short line, and
+    // whether a restart of the service is what helps.
+    limits-off: string,
+    limits-restart: bool,
+    // What the owner should know: why commands do not run.
+    warnings: [string],
+}
+
+export struct CenterRow {
+    name: string,
+    url: string,
+    // The link as words, and its colour.
+    link: string,
+    link-tone: Tone,
+    mode: string,
+    mode-detail: string,
+    settings-write: bool,
+    paused: bool,
+    // What the owner should know of this pairing: why the link fails, or
+    // that the center no longer takes this machine.
+    note: string,
+    note-tone: Tone,
+}
+
+export struct AuditRow {
+    // call, settings, node, relay, config, key
+    kind: string,
+    tone: Tone,
+    title: string,
+    // The decision or event in one or two words, in the tone's colour.
+    badge: string,
+    center: string,
+    target: string,
+    detail: string,
+    when: string,
+    when-exact: string,
+    // The four buttons: whether they work for this entry, and why not.
+    rules: bool,
+    rules-why: string,
+    // The index of the entry in the app's list, for the buttons.
+    index: int,
+}
+
+export struct PairPreview {
+    center: string,
+    tls: bool,
+    pin: string,
+    name: string,
+    // The check before the pairing (`center add` without --yes): whether it
+    // can work, and what it found in one line.
+    ready: bool,
+    check: string,
+}
+
+// A folder a center may use, with its rights.
+export struct FolderRow {
+    path: string,
+    read: bool,
+    write: bool,
+    execute: bool,
+}
+
+// A capability or one of its actions, and its switch: 0 on, 1 off, 2 hidden.
+export struct CapRow {
+    name: string,
+    // An action, shown under its capability.
+    action: bool,
+    setting: int,
+    // Set for this center, not the default.
+    set: bool,
+}
+
+export struct LogRow {
+    tone: Tone,
+    level: string,
+    msg: string,
+    when: string,
+    when-exact: string,
+}
+
+export struct HelpArg {
+    name: string,
+    about: string,
+}
+
+// A command of the reference (src/reference.rs): its words, its first
+// sentence and the rest, how it is written, its arguments, an example, and
+// where the app does the same.
+export struct RefRow {
+    topic: string,
+    name: string,
+    line: string,
+    about: string,
+    usage: string,
+    args: [HelpArg],
+    example: string,
+    in-app: bool,
+    page: Page,
+    // The tab of Settings, -1 for none.
+    tab: int,
+    place: string,
+    // It shows its arguments and example.
+    open: bool,
+}
+
+// A topic of the reference and its commands; one without a name when the
+// list goes from A to Z.
+export struct RefGroup {
+    name: string,
+    rows: [RefRow],
+    // Its commands show; a list from A to Z (no name) is always open.
+    open: bool,
+}
+
+export struct RelayNodeRow {
+    name: string,
+    reach: string,
+    limits: string,
+    // Its tunnels open now, in words ("" for none).
+    live: string,
+    // What its dialog starts from: the centers it may reach (none: every
+    // https center), whether it has limits of its own, and the limits it
+    // gets.
+    centers: [string],
+    own-limits: bool,
+    max-links: int,
+    max-opens: int,
+}
+
+// A choice of a list, ticked or not.
+export struct Pick {
+    name: string,
+    on: bool,
+}
+
+// A limit of Settings: its setting, its words, and its value in the field's
+// unit, as set or else its default.
+export struct Limit {
+    key: string,
+    label: string,
+    unit: string,
+    // What the field shows, what the node said, and the default.
+    value: string,
+    was: string,
+    default: string,
+}
+
+// A tunnel the relay carries now: whose, to which center, from where, and
+// since when.
+export struct TunnelRow {
+    node: string,
+    center: string,
+    from: string,
+    since: string,
+}

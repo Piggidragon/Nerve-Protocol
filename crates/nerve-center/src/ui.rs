@@ -743,6 +743,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_pairing_card_offers_the_command_and_the_bare_link() {
+        let d = tempfile::tempdir().unwrap();
+        let ui = Ui::new(&center(d.path()), None, false, false);
+        let h = ("Host", "127.0.0.1:7480");
+        let session = ui.request(req("GET", "/api/session", &[h], "")).await;
+        let ck = set_cookie(&session);
+        let js = ui
+            .request(req("GET", "/app.js", &[h, ("Cookie", &ck)], ""))
+            .await;
+        let js = String::from_utf8(js.body).unwrap();
+        let card = &js[js.find("function pairingCard").unwrap()..];
+        let card = &card[..card.find("\n}\n").unwrap()];
+        // Two rows with a Copy each: the command, and the link alone for the
+        // desktop app. The link's parts are not shown apart.
+        assert!(card.contains("row(\"Command\", command)"), "{card}");
+        assert!(card.contains("row(\"Link\", p.link)"), "{card}");
+        for gone in ["\"Center\"", "\"Code\"", "\"Certificate pin\""] {
+            assert!(!card.contains(gone), "{gone} is still a row: {card}");
+        }
+    }
+
+    #[tokio::test]
     async fn the_help_page_lists_every_node_command() {
         use clap::CommandFactory;
         let d = tempfile::tempdir().unwrap();

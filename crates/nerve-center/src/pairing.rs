@@ -3,11 +3,22 @@
 //! all. A code keeps the lifetime it was made with. A wrong code counts against every open
 //! code, so guessing is bounded by the tries, not by the number of codes open.
 //!
+//! A node may ask whether a code is still open before it pairs with it
+//! ([`Codes::probe`]). That neither uses the code up nor costs a try. A
+//! probe with a code that is not open costs one of [`PROBES`] that the
+//! center answers in [`PROBE_WINDOW`], whatever the code; past them it says
+//! [`Probe::Busy`] to every probe, so probing is no cheaper a way to guess
+//! codes than pairing requests.
+//!
 //! Codes live in memory only: a restart ends every open code.
 
 use std::time::{Duration, Instant};
 
 pub const TRIES: u32 = 10;
+/// The probes with a code that is not open the center answers in each
+/// [`PROBE_WINDOW`].
+pub const PROBES: u32 = TRIES;
+pub const PROBE_WINDOW: Duration = Duration::from_secs(600);
 /// 12 characters of `a-z0-9`: about 62 bits, against 10 tries.
 pub const CODE_LEN: usize = 12;
 /// How long after the pairing the center still says which node a code paired,
@@ -43,6 +54,31 @@ pub struct Lost {
     pub out_of_tries: u32,
 }
 
+/// What a node is told that checks a code before pairing with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// It can pair a machine now (or a pairing with it has not finished).
+    Open,
+    /// A machine paired with it.
+    Used,
+    /// Unknown, expired or out of tries.
+    Gone,
+    /// The center says nothing now: too many probes with codes that are
+    /// not open came in this window.
+    Busy,
+}
+
+impl Probe {
+    pub fn word(self) -> &'static str {
+        match self {
+            Probe::Open => "open",
+            Probe::Used => "used",
+            Probe::Gone => "gone",
+            Probe::Busy => "busy",
+        }
+    }
+}
+
 /// What the owner's page is told about the code on its screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -65,6 +101,10 @@ pub struct Codes {
     /// ([`PAIRED_KEPT`] after the pairing), so the page can name the node its
     /// code paired. Bounded by the pairings made in that time.
     paired: Vec<(String, String, Instant)>,
+    /// Probes with a code that was not open, in the window that ends at
+    /// the instant given ([`Codes::probe`]).
+    probe_misses: u32,
+    probe_window: Option<Instant>,
 }
 
 impl Codes {
@@ -174,6 +214,29 @@ impl Codes {
         }
     }
 
+    /// What a node is told that checks `code` before pairing: nothing is
+    /// used up and no try is counted. A code that is not open costs one of
+    /// the window's [`PROBES`]; once they are spent, every probe is told
+    /// [`Probe::Busy`] until the window ends, a right code too, so an
+    /// answer never tells more than a pairing request would.
+    pub fn probe(&mut self, code: &str, now: Instant) -> Probe {
+        if self.probe_window.is_none_or(|end| now >= end) {
+            self.probe_window = Some(now + PROBE_WINDOW);
+            self.probe_misses = 0;
+        }
+        if self.probe_misses >= PROBES {
+            return Probe::Busy;
+        }
+        match self.outcome(code, now) {
+            Outcome::Open => Probe::Open,
+            Outcome::Paired(_) => Probe::Used,
+            Outcome::Gone => {
+                self.probe_misses += 1;
+                Probe::Gone
+            }
+        }
+    }
+
     pub fn open_count(&mut self, now: Instant) -> usize {
         self.prune(now);
         self.open.len()
@@ -248,6 +311,35 @@ mod tests {
         assert_eq!(c.outcome(&long, before), Outcome::Paired("node-2".into()));
         assert_eq!(c.outcome(&short, last), Outcome::Gone);
         assert_eq!(c.outcome(&long, last), Outcome::Gone);
+    }
+
+    #[test]
+    fn a_probe_neither_uses_a_code_nor_costs_a_try_and_is_bounded() {
+        let mut c = Codes::default();
+        let now = Instant::now();
+        let code = c.create(now, TEN_MINUTES);
+        // An open code, asked often: still open, and every try left.
+        for _ in 0..3 * TRIES {
+            assert_eq!(c.probe(&code, now), Probe::Open);
+        }
+        // Wrong codes cost no try of the open ones either.
+        for _ in 0..PROBES {
+            assert_eq!(c.probe("wrong", now), Probe::Gone);
+        }
+        assert_eq!(c.check(&code, now), Ok(()));
+        // Past the window's probes the center says nothing of any code,
+        // the right one too: no more guesses than pairing requests allow.
+        assert_eq!(c.probe("wrong", now), Probe::Busy);
+        assert_eq!(c.probe(&code, now), Probe::Busy);
+        // The next window answers again; a used code says so.
+        let later = now + PROBE_WINDOW;
+        let code = c.create(later, TEN_MINUTES);
+        assert_eq!(c.probe(&code, later), Probe::Open);
+        let taken = c.take(&code, later).unwrap();
+        c.done(taken, "node-1", later);
+        assert_eq!(c.probe(&code, later), Probe::Used);
+        // The pairing took the code: it is not open for another one.
+        assert!(c.take(&code, later).is_err());
     }
 
     #[test]

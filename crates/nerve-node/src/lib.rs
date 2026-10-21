@@ -9,10 +9,13 @@
 
 pub mod account;
 pub mod backup;
+mod caller_file;
 pub mod cgroup;
 pub mod cli;
 pub mod daemon;
 pub mod descriptor;
+pub mod edition;
+pub mod entry;
 // The Event Log is Windows-only in use, and its message table is build.rs's;
 // both are tested everywhere.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -26,6 +29,7 @@ pub mod grants;
 mod job;
 pub mod keyring_setup;
 mod link;
+pub mod owner;
 pub mod pair;
 pub mod paths;
 pub mod prompt;
@@ -62,7 +66,7 @@ mod winsudo;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod winsvc;
 
-pub use daemon::{Daemon, NodeOptions};
+pub use daemon::{Daemon, Event, NodeOptions};
 pub use paths::NodePaths;
 
 /// Milliseconds since the Unix epoch.

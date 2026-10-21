@@ -35,8 +35,8 @@ ssh -L 7480:127.0.0.1:7480 user@center-host
 - **Machines.** Each paired machine with its state (online, offline,
   disabled), platform, a short summary and what it offers. Buttons: Rename,
   Disable or Enable, Remove.
-- **Pair a machine.** Makes a [pairing](pairing.md) command, address, code and
-  pin.
+- **Pair a machine.** Makes a [pairing](pairing.md) command and its bare link
+  (for the desktop app), each with Copy.
 - **Sessions.** The harnesses connected now, each marked `tainted` once the
   [action checker](action-checker.md#taint) marked it. **End** stops one
   session.

@@ -6,6 +6,14 @@ Run them as a normal user on the machine, or with `sudo` when the node is
 `nerve-node <command> --help` list the same. The center's web UI has a Help
 page with them too.
 
+On Windows, `nerve-node-desktop.exe` is the desktop app. It runs these commands
+itself, but a terminal does not wait for it: in a terminal use `nerve-node.exe`
+from the release. Where the app took over the installed node, the installed
+`nerve-node.exe` is removed, so download `nerve-node-x86_64-windows.exe` from the
+release for a terminal; it works on the node the app installed
+([the desktop app](desktop.md#in-a-terminal)). On Linux the installed
+`nerve-node` stays a link to the app, and works in a terminal as before.
+
 Every command takes `--config-dir` and `--state-dir`
 ([where files live](install.md#where-files-live)). A command that works on
 one center takes `--center <name>`. You need it only when more than one
@@ -21,12 +29,12 @@ center is paired.
 | `center ls` | List centers, their mode and grant | [pairing](pairing.md) |
 | `center pause`, `center resume` | Stop or restart the link to a center | [stop](stop.md#pause) |
 | `center grant settings write\|off` | Let a center change settings | [settings grant](settings-grant.md) |
-| `proxy set <url> [--pin P] [--header 'N: v']`, `proxy ls`, `proxy rm` | Dial centers through a proxy or a relay | [proxy](proxy.md) |
+| `proxy set <url> [--pin P] [--header 'N: v'] [--password-stdin] [--headers-stdin]`, `proxy ls`, `proxy rm` | Dial centers through a proxy, or a relay (`proxy set '<nerve://relay link>'`) | [proxy](proxy.md) |
 | `relay set <ip:port>`, `relay off` | Let other nodes reach this node's centers through it | [relay](relay.md) |
-| `relay add <name> [--center C]`, `relay rm <name>`, `relay ls` | Give a node a relay token, take it away, see who is connected | [relay](relay.md) |
+| `relay add <name> [--center C] [--address HOST[:PORT]]`, `relay rm <name>`, `relay ls` | Give a node a relay link (its token in it), take it away, see who is connected | [relay](relay.md) |
 | `relay set-centers <name> [--center C]` | Change which centers a relayed node may reach | [relay](relay.md#limit-a-node-to-some-centers) |
 | `relay set-limits <name> [--max-links N] [--max-opens-per-minute N]` | Give one relayed node (a relay behind this one) limits of its own | [relay](relay.md#limits) |
-| `relay token <name>` | Give a relayed node a new token; its centers and limits stay | [relay](relay.md#on-the-relay) |
+| `relay token <name> [--address HOST[:PORT]]` | Give a relayed node a new token in a new link; its centers and limits stay | [relay](relay.md#on-the-relay) |
 
 ## What a center may do
 
@@ -36,9 +44,11 @@ center is paired.
 | `folder add <path> +r +w +x` | Grant a folder | [modes](modes.md#folders) |
 | `folder set <path> -w` | Change a folder's rights | [modes](modes.md#folders) |
 | `folder rm <path>`, `folder ls` | Remove or list folders | [modes](modes.md#folders) |
-| `rule add allow\|deny\|sudo '<command>' [--wildcard]` | Add a command rule | [rules](rules.md) |
-| `rule rm allow\|deny\|sudo '<command>' [--wildcard]` | Remove a command rule | [rules](rules.md#list-and-remove-rules) |
-| `rule ls [allow\|deny\|sudo]` | List rules | [rules](rules.md#list-and-remove-rules) |
+| `rule add allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Add a command rule, or with `--action` the rule of an audit entry | [rules](rules.md) |
+| `rule rm allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Remove a rule | [rules](rules.md#list-change-and-remove-rules) |
+| `rule edit allow\|deny\|sudo '<entry>' '<new>'` | Change a rule in place, as one change | [rules](rules.md#list-change-and-remove-rules) |
+| `rule ls [allow\|deny\|sudo]` | List rules | [rules](rules.md#list-change-and-remove-rules) |
+| `rule guard` | Put the guard's deny rules back that a pairing lacks | [rules](rules.md#the-guard-against-changing-the-node) |
 | `cap set <cap> on\|off\|hidden`, `cap ls` | Switch a capability or action | [rules](rules.md#switch-a-capability-off) |
 | `sudo on`, `sudo off`, `sudo status` | The sudo switch | [sudo](sudo.md) |
 | `config get\|set\|unset\|add\|remove <key> [value]` | Read or change any setting | [config](config.md) |
@@ -50,7 +60,10 @@ center is paired.
 |---|---|---|
 | `run` | Run the node in the foreground | [pairing](pairing.md) |
 | `status` | Show whether it runs, the links, the confinement and the [limits per command](limits.md) | [troubleshooting](troubleshooting.md) |
-| `audit [--denied] [--follow]` | Show what was allowed and refused | [audit](audit.md) |
+| `audit [--denied] [--last N] [--follow]` | Show what was allowed and refused | [audit](audit.md) |
+| `audit clear` | Start the audit log afresh; the entries so far stay in its older file | [audit](audit.md#clear-it) |
+| `log [--problems] [--last N] [--follow]` | Show the node's log | [logs](logs.md) |
+| `log clear` | Empty the node's log | [logs](logs.md#clear-it) |
 | `panic`, `unlock` | Stop everything, then allow it again | [stop](stop.md#panic) |
 
 ## Install and set up
@@ -59,8 +72,10 @@ center is paired.
 |---|---|---|
 | `install` | Install the node as a service under its own user (Linux as root, Windows as administrator) | [service](service.md#install) |
 | `setup` | Name the node, choose the account commands run as, choose where the keys are, pair the first center, choose its mode | [service](service.md#setup) |
-| `setup --create-user <name>` | Make an account only the node uses, and run commands as it (Linux, installed node) | [service](service.md#setup) |
+| `setup --create-user <name> [--account-only]` | Make an account only the node uses, and run commands as it (Linux, installed node); with `--account-only` ask nothing else | [service](service.md#setup) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [service](service.md#update) |
+| `service start\|stop\|restart` | Start, stop or restart the installed service | [service](service.md#start-and-stop) |
+| `service status` | Show whether the node is installed as a service, whether it runs, and its program and version | [service](service.md#start-and-stop) |
 | `uninstall [--purge]` | Remove the service, its user and the program | [service](service.md#uninstall) |
 | `backup <file> [--include-keyring] [--overwrite] [--passphrase-file F]` | Write the config and keys to a file that a passphrase protects | [backup](backup.md) |
 | `restore <file> [--replace] [--secret-storage file\|keyring] [--without-proxy] [--passphrase-file F]` | Put a backup in place of this node's, or on another machine | [backup](backup.md#restore) |
@@ -74,3 +89,55 @@ The center has five commands of its own, which a harness never runs:
 | `install` | Install the center as a service under a user of its own (Linux with systemd, as root) | [center](center.md#run-it-as-a-service) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [center](center.md#update) |
 | `uninstall [--purge]` | Remove the service, its user and the program | [center](center.md#uninstall) |
+
+## For programs: `--json`
+
+A program that drives `nerve-node`, such as a script, adds `--json` and reads
+one JSON value from stdout:
+
+- The read commands print their data: `status`, `center ls`, `folder ls`,
+  `rule ls`, `cap ls` (with `known`, what `cap set` switches), `config get`,
+  `proxy ls`, `relay ls`, `sudo status`, `service status`, and `audit` and `log`
+  (`{"entries": [...]}`, the lines as the file holds them; with `--follow`
+  one a line). `status` has `"daemon"`:
+  `"running"`, with what the running node says, or `"not running"`.
+  `service status` has `"installed"`, `"state"` (`"running"`, `"stopped"`,
+  `"starting"`, `"stopping"` or `"failed"`; `null` when not installed),
+  `"enabled"` (it starts with the machine), `"program"` (where the program
+  is installed), `"present"` (whether it is there) and `"version"`. It needs
+  no root. `config get machine.secret_storage` also has `"keyring"`:
+  `{"usable": true}`, or `"usable": false` with `"reason"`
+  (`"windows-service"`, `"old-landlock"`, or `"no-answer"`: no keyring
+  answers for the account the node runs as) and `"why"` in words.
+- `center add` without `--yes` prints what you would confirm
+  (`{"paired": false, "preview": {...}, "check": {...}}`) and pairs nothing;
+  with `--yes` it pairs. `"check"` says whether pairing can work: `"ready"`,
+  `"reach"` (`"ok"`, `"unreachable"` or `"certificate"`: not the pinned or a
+  trusted one), `"code"` (`"open"`, `"used"`, `"gone"`, `"busy"` or
+  `"unknown"`, or `null` when the center was not reached), `"problem"` in
+  words when it cannot, and `"said"`, the line for people.
+- Every other command prints the lines it shows as `{"messages": [...]}`,
+  with `"next_start": true` when the node takes the change only at its next
+  start (it does not run, or it is the installed node on Windows, which
+  takes only folder changes while it runs); `center add --yes` says it the
+  same way. `relay add` and `relay token` add `"token"` (`node`, `token`,
+  `address`, `link`, the `nerve://relay` link the other node pastes,
+  `proxy`, the URL it sets with `proxy set`, and `pin`); `relay ls` has
+  `"address"`, where a new link says the relay is,
+  `backup` adds `"backup"` (`file`, `centers`, `saved`, and `left_out`, each
+  with `what` and `why`: `keyring`, `does-not-fit` or `missing`),
+  `center rotate-key` adds `"public_key"`, the new key, and
+  `restore` adds `"restored"` (`centers`, `kept`, `no_key`, and `notes`,
+  each with `text` and, when it asks you to set something again, `fix`:
+  `proxy`, `sudo`, `sudo-file`, `pin` with its `center`, or `relay`).
+- An error is `{"error": "..."}`, and the exit code is 1. stderr carries the
+  log's events, so read the error from stdout.
+
+When stdin is no terminal, nothing waits for typing: a password (`sudo on`, the
+account's on Windows) or a passphrase (`backup`, `restore`) is the first line
+of stdin, or of the file `--passphrase-file` names. `proxy set
+http://user@host:port --password-stdin` takes the proxy's password from the
+first line of stdin, and `--headers-stdin` the headers from the lines after
+it, one `Name: value` each, so neither shows in the process list. `setup` reads its answers
+from stdin one line each; `setup --create-user <name> --account-only` asks
+nothing and chooses only that account. `center add` needs `--yes`.

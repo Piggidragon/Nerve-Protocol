@@ -141,7 +141,7 @@ The node confines commands with Landlock:
 
 | A command can | Where |
 |---|---|
-| Read | the system folders (`/usr`, `/bin`, `/lib`, `/etc`, `/opt`, `/proc`, `/sys`, `/dev`, `/run` and similar) and the `r` folders |
+| Read | the system folders (`/usr`, `/bin`, `/lib`, `/etc`, `/opt`, `/proc`, `/sys`, `/dev`, `/run` but `/run/nerve-node`, and similar) and the `r` folders |
 | Write | the `w` folders and the null and terminal devices |
 | Run programs | the system folders and the `x` folders |
 
@@ -150,13 +150,15 @@ The node confines commands with Landlock:
 - Landlock cannot run a file it may not read. So an `x` folder also lets a
   command read files there by name. It still cannot list the folder.
 - The node's own folders are in none of these sets. That keeps a command from
-  the node's files, but only as far as Landlock reaches. While the commands
-  run as the node's own user (a node you run yourself, with no `machine.user`),
-  `folder` mode is no boundary against that user's other programs: a command
-  can ask one that runs commands on request, such as the user's systemd session
-  or a tmux server, to run a program outside the sandbox, and that program
-  reads the node's files and changes its settings through the control socket.
-  Run the commands as another account, one that only the node uses and that
+  the node's files, but only as far as Landlock reaches. Landlock holds the
+  command's own processes, not the other programs of the account it runs
+  as: `folder` mode is no boundary against those of them that run things on
+  request (a session's service manager, a terminal multiplexer and the
+  like), which run what the command asks outside the sandbox, as that
+  account. While the commands run as the node's own user (a node you run
+  yourself, with no `machine.user`), such a program reads the node's files
+  and changes its settings through the control socket. Run the commands as
+  another account, one that only the node uses and that
   gets root in no way without a password (not root, not in `docker` or a like
   group, no `NOPASSWD` sudo, nobody works as it and uses sudo from it), to keep
   them from the node's files and settings: see [Linux](platforms.md#linux).
@@ -192,6 +194,17 @@ The node confines commands with Landlock:
   commands run as ([service](service.md#the-account-commands-run-as)), and
   what that account may not open stays closed as well. Landlock only takes
   away; it gives the account nothing it lacks.
+- That account is the user who installed, unless you chose another, so
+  the command runs as an owner of the node. Its own processes cannot change
+  the node's settings through the owners' socket: the node answers only a
+  request with its owner token, and the token's folder `/run/nerve-node` is
+  in none of these sets, whatever folders you grant ([administrator
+  rights](desktop.md#administrator-rights)). A program of yours that runs
+  things on request is not held so (above): through one a command can do
+  all you can, Nerve's settings too, and the app's account card says so.
+  That is yours to answer for, as in `user` and `allowlist` mode
+  ([below](#user-mode)). Folder mode under an account of its own is planned
+  ([#142](https://github.com/Piggidragon/Nerve-Protocol/issues/142)).
 
 Check that your kernel supports it, with the node running:
 
@@ -434,6 +447,13 @@ and other software may open more or less to AppContainers elsewhere. "Code"
 means it follows from the node's code. What is marked "not checked" is not
 known.
 
+In short: `folder` mode keeps the command's own files and the owners' pipe
+closed, but it is not shown to hold against every program of yours that
+runs things on request. One that opens itself to all AppContainers runs
+what the command asks as you, outside the container, and then a command
+can do all you can, Nerve's settings too. As on Linux, that is yours to
+answer for while commands run as you.
+
 - **The network.** The container has the capabilities `internetClient`,
   `internetClientServer` and `privateNetworkClientServer` (code). Checked: a
   command connects to the internet, resolves names and connects to other
@@ -557,6 +577,20 @@ of a group such as `docker`; see
 [the account commands run as](service.md#the-account-commands-run-as)). In `folder` mode they are the same account, held to their
 folders.
 
+By default that account is the user who installed, an owner of the node.
+Then a `user` mode command, and a program an `allowlist` rule lets run, can
+change the node's settings as you can without a password: it runs as you
+without a sandbox, reads the node's owner token and uses the owners' socket
+(on Windows their pipe), as your own programs do. The node does not stop
+that; it is your choice of mode and account. The center's
+[blocklist and action checker](action-checker.md) and the node's
+[guard](rules.md#the-guard-against-changing-the-node) catch such a command
+when an agent tries it by mistake, and the node refuses a process it sees
+below one of its commands, but none of that is a boundary. Give the
+commands an account that is no owner (the app's **Create a separate
+account**, or `setup`) to keep them from the node's settings in every mode
+([administrator rights](desktop.md#administrator-rights)).
+
 ### Paths a command builds at run time
 
 The node checks the paths a command line names plainly (an absolute path, or
@@ -582,9 +616,10 @@ limit:
   with them. On the installed Windows node `folder` mode runs only such
   commands ([Windows](#what-a-command-can-reach-in-folder-mode-windows)).
 
-And in `folder` mode on a node you run yourself, a command can hand work to the
-programs of your own session that run commands on request, which are outside
-the sandbox ([Linux](#what-a-command-can-reach-in-folder-mode-linux)).
+And in `folder` mode while commands run as you (on a node you run yourself,
+or one installed with your account), a command can hand work to the programs
+of yours that run commands on request, which are outside the sandbox
+([Linux](#what-a-command-can-reach-in-folder-mode-linux)).
 
 No rule closes these limits.
 

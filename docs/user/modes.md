@@ -252,8 +252,9 @@ and no other groups; `uninstall` removes both.
 - A file a command makes private (mode 0600 or 0700) stays its own: the ACL
   mask hides your entry then. If you narrow a file's group bits later
   (`chmod g-w`), `nerve-run` loses that right too.
-- [sudo](sudo.md) commands run as you, with your password, whatever account
-  the pairing's other commands use.
+- An allowed [sudo](sudo.md) command of a pairing whose commands run as
+  `nerve-run` runs as root, started by the node: the sudo list is its only
+  way to root, and your password is not used for it.
 
 Check that your kernel supports it, with the node running:
 

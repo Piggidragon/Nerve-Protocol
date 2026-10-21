@@ -1028,9 +1028,12 @@ center with the settings grant `write` (protocol §7.4.1, sealed end to end so
 the center cannot read it). The node checks it with `sudo -S -k -v` (output
 discarded), run as the owner (§1: on the installed Linux node the account
 the unit names, on Windows `machine.user`, else the node's own user), so the
-password is the owner's, and a sudo command runs as the owner whatever
-account the pairing's other commands use and refuses a wrong one with `invalid_args`; the switch then stays
-as it was. Turning it off drops the password. On Linux the password is kept
+password is the owner's, and refuses a wrong one with `invalid_args`; the
+switch then stays as it was. An allowed sudo command of a pairing whose
+commands run as the owner runs through sudo as the owner, with that
+password; one of a pairing whose commands run as `nerve-run` runs as root,
+started by the node itself (`sh -c 'exec <the command>'`, root's group only,
+no Landlock), without the password or the sudo program. Turning it off drops the password. On Linux the password is kept
 in memory only, whatever `secret_storage` says, so a restarted node, or
 a `node.toml` that says `on` without a password held, has the switch off. It
 never reaches a center: the node replaces every copy in an outgoing frame and

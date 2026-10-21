@@ -63,6 +63,25 @@ pub const NO_ACCOUNT_INSTALL: &str = "`nerve-node install` asks again";
 
 /// Looks `name` up in the system's account database. `getent` and `id` ask
 /// it through NSS, which the static program cannot do itself.
+/// Root, as an allowed sudo command of a pairing whose commands run as
+/// [`RUN_USER`] runs (crate::link): the node starts it as root itself, with
+/// root's own group only, since `nerve-run` has no sudo of its own.
+#[cfg(target_os = "linux")]
+pub fn root() -> Account {
+    let home = lookup("root")
+        .ok()
+        .flatten()
+        .map_or_else(|| std::path::PathBuf::from("/root"), |a| a.home);
+    Account {
+        name: "root".into(),
+        uid: 0,
+        gid: 0,
+        comment: String::new(),
+        home,
+        groups: vec![0],
+    }
+}
+
 pub fn lookup(name: &str) -> Result<Option<Account>, String> {
     #[cfg(windows)]
     return crate::win_user::lookup(name);

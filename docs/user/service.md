@@ -109,7 +109,7 @@ A center's commands run as one of two accounts:
 | `folder` | `nerve-run` |
 | `allowlist` | `nerve-run`, or the owner with `mode set allowlist --as-owner` |
 | `user` | the owner |
-| a [sudo](sudo.md) command, in every mode | the owner, with the owner's password |
+| an allowed [sudo](sudo.md) command | root: through the owner's sudo where the pairing runs as the owner, started by the node itself where it runs as `nerve-run` |
 
 There is no other account to choose. A command gets the account's groups,
 its home as `HOME` and, when the call names no folder, as its working

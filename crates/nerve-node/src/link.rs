@@ -1817,15 +1817,21 @@ impl Link {
     ) -> Result<Value, RpcError> {
         // The installed node runs a command as `nerve-run`, or as the owner
         // where the pairing runs as the owner (crate::account), from that
-        // account's home. A sudo command runs as the owner, whose password
-        // the switch holds. A missing account stops the command after the
-        // call is decided and audited.
+        // account's home. A sudo command of a pairing that runs as the owner
+        // runs through sudo as the owner, whose password the switch holds;
+        // one of a pairing that runs as `nerve-run` runs as root, started by
+        // the node itself: `nerve-run` has no sudo, and the sudo allow list
+        // is its only way to root. A missing account stops the command after
+        // the call is decided and audited.
         let sudo_call = inv
             .args
             .get("command")
             .and_then(Value::as_str)
             .is_some_and(|c| nerve_policy::sudo_command(c).is_some());
-        let account = if sudo_call {
+        let as_root = sudo_call && cfg!(target_os = "linux") && self.shared.separate(&entry.policy);
+        let account = if as_root {
+            Ok(Some(root_account()))
+        } else if sudo_call {
             self.shared.owner_account(cfg)
         } else {
             self.shared.command_account(cfg, &entry.policy)
@@ -1885,7 +1891,15 @@ impl Link {
         // which would keep sudo from rising.
         let mut rc = rc;
         let mut sudo = None;
-        if let Some(args) = nerve_policy::sudo_command(&rc.command) {
+        if let Some(args) = nerve_policy::sudo_command(&rc.command).filter(|_| as_root) {
+            // The one simple command the sudo allow list named (the gate
+            // takes no other), as root, through the shell as sudo would
+            // have it.
+            if !self.shared.sudo_on() {
+                return Err(RpcError::forbidden("sudo is off on this node"));
+            }
+            rc.command = format!("exec {args}");
+        } else if let Some(args) = nerve_policy::sudo_command(&rc.command) {
             let password = self
                 .shared
                 .sudo_password()
@@ -1897,7 +1911,7 @@ impl Link {
         // Folder mode confines: Landlock on Linux, the pairing's AppContainer
         // on Windows, by the answer the gate went by; `nerve-run` is
         // confined in allowlist mode too, where Landlock is there.
-        let folder = sudo.is_none() && by_folders && unconfined.is_none();
+        let folder = sudo.is_none() && !as_root && by_folders && unconfined.is_none();
         let container = if folder && self.shared.confinement.appcontainer {
             Some(self.container(entry, cfg, &home).await?)
         } else {
@@ -1970,6 +1984,15 @@ impl Link {
         }
         r
     }
+}
+
+/// The account an allowed sudo command of `nerve-run` runs as
+/// (crate::account::root).
+fn root_account() -> crate::service::Account {
+    #[cfg(target_os = "linux")]
+    return crate::account::root();
+    #[cfg(not(target_os = "linux"))]
+    unreachable!("only the installed Linux node runs commands as nerve-run")
 }
 
 impl Link {

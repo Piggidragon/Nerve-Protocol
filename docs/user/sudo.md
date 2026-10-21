@@ -23,17 +23,23 @@ for it.
    ```
 
 2. Switch sudo on. The node must be running. It asks for your own sudo
-   password: a sudo command runs as you, the owner, also on a node installed
-   as a [service](service.md#the-accounts-commands-run-as) whose other
-   commands run as `nerve-run`:
+   password, which shows that you may run commands as root on this machine:
 
    ```sh
    nerve-node sudo on
    ```
 
-   A sudo command is yours: it runs as root through your sudo, in every
-   mode, and the folders do not hold it. Put on the sudo list only what you
-   would run yourself.
+   A sudo command is yours: it runs as root, in every mode, and the folders
+   do not hold it. Put on the sudo list only what you would run yourself.
+   Who raises it depends on the account the pairing's commands run as
+   ([service](service.md#the-accounts-commands-run-as)):
+
+   - **as you** (`user` mode, `allowlist` mode as you, a node you run
+     yourself): through your sudo, with your password.
+   - **as `nerve-run`** (`folder` mode and `allowlist` mode on the installed
+     Linux node): the node starts the command as root itself. `nerve-run`
+     has no sudo and no password of its own, and your password is not used
+     for it: the sudo list is the only way to root for it.
 
 3. Look or turn it off:
 
@@ -65,10 +71,15 @@ On Linux (Windows differs, see [sudo on Windows](#sudo-on-windows)):
   `sudo net *` does not cover `sudo net start spooler`: add
   `nerve-node rule add sudo 'systemctl start nginx'` without `--wildcard`.
   The refusal names the character or word. This holds on Windows too.
-- It starts the command as that account, as `sudo -S -k -p <prompt> …`, so
-  sudo raises it from that account. It runs without the Landlock
-  sandbox, which would stop sudo from gaining privileges. It writes the
-  password only after sudo prints the prompt.
+- For a pairing whose commands run as you, it starts the command as you, as
+  `sudo -S -k -p <prompt> …`, so sudo raises it from your account. It runs
+  without the Landlock sandbox, which would stop sudo from gaining
+  privileges. It writes the password only after sudo prints the prompt.
+- For a pairing whose commands run as `nerve-run`, it starts the command as
+  root, with root's own group, through the shell (`sh -c 'exec …'`), in
+  the command's working folder, without the Landlock sandbox. The shell reads
+  the line as root, so `~` is root's home there. The sudo program and its
+  sudoers rules play no part in it.
 - Every other command runs with `no_new_privs`. A `sudo` later in a command
   line, or any setuid program, cannot gain privileges.
 

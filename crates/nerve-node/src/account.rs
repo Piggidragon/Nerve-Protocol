@@ -10,7 +10,7 @@
 //! the account the service keeps CAP_SETUID and CAP_SETGID, the one
 //! privilege it has, and every command it starts drops both before it runs.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use nerve_policy::config::{Access, Folder};
 
@@ -78,7 +78,11 @@ pub fn home_open(home: &Path) -> Option<u32> {
 /// (crate::acl). `None` where neither is so. With Landlock nothing is said:
 /// it holds every command of `nerve-run` to its own folders.
 #[cfg(unix)]
-pub fn home_warning(home: &Path, open: Option<u32>, below: &[PathBuf]) -> Option<String> {
+pub fn home_warning(
+    home: &Path,
+    open: Option<u32>,
+    below: &[std::path::PathBuf],
+) -> Option<String> {
     let mut why = Vec::new();
     if let Some(mode) = open {
         why.push(format!(

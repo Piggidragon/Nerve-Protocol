@@ -293,8 +293,11 @@ pub fn rule_for(cap: &str, action: &str, target: &str, wildcard: bool) -> Result
 /// that runs the node's programs (at the start of a command, after `sudo`,
 /// or by a path, `.exe` too), names its socket and pipes (all named
 /// `nerve-node…`) or its config and state folders, and a write into those
-/// folders. Only running the program counts, not its name anywhere: `cargo
-/// build -p nerve-node` and `journalctl -u nerve-node` stay allowed. They
+/// folders, and a command that stops, restarts, disables or kills the node's
+/// service by its name (`systemctl stop nerve-node`, `sc stop nerve-node`,
+/// `taskkill /im nerve-node.exe`). Only running or stopping it counts, not
+/// its name anywhere: `cargo build -p nerve-node`, `journalctl -u nerve-node`
+/// and `systemctl status nerve-node` stay allowed. They
 /// are on top of the node's own folders, which nothing releases
 /// (crate::protected). A deny rule matches the whole line, so they catch a
 /// confused agent, not one that builds the name at run time: the real
@@ -316,6 +319,17 @@ pub const GUARD: &[&str] = &[
     // `C:\ProgramData\Nerve`, `%ProgramData%\Nerve`, `$env:ProgramData\Nerve`:
     // the line's `\` is matched as `/` on Windows.
     "exec.run:*[Pp]rogram[Dd]ata*/[Nn]erve{,/*,[ \"']*}",
+    // Stopping, restarting, disabling or killing the node's service, by the
+    // service's name, with the same line starts (and the program's path).
+    // Reading it stays allowed: `systemctl status`, `sc query`, `Get-Service`.
+    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }{,*[/\\]}systemctl{, *} {stop,restart,try-restart,reload-or-restart,disable,kill,mask} {,*[ \"']}nerve-node{,.service}{,[ \"');&|]*}",
+    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }{,*[/\\]}sc{,.exe} {,*[ ]}{stop,config,delete} {,*[ \"']}nerve-node{,[ \"');&|]*}",
+    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }{,*[/\\]}net{,.exe} stop {,*[ \"']}nerve-node{,[ \"');&|]*}",
+    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }{[Ss]top,[Rr]estart,[Ss]et,[Rr]emove}-[Ss]ervice{, *}[ \"':=,]nerve-node{,[ \"');,|&]*}",
+    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }{,*[/\\]}taskkill{,.exe} *[ \"':=]nerve-node{,-desktop}{,.exe}{,[ \"');&|]*}",
+    "exec.run:{,*[;&|(] ,*[;&|(],*sudo ,*sudo * }[Ss]top-[Pp]rocess{, *}[ \"':=,]nerve-node{,-desktop}{,.exe}{,[ \"');,|&]*}",
+    // The same through a pipe: `Get-Service nerve-node | Stop-Service`.
+    "exec.run:*[ \"'(,:=]nerve-node{,-desktop}{,.exe}*|{,[ ]}{[Ss]top,[Rr]estart,[Ss]et,[Rr]emove}-{[Ss]ervice,[Pp]rocess}{,[ \"');,|&]*}",
     "fs.write:~/.config/nerve/*",
     "fs.write:~/.local/state/nerve/*",
     "fs.write:/etc/nerve/*",
@@ -515,6 +529,145 @@ mod tests {
         }
         let have = vec![GUARD[0].to_string(), "exec.run:rm *".to_string()];
         assert_eq!(guard_missing(&have), GUARD[1..].to_vec());
+    }
+
+    /// The guard also refuses a command that stops, restarts, disables or
+    /// kills the node's service by its name, and leaves reading it alone.
+    #[test]
+    fn the_guard_refuses_stopping_the_service() {
+        // The rules before the service rules: they alone refuse none of these.
+        const BEFORE: usize = 9;
+        let rules = |g: &[&str]| g.iter().map(|g| g.to_string()).collect::<Vec<_>>();
+        let home = Path::new("/home/alice");
+        let all = RuleSet::new(&rules(GUARD), home);
+        let before = RuleSet::new(&rules(&GUARD[..BEFORE]), home);
+        let mut caught = std::collections::BTreeSet::new();
+        for c in [
+            "systemctl stop nerve-node",
+            "sudo systemctl stop nerve-node",
+            "sudo -n systemctl stop nerve-node.service",
+            "systemctl restart nerve-node",
+            "systemctl try-restart nerve-node",
+            "systemctl reload-or-restart nerve-node.service",
+            "systemctl disable nerve-node",
+            "systemctl disable --now nerve-node",
+            "sudo systemctl --now disable nerve-node.service",
+            "systemctl kill nerve-node",
+            "systemctl kill -s KILL nerve-node",
+            "systemctl kill --signal=SIGKILL nerve-node.service",
+            "systemctl mask nerve-node",
+            "systemctl mask --now nerve-node",
+            "systemctl --no-block stop 'nerve-node'",
+            "systemctl stop nerve-node nerve-center",
+            "systemctl stop sshd; journalctl -u nerve-node",
+            "/usr/bin/systemctl stop nerve-node",
+            "sudo /bin/systemctl restart nerve-node.service",
+            "cd /tmp && sudo systemctl stop nerve-node",
+            "true; systemctl stop nerve-node",
+            "(systemctl stop nerve-node)",
+            "sc stop nerve-node",
+            "sc.exe stop nerve-node",
+            "sc config nerve-node start= disabled",
+            "sc.exe config nerve-node start= disabled",
+            "sc delete nerve-node",
+            "sc \\\\host stop nerve-node",
+            "sc stop \"nerve-node\"",
+            "C:\\Windows\\System32\\sc.exe stop nerve-node",
+            "Stop-Service nerve-node",
+            "Stop-Service -Name nerve-node",
+            "Stop-Service -Name nerve-node -Force",
+            "Stop-Service -Name:nerve-node",
+            "Stop-Service -Name \"nerve-node\"",
+            "stop-service nerve-node",
+            "Restart-Service nerve-node",
+            "Restart-Service -Name nerve-node -Force",
+            "Set-Service -Name nerve-node -StartupType Disabled",
+            "Set-Service nerve-node -StartupType Disabled",
+            "Remove-Service nerve-node",
+            "cd C:\\ ; Stop-Service nerve-node",
+            "& Stop-Service nerve-node",
+            "Get-Service nerve-node | Stop-Service",
+            "Get-Service nerve-node | Restart-Service -Force",
+            "Get-Service -Name nerve-node | Set-Service -StartupType Disabled",
+            "Get-Service nerve-node|Stop-Service",
+            "Get-Service nerve-node | Select-Object Name | Stop-Service",
+            "net stop nerve-node",
+            "net.exe stop nerve-node",
+            "net stop \"nerve-node\"",
+            "taskkill /im nerve-node.exe",
+            "taskkill /IM nerve-node.exe /F",
+            "taskkill /f /im nerve-node-desktop.exe",
+            "taskkill.exe /f /im nerve-node-desktop.exe /t",
+            "taskkill /fi \"IMAGENAME eq nerve-node.exe\"",
+            "Stop-Process -Name nerve-node",
+            "Stop-Process -Name nerve-node-desktop -Force",
+            "Stop-Process -Name nerve-node.exe",
+            "stop-process -name:nerve-node",
+            "Stop-Process -Force -Name \"nerve-node\"",
+            "Get-Process nerve-node | Stop-Process",
+            "Get-Process nerve-node-desktop | Stop-Process -Force",
+            "Get-Process | Where-Object Name -eq nerve-node | Stop-Process",
+        ] {
+            let found = all.find("exec", "run", c);
+            let Some(rule) = found else {
+                panic!("should be refused: {c}");
+            };
+            assert!(
+                before.find("exec", "run", c).is_none(),
+                "refused without the service rules: {c}"
+            );
+            caught.insert(rule.to_string());
+        }
+        // Every service rule refuses a line of its own, so none can go dead.
+        for g in &GUARD[BEFORE..BEFORE + 7] {
+            assert!(caught.contains(*g), "no case for {g}");
+        }
+        let run = |c: &str| all.find("exec", "run", c).is_some();
+        for c in [
+            "systemctl status nerve-node",
+            "systemctl status nerve-node.service",
+            "sudo systemctl status nerve-node",
+            "systemctl is-active nerve-node",
+            "systemctl is-enabled nerve-node",
+            "systemctl show nerve-node",
+            "systemctl cat nerve-node",
+            "systemctl list-units 'nerve*'",
+            "systemctl stop sshd",
+            "systemctl restart nerve-center",
+            "systemctl stop nerve-node-extra",
+            "systemctl stop my-nerve-node",
+            "journalctl -u nerve-node",
+            "journalctl -u nerve-node -f",
+            "sc query nerve-node",
+            "sc.exe query nerve-node",
+            "sc qc nerve-node",
+            "sc stop spooler",
+            "sc queryex nerve-node",
+            "Get-Service nerve-node",
+            "Get-Service -Name nerve-node | Format-List",
+            "Get-Service nerve-node | Select-Object Status",
+            "Stop-Service spooler",
+            "Restart-Service -Name spooler",
+            "Set-Service -Name spooler -StartupType Disabled",
+            "net start spooler",
+            "net stop spooler",
+            "net start nerve-node-other",
+            "taskkill /im notepad.exe",
+            "taskkill /im nerve-center.exe",
+            "tasklist /fi \"IMAGENAME eq nerve-node.exe\"",
+            "Get-Process nerve-node",
+            "Get-Process notepad | Stop-Process",
+            "Stop-Process -Name notepad",
+            "cargo build -p nerve-node",
+            "cargo build -p nerve-node-desktop --release",
+            "cargo test -p nerve-node",
+            "git commit -m 'systemctl stop nerve-node'",
+            "git commit -m 'Stop-Service nerve-node'",
+            "echo systemctl stop nerve-node",
+            "grep -r 'systemctl stop nerve-node' docs/",
+        ] {
+            assert!(!run(c), "should stay allowed: {c}");
+        }
     }
 
     #[test]

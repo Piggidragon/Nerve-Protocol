@@ -41,9 +41,20 @@ node itself: a command that runs `nerve-node` or `nerve-node-desktop` (at
 the start of a command, after `sudo`, or by a path, `.exe` too), a command
 line that names the node's socket or pipes or its config and state folders
 (`/etc/nerve`, `/var/lib/nerve`, `~/.config/nerve`, `~/.local/state/nerve`,
-`%ProgramData%\Nerve`), and a write into those folders. The name alone is
-not refused: `cargo build -p nerve-node` and `journalctl -u nerve-node` run.
-`rule ls deny` shows them; remove any you do not want.
+`%ProgramData%\Nerve`), a write into those folders, and a command that
+stops the node's service by its name, as the node's own `service stop` would.
+The name alone is not refused: `cargo build -p nerve-node` and
+`journalctl -u nerve-node` run. `rule ls deny` shows them; remove any you do
+not want.
+
+| | Refused | Still runs |
+|---|---|---|
+| Linux | `systemctl stop`, `restart`, `try-restart`, `reload-or-restart`, `disable`, `kill` or `mask` on `nerve-node` (or `nerve-node.service`), with or without `sudo`, a path to `systemctl` or flags such as `--now` | `systemctl status`, `is-active`, `show`, `cat` on it, `journalctl -u nerve-node` |
+| Windows | `sc stop`, `config` or `delete`; `net stop`; `Stop-Service`, `Restart-Service`, `Set-Service` or `Remove-Service`; `Stop-Process -Name`; `taskkill` with `nerve-node.exe` or `nerve-node-desktop.exe`; `Get-Service` or `Get-Process` on the node piped into one of the cmdlets | `sc query`, `sc qc`, `Get-Service nerve-node`, `Get-Process nerve-node` |
+
+A line that stops some other service and names `nerve-node` later is refused
+too, since the rules match the whole line. On Windows the cmdlets match in the
+spellings `Stop-Service` and `stop-service`.
 
 ```sh
 nerve-node rule guard --center lab   # puts back the ones a pairing lacks

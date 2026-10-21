@@ -279,9 +279,8 @@ as `nerve` over a pipe open to the owners only, and audits them with the
 owner's name ([who may change the node](desktop.md#administrator-rights)).
 `install`, `update`, `uninstall`, `setup`, `sudo on` and the `machine.*`
 settings that pick the account (also a `restore` that would change them)
-still need an administrator's terminal. `update` gives a node installed before there were owners the user
-who updates as its owner; `uninstall` removes the service, and the owners and
-their rights with it.
+still need an administrator's terminal. `uninstall` removes the service, and
+the owners and their rights with it.
 
 The other commands work on the installed node from an administrator's
 terminal, or an owner's. The service takes `folder add`, `folder set` and
@@ -362,10 +361,7 @@ place and starts the service; if the new one does not start, the old one
 goes back. The old program goes once nothing holds it, or at the next
 restart of Windows when Windows still holds it: when `update` ran from it, or
 when the Event Log read the text of the node's entries from it. `install`
-over an installed node moves the old program aside the same way. `update` also registers the Event Log
-source `nerve-node` again. A node installed by a program that did not
-register it yet gets it from the installed program:
-`& "C:\Program Files\Nerve\nerve-node.exe" install`, or the next `update`.
+over an installed node moves the old program aside the same way.
 
 When the [desktop app](desktop.md) takes over a node installed with
 `nerve-node.exe`, its `install` removes `C:\Program Files\Nerve\nerve-node.exe`

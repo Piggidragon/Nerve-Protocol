@@ -66,7 +66,10 @@ impl Ctl {
         let separate = cfg!(target_os = "linux") && st["owner"].is_string();
         let account = c["account"].as_str().unwrap_or_default().to_string();
         let built_in = if separate && account == nerve_node::account::RUN_USER {
-            format!("/tmp, /var/tmp and its home {}", nerve_node::account::RUN_HOME)
+            format!(
+                "/tmp, /var/tmp and its home {}",
+                nerve_node::account::RUN_HOME
+            )
         } else {
             String::new()
         };

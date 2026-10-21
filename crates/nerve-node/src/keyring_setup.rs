@@ -333,8 +333,10 @@ fn graphical_type(t: &str) -> bool {
 }
 
 /// Runs a system command as root: directly when this process is root; on
-/// the installed node, where setup keeps root as its saved id, with that id
-/// back; elsewhere through `sudo`, which asks for the password.
+/// the installed node, where setup keeps root as its saved id (run with
+/// sudo) or runs for the owner with the service's CAP_SETUID and CAP_SETGID
+/// (crate::owner), as root by those; elsewhere through `sudo`, which asks
+/// for the password.
 fn as_root(cmd: &[String]) -> Result<(), String> {
     let (program, args) = cmd.split_first().ok_or("an empty command")?;
     let mut c;
@@ -346,11 +348,13 @@ fn as_root(cmd: &[String]) -> Result<(), String> {
         unsafe { libc::getresuid(&mut r, &mut e, &mut s) };
         if e == 0 {
             c = std::process::Command::new(program);
-        } else if s == 0 {
+        } else if s == 0 || crate::account::can_switch() {
             c = std::process::Command::new(program);
             // SAFETY: plain system calls between fork and exec.
             unsafe {
                 c.pre_exec(|| {
+                    // The user first: as root again the process has its
+                    // capabilities in effect for the group and the groups.
                     if libc::setresuid(0, 0, 0) != 0
                         || libc::setresgid(0, 0, 0) != 0
                         || libc::setgroups(0, std::ptr::null()) != 0

@@ -171,7 +171,10 @@ pub fn refused(cmd: &Cmd) -> Option<String> {
             "service",
             "the service manager decides who may start and stop the service",
         ),
-        Cmd::Setup => (
+        // On Linux the node runs setup for its owner too: its one step that
+        // needs root, installing a keyring for the node's user, takes root
+        // by the service's own rights (crate::keyring_setup).
+        Cmd::Setup if cfg!(windows) => (
             "setup",
             "it can install a system keyring and restart the service",
         ),
@@ -1828,12 +1831,13 @@ mod tests {
             &["update"],
             &["uninstall", "--purge"],
             &["service", "restart"],
-            &["setup"],
-            &["setup"],
             &["sudo", "on"],
         ] {
             assert!(refused(&cli(args).cmd).is_some(), "{args:?}");
         }
+        // Setup's one step that needs root takes it on Linux by the node's
+        // own rights.
+        assert_eq!(refused(&cli(&["setup"]).cmd).is_some(), cfg!(windows));
         for args in [
             &["status"][..],
             &["center", "ls"],
@@ -1864,7 +1868,6 @@ mod tests {
             &["sudo", "on"][..],
             &["update"],
             &["uninstall"],
-            &["setup"],
             &["config", "set", "machine.user", "bob"],
             &["config", "unset", "machine.shell"],
         ] {

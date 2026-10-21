@@ -91,7 +91,7 @@ The running node takes them on its owner socket, `/run/nerve-node/owner.sock`,
 from the owner's account (and root) only, runs them as `nerve` with the CLI's
 checks, and audits them with the owner's name ([who may change the
 node](desktop.md#administrator-rights)). These stay root's, with `sudo`:
-`install`, `update`, `uninstall`, `setup`, `sudo on`, and
+`install`, `update`, `uninstall`, `sudo on`, and
 `machine.allow_root`, `machine.sudo_path` and `machine.shell`, also a
 `restore` that would change them. `backup` and `restore` open the file as the
 owner and hand it to the node ([backup](backup.md#on-a-node-installed-as-a-service)).
@@ -136,14 +136,18 @@ it runs, in every mode, so no command keeps them.
 
 ## Setup
 
-`sudo nerve-node setup` asks these things, one at a time. Enter keeps what is
-in brackets. It is optional: `center add` and `folder add` do the same.
+`nerve-node setup` asks these things, one at a time. Enter keeps what is
+in brackets. It is optional: `center add` and `folder add` do the same. The
+owner runs it without `sudo`: its one step that needs root, installing a
+keyring, takes root by the service's own rights, for that step alone.
 
 1. The node's name, as centers show it. The host name by default.
 2. Where the node keeps its keys: `file` or `keyring`
    ([keys](config.md#where-the-node-keeps-its-keys)). With `keyring` and no
    keyring that answers, it offers to install one where `nerve` has no
-   desktop, and then restarts the node if it had found none before. Not
+   desktop. If the node had found none when it started, it needs a
+   restart: run as root, setup restarts it; run by the owner, it says so,
+   and you run `nerve-node service restart` and setup again. Not
    asked on the installed node on Windows, which keeps them in files
    ([Windows](#windows)); setup warns instead.
 3. A pairing link from the center's web UI. Enter skips it. The node shows

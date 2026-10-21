@@ -2373,6 +2373,11 @@ fn restart_for_keyring(
     if status["keyring_failed"] != true {
         return Ok(());
     }
+    // Run by the node for its owner, setup would end with the node it runs
+    // in.
+    if crate::owner::owner_running().is_some() {
+        return Err("the system keyring answers now, but the node found none when it started and does not look again until it is restarted; `nerve-node service restart`, then run `nerve-node setup` again".into());
+    }
     let Some(sys) = machine else {
         return Err("the system keyring answers now, but the node that runs for this folder found none before and does not look again until it is restarted; restart it, then run `nerve-node setup` again".into());
     };
@@ -2549,7 +2554,7 @@ async fn setup_steps(
     }
     let _ = writeln!(
         out,
-        "Done. `nerve-node rule add allow '<command>'` allows one command; `nerve-node --help` lists the rest."
+        "Done. `nerve-node folder add <folder> +rwx` gives a folder, `nerve-node rule add allow '<command>'` allows a command in allowlist mode; `nerve-node --help` lists the rest."
     );
     Ok(())
 }

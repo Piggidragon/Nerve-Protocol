@@ -268,7 +268,7 @@ without a desktop, let `setup` install one.
 ### A keyring on a Linux without a desktop
 
 A server without a desktop usually has no keyring. When you choose `keyring`
-in `nerve-node setup` (on the installed node, `sudo nerve-node setup`), or
+in `nerve-node setup` (on the installed node too, without `sudo`), or
 the settings say `keyring` and no keyring answers, setup asks:
 
 ```

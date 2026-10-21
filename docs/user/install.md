@@ -43,7 +43,7 @@ let it install itself instead ([service](service.md)):
 curl -LO https://github.com/Piggidragon/Nerve-Protocol/releases/latest/download/nerve-node-x86_64-linux
 chmod +x nerve-node-x86_64-linux
 sudo ./nerve-node-x86_64-linux install
-sudo nerve-node setup
+nerve-node setup
 ```
 
 `install` puts the program at `/usr/local/bin/nerve-node`, whatever the

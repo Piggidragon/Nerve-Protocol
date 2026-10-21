@@ -1232,7 +1232,7 @@ names no package, so no AppContainer opens it.
 `cli` is refused to a caller who is not the owner, below a command the node
 runs, with `no_new_privs` (Linux), in a command's job (Windows), with
 `--config-dir` or `--state-dir`, and for `run`, `install`, `update`,
-`uninstall`, `service`, `setup` and `sudo on`. The checks of the caller's
+`uninstall`, `service` and `sudo on`, and on Windows `setup`. The checks of the caller's
 process read the process that connected, which may have ended by the time
 the request comes: they catch mistakes of a command that runs as the owner,
 no more.

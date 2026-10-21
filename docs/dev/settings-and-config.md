@@ -167,7 +167,7 @@ administrators and the owners, read at the node's start. It takes `status`
 who is not the owner (`nerve-run` among them), a caller below a command it
 runs, one with `no_new_privs` (Linux; every confined command keeps it) or in
 a command's job (Windows), the commands that stay root's (`run`, `install`,
-`update`, `uninstall`, `service`, `setup`, `sudo on`), and a `backup` or
+`update`, `uninstall`, `service`, `sudo on`, and on Windows `setup`), and a `backup` or
 `restore` without the file the caller opened itself. The checks of the
 caller's process read `/proc/<pid>` of the process that connected, which may
 be gone by the time the request comes, so they catch mistakes, no more. Then

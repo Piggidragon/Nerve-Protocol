@@ -2,9 +2,9 @@
 
 Run them as a normal user on the machine. On a node
 [installed as a service](service.md), the owner (the account that ran
-`install`) runs them without `sudo`; `install`, `update`, `uninstall`,
-`setup` and `sudo on` need `sudo` (on Windows, a terminal opened with
-"Run as administrator"). `nerve-node --help` and
+`install`) runs them without `sudo`; `install`, `update`, `uninstall` and
+`sudo on` need `sudo`, and on Windows `setup` too (there, a terminal opened
+with "Run as administrator"). `nerve-node --help` and
 `nerve-node <command> --help` list the same. The center's web UI has a Help
 page with them too.
 

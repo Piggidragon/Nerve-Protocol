@@ -10,7 +10,7 @@ Fedora 36 and later) and fontconfig.
 | | Linux | Windows |
 |---|---|---|
 | Shell for commands | `/bin/sh -c` | Windows PowerShell 5.1 (`powershell.exe -NoProfile -Command`) |
-| `folder` mode runs commands | Yes, confined by Landlock | Yes, confined by an AppContainer; not yet on the [installed service](service.md#windows) |
+| `folder` mode runs commands | Yes, confined by Landlock; on the installed node as `nerve-run`, also where Landlock is missing | Yes, confined by an AppContainer; not yet on the [installed service](service.md#windows) |
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
 | Sudo switch | Yes | On the [installed service](service.md#windows), with the administrator token of the account commands run as ([sudo on Windows](sudo.md#sudo-on-windows)) |
 | Control socket | Yes | A control pipe that takes folder changes only |
@@ -20,9 +20,17 @@ Fedora 36 and later) and fontconfig.
 
 ## Linux
 
-- `folder` mode needs Landlock in the kernel. With the node running,
-  `nerve-node status` shows `confinement landlock v…`, or `confinement none`
-  when it is missing. With `none`, `folder` mode refuses every command.
+- With the node running, `nerve-node status` shows `confinement landlock
+  v…`, or `confinement none` when the kernel has no Landlock (some
+  container hosts, older kernels). On the node installed as a service,
+  `folder` and `allowlist` mode then run their commands as `nerve-run`
+  without Landlock, held to the folders you give it by the account alone;
+  `status` says `as nerve-run, without Landlock`. A node you run yourself
+  refuses every `folder` mode command without Landlock.
+- `nerve-run` is another account: in your home it reads what any account
+  may. When your home is open to others (`ls -ld ~` shows `drwxr-xr-x` or
+  `drwx--x--x`), `install`, `status` and the app say so. `chmod 750 ~` (or
+  `700`) closes it; most distributions make homes like that already.
 - Commands run with `no_new_privs`, so setuid programs cannot gain privileges.
   Only a command on the [sudo list](sudo.md) runs without it.
 - When a call ends, the node kills the command's whole process group.
@@ -37,7 +45,7 @@ Fedora 36 and later) and fontconfig.
   open the node's files, is refused by the owner socket, and your session's
   programs (the service manager, the session bus, tmux) take no requests
   from it, on every kernel. Landlock holds it to its own pairing's folders on
-  top.
+  top, where the kernel has it.
 - A `user` mode command runs as you, the owner, without a sandbox: it can do
   what you can, change the node's settings through the owner socket
   included. That is the owner's choice of mode. The node refuses the owner

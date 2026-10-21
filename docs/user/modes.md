@@ -224,8 +224,8 @@ and no other groups; `uninstall` removes both.
   when you remove the grant: you cannot change another account's files, and
   `nerve-run` may do anything with its own files whatever their entries say.
   It can no longer get to them through your folders above, which lost its
-  entry, unless those folders are open to everyone (see `chmod 750 ~`
-  below). Files you put into such a folder later get its entry from the
+  entry, unless those folders are open to everyone ([your
+  home](#your-home-and-other-accounts)). Files you put into such a folder later get its entry from the
   folder's default entries. `uninstall` takes every entry off, also those.
 - A grant that fails (a folder below it closed to you, a file system without
   ACLs) is named by `folder add` and `folder set` and in `nerve-node status`,
@@ -266,10 +266,32 @@ nerve-node status
 ```
 
 The first line reads `daemon: running (confinement landlock v…)`. With
-`confinement none` the node cannot confine commands, so `folder` mode refuses
-every command, on the installed node too. `allowlist` mode as `nerve-run`
-then runs without Landlock, held by the account alone. A line `folder mode runs no command: …` says the same, and
-why.
+`confinement none` the kernel has no Landlock. The installed node then runs
+`folder` mode and `allowlist` mode commands as `nerve-run` without it: the
+account and the ACL entries alone hold it to the folders you give it, and
+each pairing's line in `status` says `as nerve-run, without Landlock` (the
+app says **Without Landlock**). What sets one pairing's folders apart from
+another's is then gone, as the account is one for all of them, and so is
+the narrower set Landlock gives (`w` without `r`, `x` without listing). A
+node you run yourself refuses every `folder` mode command without Landlock,
+and a line `folder mode runs no command: …` says why.
+
+### Your home and other accounts
+
+`nerve-run` is an account like any other on the machine: in your home it may
+read what you let every account read. Where your home is open to others
+(mode 755 or 711, `ls -ld ~`), it may list your home and read your files that
+are readable by all (most are 644), outside the folders you gave it; Landlock
+holds it off them where the kernel has it, and nothing does where it has
+none. `install`, `nerve-node status` (`warning: your home … is open to other
+accounts`) and the app say so. Close it:
+
+```sh
+chmod 750 ~
+```
+
+(or `chmod 700 ~`). The node then gives `nerve-run` a pass-through entry on
+your home for the folders you grant below it, and nothing more.
 
 ## What a command can reach in `folder` mode (Windows)
 

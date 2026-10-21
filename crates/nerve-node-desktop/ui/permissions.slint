@@ -125,6 +125,33 @@ component ModeSection inherits Section {
             }
         }
     }
+    // Where the kernel has no Landlock, nerve-run runs without it.
+    Reveal {
+        shown: Perm.account == "nerve-run" && !Perm.landlock;
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.lg;
+            Banner {
+                tone: Tone.neutral;
+                title: "Without Landlock";
+                text: "This machine has no Landlock: nerve-run is held to the folders you give it by its own account alone.";
+            }
+        }
+    }
+    Reveal {
+        shown: Perm.account == "nerve-run" && Perm.home-open != "";
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.lg;
+            Banner {
+                tone: Tone.warn;
+                title: "Your home is open to other accounts";
+                text: Perm.home-open;
+            }
+        }
+    }
 }
 
 component FolderSection inherits Section {

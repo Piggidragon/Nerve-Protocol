@@ -816,11 +816,53 @@ impl Shared {
         cfg: &NodeConfig,
         account: impl FnOnce() -> Option<crate::service::Account>,
     ) -> Option<&'static str> {
-        if !self.confinement.available() || self.exe.is_none() {
-            return Some(NOT_CONFINED);
+        folder_refusal(
+            self.confinement.available() && self.exe.is_some(),
+            self.service,
+            cfg.machine.secret_storage,
+            account,
+        )
+    }
+
+    /// Whether the commands of a pairing with `policy` run under Landlock
+    /// now: in folder mode, and as `nerve-run`, where the kernel has it.
+    pub fn landlock_for(&self, policy: &nerve_policy::config::CenterPolicy) -> bool {
+        self.confinement.landlock_abi.is_some()
+            && self.exe.is_some()
+            && (policy.mode_at(crate::now_ms()) == nerve_policy::Mode::Folder
+                || self.separate(policy))
+    }
+
+    /// The owner's home when other accounts may list or enter it, with its
+    /// mode and what the node says of it (crate::account::home_open), on the
+    /// installed Linux node: `nerve-run` is such an account.
+    pub fn home_open(&self, cfg: &NodeConfig) -> Value {
+        #[cfg(target_os = "linux")]
+        {
+            if !self.service {
+                return Value::Null;
+            }
+            let Ok(Some(owner)) = self.owner_account(cfg) else {
+                return Value::Null;
+            };
+            match crate::account::home_open(&owner.home) {
+                Some(mode) => json!({
+                    "home": owner.home,
+                    "mode": format!("{mode:o}"),
+                    "warning": crate::account::home_open_warning(
+                        &owner.home,
+                        mode,
+                        self.confinement.landlock_abi.is_some(),
+                    ),
+                }),
+                None => Value::Null,
+            }
         }
-        let kept = keys_kept_from_commands(cfg.machine.secret_storage, account);
-        (!kept).then_some(KEYRING_NOT_CONFINED)
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cfg;
+            Value::Null
+        }
     }
 
     /// Counts a `folder` mode command whose Landlock domain has no connect
@@ -975,6 +1017,9 @@ impl Shared {
                     // The account its commands run as now; none on a node
                     // run by hand, which runs them as itself.
                     "account": self.command_account(&cfg, &c.policy).ok().flatten().map(|a| a.name),
+                    // Whether Landlock holds its commands now; `nerve-run`
+                    // runs without it where the kernel has none.
+                    "landlock": self.landlock_for(&c.policy),
                     "settings": c.settings,
                     "paused": c.paused,
                     "revoked": c.revoked,
@@ -1000,6 +1045,8 @@ impl Shared {
             "command_limits": crate::cgroup::status(&cfg.limits.command, &self.cgroups),
             "providers": self.providers.status(),
             "folder_grants": grants,
+            // The owner's home, when other accounts may look into it.
+            "home_open": self.home_open(&cfg),
             "centers": centers,
             "relay": self.relay.status(&cfg),
         })
@@ -1033,6 +1080,35 @@ pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this mach
 /// nor the session bus exist there.
 #[cfg(windows)]
 pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this machine while the node's keys are in the system keyring: the AppContainer here is not known to keep a command from the Credential Manager the keys are in, so folder mode runs no command; `nerve-node config set machine.secret_storage file` brings them back";
+
+/// Why commands of `folder` mode may not run ([`Shared::unconfined_as`]),
+/// or `None`: `sandbox` says whether the machine confines them, `service`
+/// whether this is the installed node, `account` the account they run as.
+/// Where Landlock is missing, `nerve-run` is held to its folders by its own
+/// account and the ACLs alone, and the installed Linux node runs its
+/// commands without it (docs/user/modes.md). `account` is asked only when
+/// the answer depends on it.
+pub fn folder_refusal(
+    sandbox: bool,
+    service: bool,
+    storage: SecretStorage,
+    account: impl FnOnce() -> Option<crate::service::Account>,
+) -> Option<&'static str> {
+    if sandbox && storage == SecretStorage::File {
+        return None;
+    }
+    let account = account();
+    let held = service
+        && cfg!(target_os = "linux")
+        && account
+            .as_ref()
+            .is_some_and(|a| a.name == crate::account::RUN_USER);
+    if !sandbox && !held {
+        return Some(NOT_CONFINED);
+    }
+    let kept = keys_kept_from_commands(storage, || account);
+    (!kept).then_some(KEYRING_NOT_CONFINED)
+}
 
 /// Whether a confined command of `account` (`None`: the node's own user)
 /// cannot reach the node's keys where `storage` keeps them. Files are out of
@@ -3074,6 +3150,47 @@ mod confinement_tests {
         }
         #[cfg(not(windows))]
         assert!(text.contains("session bus") && text.contains("nerve-run"));
+    }
+
+    /// Without Landlock, the installed Linux node runs folder mode as
+    /// `nerve-run`, which its account and the ACLs hold to its folders; a
+    /// node run by hand, and any other account, still runs none (#142).
+    #[test]
+    fn without_landlock_only_nerve_run_runs_folder_mode() {
+        let account = |name: &str, uid: u32| crate::service::Account {
+            name: name.into(),
+            uid,
+            gid: uid,
+            comment: String::new(),
+            home: "/home/x".into(),
+            groups: vec![uid],
+        };
+        let run = || Some(account(crate::account::RUN_USER, 990));
+        let file = SecretStorage::File;
+        let held = if cfg!(target_os = "linux") {
+            None
+        } else {
+            Some(NOT_CONFINED)
+        };
+        assert_eq!(folder_refusal(false, true, file, run), held);
+        assert_eq!(folder_refusal(false, false, file, run), Some(NOT_CONFINED));
+        assert_eq!(
+            folder_refusal(false, true, file, || Some(account("alice", 1000))),
+            Some(NOT_CONFINED)
+        );
+        assert_eq!(
+            folder_refusal(false, true, file, || None),
+            Some(NOT_CONFINED)
+        );
+        assert_eq!(folder_refusal(true, false, file, || None), None);
+        // The keys in the keyring: nerve-run does not reach it, the node's
+        // own user does.
+        let ring = SecretStorage::Keyring;
+        assert_eq!(folder_refusal(false, true, ring, run), held);
+        assert_eq!(
+            folder_refusal(true, false, ring, || None),
+            Some(KEYRING_NOT_CONFINED)
+        );
     }
 
     /// The installed Windows service runs commands as another account, for

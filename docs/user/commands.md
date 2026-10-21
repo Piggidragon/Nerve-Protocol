@@ -103,9 +103,12 @@ one JSON value from stdout:
   one a line). `status` has `"daemon"`:
   `"running"`, with what the running node says, or `"not running"`.
   It names the installed node's `"owner"`, each center's `"account"` (the
-  account its commands run as now, `null` on a node run by hand) and
-  `"as_owner"`, and the running Linux node's `"folder_grants"` (`"errors"`,
-  `"stale"`, `"skipped"`: what giving `nerve-run` its folders left).
+  account its commands run as now, `null` on a node run by hand),
+  `"as_owner"` and `"landlock"` (whether Landlock holds its commands now),
+  the running Linux node's `"folder_grants"` (`"errors"`, `"stale"`,
+  `"failed"`, `"skipped"`: what giving `nerve-run` its folders left; a failed
+  grant is tried again) and `"home_open"` (`{"home", "mode", "warning"}` when
+  the owner's home is open to other accounts, else `null`).
   `service status` has `"installed"`, `"state"` (`"running"`, `"stopped"`,
   `"starting"`, `"stopping"` or `"failed"`; `null` when not installed),
   `"enabled"` (it starts with the machine), `"program"` (where the program

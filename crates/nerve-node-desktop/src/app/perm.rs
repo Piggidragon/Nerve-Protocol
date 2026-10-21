@@ -105,6 +105,15 @@ impl Ctl {
             p.set_as_owner(c["as_owner"] == true);
             p.set_built_in(built_in.as_str().into());
             p.set_grant_errors(errors.join("\n").into());
+            // A pairing of the installed Linux node that runs as nerve-run
+            // says whether Landlock holds it; any other shows nothing.
+            p.set_landlock(c["landlock"] != false);
+            p.set_home_open(
+                st["home_open"]["warning"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+            );
         });
     }
 

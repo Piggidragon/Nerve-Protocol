@@ -165,12 +165,15 @@ export global Perm {
     // an account of its own (src/app/perm.rs): whether it does here, the
     // account this center's commands run as now, whether allowlist mode
     // runs as the owner, the folders nerve-run always has, and the folder
-    // grants that failed.
+    // grants that failed; whether Landlock holds this center's commands,
+    // and what the node says of a home open to other accounts.
     in-out property <bool> separate;
     in-out property <string> account;
     in-out property <bool> as-owner;
     in-out property <string> built-in;
     in-out property <string> grant-errors;
+    in-out property <bool> landlock: true;
+    in-out property <string> home-open;
     in-out property <[FolderRow]> folders;
     in-out property <[string]> allow;
     in-out property <[string]> deny;

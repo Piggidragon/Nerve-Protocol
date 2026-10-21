@@ -1891,6 +1891,9 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 if let Some(o) = v["owner"].as_str() {
                     w(out, format!("owner: {o}"));
                 }
+                if let Some(h) = v["home_open"]["warning"].as_str() {
+                    w(out, format!("warning: {h}"));
+                }
                 for e in v["folder_grants"]["errors"]
                     .as_array()
                     .into_iter()
@@ -1903,9 +1906,14 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 }
                 for c in v["centers"].as_array().into_iter().flatten() {
                     // The installed node says as whom its commands run.
-                    let whom = c["account"]
-                        .as_str()
-                        .map_or_else(String::new, |a| format!(", as {a}"));
+                    // Where Landlock is missing nerve-run runs without it.
+                    let whom = match c["account"].as_str() {
+                        Some(a) if a == crate::account::RUN_USER && c["landlock"] == false => {
+                            format!(", as {a}, without Landlock")
+                        }
+                        Some(a) => format!(", as {a}"),
+                        None => String::new(),
+                    };
                     w(
                         out,
                         format!(

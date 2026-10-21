@@ -521,6 +521,8 @@ fn the_app_drives_the_cli_end_to_end() {
         .unwrap();
         st["owner"] = owner.clone();
         st["centers"][0]["account"] = serde_json::json!("nerve-run");
+        st["centers"][0]["landlock"] = serde_json::json!(false);
+        st["home_open"] = serde_json::json!({"warning": "your home /home/alice is open to other accounts (mode 755)"});
         st["folder_grants"] = serde_json::json!({"errors": [
             format!("{}: Permission denied (os error 13)", root.join("work/closed").display()),
             "/elsewhere/proj: Permission denied (os error 13)",
@@ -536,12 +538,17 @@ fn the_app_drives_the_cli_end_to_end() {
             let errors = perm.get_grant_errors();
             assert!(errors.contains("work/closed"), "{errors}");
             assert!(!errors.contains("/elsewhere"), "{errors}");
+            assert!(!perm.get_landlock());
+            assert!(perm.get_home_open().contains("mode 755"));
         } else {
             assert!(!perm.get_separate());
             assert_eq!(perm.get_built_in(), "");
         }
     }
     ctl.refresh_status();
+    until(&ctl, "the node's own status", || {
+        perm.get_landlock() && perm.get_home_open() == ""
+    });
     perm.invoke_folder_remove(path);
     assert!(config(&paths).centers[0].policy.folders.is_empty());
 

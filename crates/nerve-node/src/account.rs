@@ -63,6 +63,61 @@ pub const NO_ACCOUNT_INSTALL: &str = "`nerve-node install` asks again";
 
 /// Looks `name` up in the system's account database. `getent` and `id` ask
 /// it through NSS, which the static program cannot do itself.
+/// The mode of `home` when other accounts may list or enter it (`o+r` or
+/// `o+x`): `nerve-run` is another account, and reads there what anyone may.
+#[cfg(unix)]
+pub fn home_open(home: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(home).ok()?.permissions().mode() & 0o777;
+    (mode & 0o005 != 0).then_some(mode)
+}
+
+/// What the node says of a home open to other accounts ([`home_open`]),
+/// with or without Landlock on this machine.
+#[cfg(unix)]
+pub fn home_open_warning(home: &Path, mode: u32, landlock: bool) -> String {
+    let held = if landlock {
+        "where Landlock does not hold it to its folders"
+    } else {
+        "as this machine has no Landlock to hold it to its folders"
+    };
+    format!(
+        "your home {home} is open to other accounts (mode {mode:o}): {RUN_USER}, which runs the commands of folder mode, may read there what any account may, {held}; `chmod 750 {home}` (or 700) closes it",
+        home = home.display()
+    )
+}
+
+#[cfg(all(test, unix))]
+mod home_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A home others may list or enter is open to `nerve-run` too; one
+    /// closed to them is not (#142).
+    #[test]
+    fn a_home_open_to_others_is_told() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        for (mode, open) in [
+            (0o755, true),
+            (0o711, true),
+            (0o704, true),
+            (0o750, false),
+            (0o700, false),
+        ] {
+            std::fs::set_permissions(home, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(home_open(home), open.then_some(mode), "{mode:o}");
+        }
+        let text = home_open_warning(home, 0o755, false);
+        assert!(
+            text.contains("mode 755") && text.contains("chmod 750"),
+            "{text}"
+        );
+        assert!(text.contains("no Landlock"), "{text}");
+        assert!(!home_open_warning(home, 0o755, true).contains("no Landlock"));
+    }
+}
+
 /// Root, as an allowed sudo command of a pairing whose commands run as
 /// [`RUN_USER`] runs (crate::link): the node starts it as root itself, with
 /// root's own group only, since `nerve-run` has no sudo of its own.

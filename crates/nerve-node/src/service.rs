@@ -1052,16 +1052,36 @@ fn owner_of_install(
         }
         (i, _) => i,
     };
-    if let Err(e) = usable_owner(sys, &layout.paths, name) {
-        steps.did(format!(
-            "Warning: no owner: {e}; only root changes the node and user mode runs no command"
-        ));
-        return Ok(None);
-    }
+    let account = match usable_owner(sys, &layout.paths, name) {
+        Ok(a) => a,
+        Err(e) => {
+            steps.did(format!(
+                "Warning: no owner: {e}; only root changes the node and user mode runs no command"
+            ));
+            return Ok(None);
+        }
+    };
     steps.did(format!(
         "{name} is the owner of the node: `{}` changes its settings and starts and stops it without sudo, and user mode runs commands as {name}",
         layout.edition.program
     ));
+    // nerve-run is another account: what the owner's home shows others, it
+    // sees, and without Landlock nothing else keeps it from that.
+    let landlock = nerve_sandbox::Confinement::detect().landlock_abi.is_some();
+    if !landlock {
+        steps.did(
+            "this kernel has no Landlock: the commands of nerve-run run without it, held to the folders you give it by its own account alone".to_string(),
+        );
+    }
+    #[cfg(unix)]
+    if let Some(mode) = crate::account::home_open(&account.home) {
+        steps.did(format!(
+            "Warning: {}",
+            crate::account::home_open_warning(&account.home, mode, landlock)
+        ));
+    }
+    #[cfg(not(unix))]
+    let _ = account;
     Ok(Some(name.to_string()))
 }
 

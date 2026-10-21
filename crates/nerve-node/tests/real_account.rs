@@ -3,8 +3,11 @@
 //! with the folder the owner gives it (a POSIX ACL), `/tmp` and its own home,
 //! and nothing else of the owner's; the owner socket refuses it; `folder rm`
 //! takes the ACL off; `uninstall` removes the account, its home and every
-//! entry (issue #142). For a test machine only, as root: it installs the
-//! node as a service and removes it again.
+//! entry, also on what nerve-run made (issue #142). Where the kernel has no
+//! Landlock, folder mode runs as nerve-run all the same. An allowed sudo
+//! command of nerve-run runs as root without the owner's password. For a
+//! test machine only, as root: it installs the node as a service and removes
+//! it again, and gives the owner a password and sudo.
 //!
 //! `NERVE_NODE_REAL=<the nerve-node to install> NERVE_REAL_OWNER=<an account
 //! with a home, the owner> cargo test -p nerve-node --test real_account --
@@ -40,6 +43,33 @@ fn as_owner(owner: &str, args: &[&str]) -> (bool, String) {
         .args(["-u", owner, "--", BIN])
         .args(args)
         .current_dir("/"))
+}
+
+/// [`as_owner`] with `input` on stdin.
+fn as_owner_typing(owner: &str, args: &[&str], input: &str) -> (bool, String) {
+    use std::io::Write;
+    let mut child = Command::new("runuser")
+        .args(["-u", owner, "--", BIN])
+        .args(args)
+        .current_dir("/")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("starts");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    (o.status.success(), text)
 }
 
 fn getfacl(p: &Path) -> String {
@@ -94,15 +124,28 @@ async fn folder_mode_runs_as_nerve_run_on_this_machine() {
         sh(Command::new("sh").args(["-c", &format!("getent passwd {owner} | cut -d: -f6")])).1;
     let home = PathBuf::from(home.trim());
     assert!(home.is_dir(), "{home:?}");
+    let chmod = |p: &Path, m: &str| assert!(sh(Command::new("chmod").arg(m).arg(p)).0);
+    let landlock = nerve_sandbox::Confinement::detect().landlock_abi.is_some();
 
     // Install, as the owner's sudo would: the owner is named, nerve-run is
-    // made with its home.
+    // made with its home. A home open to other accounts is told.
+    chmod(&home, "755");
     let (ok, said) = sh(Command::new(&exe).arg("install").env("SUDO_USER", &owner));
     assert!(ok, "{said}");
     assert!(
         said.contains(&format!("{owner} is the owner of the node")),
         "{said}"
     );
+    assert!(
+        said.contains("is open to other accounts (mode 755)"),
+        "{said}"
+    );
+    assert_eq!(said.contains("no Landlock"), !landlock, "{said}");
+    let (_, st) = as_owner(&owner, &["status"]);
+    assert!(st.contains("warning: your home"), "{st}");
+    chmod(&home, "750");
+    let (_, st) = as_owner(&owner, &["status"]);
+    assert!(!st.contains("warning: your home"), "{st}");
     let (ok, id) = sh(Command::new("id").arg("nerve-run"));
     assert!(ok, "{id}");
     assert!(!id.contains("sudo") && !id.contains("docker"), "{id}");
@@ -144,7 +187,6 @@ async fn folder_mode_runs_as_nerve_run_on_this_machine() {
         );
     };
     chown(&base);
-    let chmod = |p: &Path, m: &str| assert!(sh(Command::new("chmod").arg(m).arg(p)).0);
     chmod(&home, "750");
     chmod(&base, "755");
     chmod(&base.join("open.txt"), "644");
@@ -182,36 +224,53 @@ except OSError as e:
     std::fs::write(proj.join("who.sh"), "#!/bin/sh\nid -un\necho \"$HOME\"\n").unwrap();
     std::fs::write(
         proj.join("rw.sh"),
-        "#!/bin/sh\nset -e\ncat given.txt\necho made > made.txt\ncat made.txt\necho t > /tmp/nerve-real-t\ncat /tmp/nerve-real-t\nrm /tmp/nerve-real-t\necho h > \"$HOME/h\"\ncat \"$HOME/h\"\n",
+        "#!/bin/sh\nset -e\ncat given.txt\necho made > made.txt\ncat made.txt\nmkdir made-dir\necho in > made-dir/in.txt\necho t > /tmp/nerve-real-t\ncat /tmp/nerve-real-t\nrm /tmp/nerve-real-t\necho h > \"$HOME/h\"\ncat \"$HOME/h\"\n",
     )
     .unwrap();
+    // A folder below the grant closed to the owner: its grant fails.
+    let shut = proj.join("shut");
+    std::fs::create_dir_all(shut.join("inner")).unwrap();
     chown(&proj);
     for script in ["who.sh", "rw.sh"] {
         chmod(&proj.join(script), "755");
     }
+    chmod(&shut, "000");
 
-    // The owner pairs and gives the folder, without sudo.
+    // The owner pairs and gives the folder, without sudo: the closed folder
+    // in it is told at once, and in `status`.
     let mut center = FakeCenter::start(false).await.unwrap();
     let link = center.link().render();
     let (ok, said) = as_owner(&owner, &["center", "add", &link, "--yes"]);
     assert!(ok, "{said}");
     let (ok, said) = as_owner(&owner, &["folder", "add", proj.to_str().unwrap(), "+rwx"]);
     assert!(ok, "{said}");
+    assert!(
+        said.contains("warning: nerve-run did not get every folder"),
+        "{said}"
+    );
+    assert!(said.contains("shut"), "{said}");
+    let (_, st) = as_owner(&owner, &["status"]);
+    assert!(st.contains("folder grant: ") && st.contains("shut"), "{st}");
+    // Opened, the grant is tried again with the next change.
+    chmod(&shut, "755");
+    let p = proj.to_str().unwrap();
+    assert!(as_owner(&owner, &["folder", "set", p, "-x"]).0);
+    let (ok, said) = as_owner(&owner, &["folder", "set", p, "+x"]);
+    assert!(ok && !said.contains("warning"), "{said}");
+    let (_, st) = as_owner(&owner, &["status"]);
+    assert!(!st.contains("folder grant: "), "{st}");
     let (_, ls) = as_owner(&owner, &["--json", "center", "ls"]);
     let ls: Value = serde_json::from_str(ls.trim()).unwrap();
     assert_eq!(ls["centers"][0]["mode"], "folder", "{ls}");
-    let name = ls["centers"][0]["name"].as_str().unwrap().to_string();
-    // Without Landlock folder mode runs no command; allowlist mode runs them
-    // as nerve-run all the same, held by its account alone.
-    let landlock = nerve_sandbox::Confinement::detect().landlock_abi.is_some();
-    if !landlock {
-        eprintln!("no Landlock here: allowlist mode, every command allowed");
-        let key = format!("center.{name}.policy.allow");
-        let (ok, said) = as_owner(&owner, &["mode", "set", "allowlist"]);
-        assert!(ok, "{said}");
-        let (ok, said) = as_owner(&owner, &["config", "add", &key, "exec.run:*"]);
-        assert!(ok, "{said}");
-    }
+    // Without Landlock folder mode runs as nerve-run all the same, and
+    // `status` says so.
+    let (_, st) = as_owner(&owner, &["status"]);
+    let line = if landlock {
+        "mode folder, as nerve-run\n"
+    } else {
+        "mode folder, as nerve-run, without Landlock"
+    };
+    assert!(st.contains(line), "{st}");
     let paired = center.paired().expect("paired");
     let mut inc = center.next_link(WAIT).await.expect("the node dials");
     fake_center::handshake(&mut inc.conn, &center.center_id, &paired)
@@ -237,6 +296,12 @@ except OSError as e:
         .args(["-u", &owner, "--", "sh", "-c"])
         .arg(format!("echo more >> {}", proj.join("made.txt").display())));
     assert!(ok, "the owner writes what nerve-run made: {said}");
+    let run_id = sh(Command::new("id").args(["-u", "nerve-run"])).1;
+    let acl = getfacl(&shut.join("inner"));
+    assert!(
+        acl.contains(&format!("\nuser:{}:rwx", run_id.trim())),
+        "the grant reached the folder once open: {acl}"
+    );
     // No other file of the owner's: one closed to others by its mode, and
     // with Landlock one open to them as well.
     let others: &[&str] = if landlock {
@@ -257,8 +322,37 @@ except OSError as e:
     assert!(out(&r).contains("not the owner"), "{r}");
     let (_, ls) = as_owner(&owner, &["--json", "center", "ls"]);
     let ls: Value = serde_json::from_str(ls.trim()).unwrap();
-    let mode = if landlock { "folder" } else { "allowlist" };
-    assert_eq!(ls["centers"][0]["mode"], mode, "{ls}");
+    assert_eq!(ls["centers"][0]["mode"], "folder", "{ls}");
+
+    // sudo: on with the owner's password; an allowed sudo command of
+    // nerve-run runs as root, started by the node, not through the owner's
+    // sudo: it still works after the owner's password changed. One the sudo
+    // list does not name is refused.
+    let pw = |p: &str| {
+        let mut c = Command::new("chpasswd");
+        c.stdin(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{owner}:{p}\n").as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    };
+    pw("first-pass-142");
+    assert!(sh(Command::new("usermod").args(["-aG", "sudo", &owner])).0);
+    let (ok, said) = as_owner_typing(&owner, &["sudo", "on"], "first-pass-142\n");
+    assert!(ok, "{said}");
+    let (ok, said) = as_owner(&owner, &["rule", "add", "sudo", "id -un"]);
+    assert!(ok, "{said}");
+    pw("second-pass-142");
+    let r = run(&mut conn, &proj, "sudo id -un").await.unwrap();
+    assert_eq!(out(&r), "root\n", "{r}");
+    let r = run(&mut conn, &proj, "sudo whoami").await;
+    assert!(r.is_err(), "{r:?}");
+    assert!(as_owner(&owner, &["sudo", "off"]).0);
 
     // The ACLs: on the folder and below, default ones for nerve-run and the
     // owner, a pass-through one on the closed home above it.
@@ -301,6 +395,37 @@ except OSError as e:
     assert!(ok, "{said}");
     let r = run(&mut conn, &proj, "cat given.txt").await.unwrap();
     assert_eq!(out(&r), "given\n", "{r}");
+    // Allowlist mode as nerve-run: its folders count, and say nothing; as
+    // the owner they do not, and nerve-run loses their entries.
+    let other = base.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    chown(&other);
+    assert!(as_owner(&owner, &["mode", "set", "allowlist"]).0);
+    let (ok, said) = as_owner(&owner, &["folder", "add", other.to_str().unwrap(), "+r"]);
+    assert!(ok && !said.contains("do not count"), "{said}");
+    assert!(
+        getfacl(&other).contains(&format!("\nuser:{run_uid}:r-x")),
+        "{}",
+        getfacl(&other)
+    );
+    assert!(as_owner(&owner, &["mode", "set", "allowlist", "--as-owner"]).0);
+    let (ok, said) = as_owner(&owner, &["folder", "set", other.to_str().unwrap(), "+x"]);
+    assert!(ok, "{said}");
+    for p in [&proj, &other] {
+        assert!(
+            !getfacl(p).contains(&format!("user:{run_uid}:")),
+            "{p:?}: {}",
+            getfacl(p)
+        );
+    }
+    let third = base.join("third");
+    std::fs::create_dir_all(&third).unwrap();
+    chown(&third);
+    let (ok, said) = as_owner(&owner, &["folder", "add", third.to_str().unwrap(), "+r"]);
+    assert!(ok && said.contains("do not count"), "{said}");
+    assert!(as_owner(&owner, &["mode", "set", "folder"]).0);
+    let r = run(&mut conn, &proj, "cat given.txt").await.unwrap();
+    assert_eq!(out(&r), "given\n", "{r}");
     drop(conn);
 
     // Uninstall: the account, its home and every entry go.
@@ -309,8 +434,17 @@ except OSError as e:
     assert!(said.contains("removed the account nerve-run"), "{said}");
     assert!(!sh(Command::new("id").arg("nerve-run")).0);
     assert!(!run_home.exists());
-    for p in [&proj, &proj.join("given.txt"), &home] {
-        assert!(!getfacl(p).contains(&format!("user:{run_uid}:")), "{p:?}");
+    // Also on what nerve-run made, which was its own.
+    for p in [
+        &proj,
+        &proj.join("given.txt"),
+        &home,
+        &proj.join("made.txt"),
+        &proj.join("made-dir"),
+        &proj.join("made-dir/in.txt"),
+    ] {
+        let acl = getfacl(p);
+        assert!(!acl.contains(&format!("user:{run_uid}:")), "{p:?}: {acl}");
     }
     std::fs::remove_dir_all(&base).unwrap();
 }

@@ -77,7 +77,7 @@ component ModeSection inherits Section {
         OptionTile {
             icon: @image-url("icons/folder.svg");
             title: "Folder";
-            text: "What each folder below allows.";
+            text: Perm.separate ? "The folders below, as nerve-run, an account of its own." : "What each folder below allows.";
             selected: Perm.mode == "folder";
             badge: Perm.mode == "folder" ? "Now" : "";
             clicked => {
@@ -87,11 +87,29 @@ component ModeSection inherits Section {
         OptionTile {
             icon: @image-url("icons/key.svg");
             title: "User";
-            text: "Anything you may do, protected files aside.";
+            text: "Anything you may do, as you, protected files aside.";
             selected: Perm.mode == "user";
             badge: Perm.mode == "user" ? "Now" : "";
             clicked => {
                 Perm.mode-pick("user");
+            }
+        }
+    }
+    // Allowlist mode runs as nerve-run unless the owner says otherwise.
+    Reveal {
+        shown: Perm.separate && Perm.mode == "allowlist";
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.lg;
+            alignment: start;
+            Chip {
+                text: "Run them as you";
+                label: "Run the allowed commands as you";
+                on: Perm.as-owner;
+                toggled(on) => {
+                    Perm.as-owner-set(on);
+                }
             }
         }
     }
@@ -112,16 +130,31 @@ component ModeSection inherits Section {
 component FolderSection inherits Section {
     icon: @image-url("icons/folder.svg");
     title: "Folders";
-    text: "What " + Perm.center + " may do in each, in folder mode.";
+    text: "What " + Perm.center + " may do in each.";
+    // Folders count in folder mode, and as nerve-run's sandbox in
+    // allowlist mode.
     Reveal {
-        shown: Perm.mode != "folder" && Perm.folders.length > 0;
+        shown: Perm.folders.length > 0 && (Perm.mode == "user" || (Perm.mode == "allowlist" && (!Perm.separate || Perm.as-owner)));
         HorizontalLayout {
             padding-left: Space.xl;
             padding-right: Space.xl;
             padding-bottom: Space.md;
             Banner {
                 tone: Tone.neutral;
-                text: "Folders count in folder mode only.";
+                text: "Folders do not count in this mode.";
+            }
+        }
+    }
+    Reveal {
+        shown: Perm.grant-errors != "";
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.md;
+            Banner {
+                tone: Tone.warn;
+                title: "nerve-run did not get every folder";
+                text: Perm.grant-errors;
             }
         }
     }
@@ -189,13 +222,25 @@ component FolderSection inherits Section {
             padding: Space.lg;
             padding-left: Space.xl;
             spacing: Space.md;
-            if Perm.folders.length == 0: Text {
+            if Perm.folders.length == 0 && Perm.built-in == "": Text {
                 text: "No folder yet.";
                 color: Theme.text-muted;
                 font-size: Type.small;
                 vertical-alignment: center;
             }
-            Rectangle {
+            // nerve-run's own folders, which no grant gives or takes.
+            Reveal {
+                shown: Perm.built-in != "";
+                horizontal-stretch: 1;
+                Text {
+                    text: "Always: " + Perm.built-in + ", to read, write and run in.";
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+            if Perm.built-in == "": Rectangle {
                 horizontal-stretch: 1;
             }
             Button {

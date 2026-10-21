@@ -161,6 +161,16 @@ export global Perm {
     in-out property <string> error;
     in-out property <string> mode;
     in-out property <string> mode-until;
+    // The installed Linux node runs folder and allowlist mode as nerve-run,
+    // an account of its own (src/app/perm.rs): whether it does here, the
+    // account this center's commands run as now, whether allowlist mode
+    // runs as the owner, the folders nerve-run always has, and the folder
+    // grants that failed.
+    in-out property <bool> separate;
+    in-out property <string> account;
+    in-out property <bool> as-owner;
+    in-out property <string> built-in;
+    in-out property <string> grant-errors;
     in-out property <[FolderRow]> folders;
     in-out property <[string]> allow;
     in-out property <[string]> deny;
@@ -210,6 +220,7 @@ export global Perm {
     callback refresh();
     callback mode-pick(string);
     callback mode-apply();
+    callback as-owner-set(bool);
     callback folder-choose();
     callback folder-add();
     callback folder-set(string, bool, bool, bool);

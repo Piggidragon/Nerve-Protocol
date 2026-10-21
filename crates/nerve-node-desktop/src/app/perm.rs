@@ -61,10 +61,44 @@ impl Ctl {
             .find(|c| c["name"] == center.as_str())
             .cloned()
             .unwrap_or(Value::Null);
+        // The installed Linux node names its owner and runs folder and
+        // allowlist mode as nerve-run (nerve_node::account).
+        let separate = cfg!(target_os = "linux") && st["owner"].is_string();
+        let account = c["account"].as_str().unwrap_or_default().to_string();
+        let built_in = if separate && account == nerve_node::account::RUN_USER {
+            format!("/tmp, /var/tmp and its home {}", nerve_node::account::RUN_HOME)
+        } else {
+            String::new()
+        };
+        let errors: Vec<&str> = st["folder_grants"]["errors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
         self.with_perm(|p| {
             p.set_mode(c["mode"].as_str().unwrap_or_default().into());
             p.set_mode_until(view::mode_until(&c, now_ms()).into());
+            p.set_separate(separate);
+            p.set_account(account.as_str().into());
+            p.set_as_owner(c["as_owner"] == true);
+            p.set_built_in(built_in.as_str().into());
+            p.set_grant_errors(errors.join("\n").into());
         });
+    }
+
+    /// Allowlist mode as the owner (`mode set allowlist --as-owner`), or as
+    /// nerve-run again.
+    fn as_owner_set(self: &Rc<Self>, on: bool) {
+        let center = self.perm_center();
+        let mut args = vec!["mode".into(), "set".into(), "allowlist".into()];
+        let said = if on {
+            args.push("--as-owner".into());
+            format!("{center}'s allowed commands run as you.")
+        } else {
+            format!("{center}'s allowed commands run as nerve-run.")
+        };
+        self.perm_change(args, None, said, |_| {}, |c, e| c.toast(e, Tone::Danger));
     }
 
     pub(super) fn perm_load(self: &Rc<Self>) {
@@ -522,6 +556,8 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     p.on_mode_pick(move |m| c.mode_pick(&m));
     let c = ctl.clone();
     p.on_mode_apply(move || c.mode_apply());
+    let c = ctl.clone();
+    p.on_as_owner_set(move |on| c.as_owner_set(on));
     let c = ctl.clone();
     p.on_folder_choose(move || c.folder_choose());
     let c = ctl.clone();

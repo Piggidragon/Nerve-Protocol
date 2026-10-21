@@ -106,8 +106,7 @@ unless you give `--include-keyring`) does not keep whatever is on this machine:
   and header names. Restore with `--without-proxy` and set the proxy again
   here; or start or unlock the keyring (on a Linux without a desktop,
   `nerve-node setup` can install one if you answer `keyring` where it asks
-  where the keys go; on a kernel below Linux 7.1 it installs none, so start
-  one by hand); or take the header values off the node you back up
+  where the keys go); or take the header values off the node you back up
   (`nerve-node proxy rm` there) and make a new backup. A backup made with
   `--include-keyring` does not get round this: it writes the values into the
   same keyring, and fails the same way.
@@ -213,16 +212,17 @@ center, a relayed node holds the pin of its relay, and a node behind an
 2. Copy the file, install `nerve-node` on the new machine
    ([install](install.md)), and `nerve-node restore file`.
 3. Check what belongs to the machine and not to the node: the folders in
-   `center.<name>.policy.folders`, the account commands run as
+   `center.<name>.policy.folders`, the account commands run as on Windows
    (`machine.user`), the paths of providers, and the address of the relay.
+   On Linux the installed node's owner is whoever installed it there, not
+   part of the backup.
    `nerve-node config get` shows each.
 4. `nerve-node sudo on` if you used the sudo switch, then `nerve-node run`.
 
 A node whose proxy has header values (an `http://` proxy with a login is one)
 needs a keyring that answers on the new machine, since the node reads those
 values from it ([keys](config.md#where-the-node-keeps-its-keys) says how a
-Linux without a desktop gets one; on a kernel below Linux 7.1 `nerve-node setup`
-installs none). Without a keyring the restore stops, and the node could not use
+Linux without a desktop gets one). Without a keyring the restore stops, and the node could not use
 that proxy anyway. Restore with `--without-proxy` and set the proxy again on the
 new machine, or take the header values off the old node with `nerve-node proxy
 rm` and back it up again.
@@ -267,11 +267,11 @@ too, or reads `--passphrase-file` as you. A backup is put in place once it is
 complete. For a restore the node stops, restores and starts again by itself,
 so it must run when you start it. A backup that would change
 `machine.user`, `machine.allow_root`, `machine.sudo_path` or `machine.shell`
-is refused to an owner: restore it with `sudo` (on Windows from an
+is refused to the owner: restore it with `sudo` (on Windows from an
 administrator's terminal).
 
-The desktop app does this for an owner without a question; it asks for the
-administrator only for such a backup. For someone who is no owner it works
+The desktop app does this for the owner without a question; it asks for the
+administrator only for such a backup. For someone who is not the owner it works
 as `sudo` above, without the second try: a file you may not open is refused
 there.
 

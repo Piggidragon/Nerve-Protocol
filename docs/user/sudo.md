@@ -22,23 +22,18 @@ for it.
    nerve-node rule add sudo 'apt update' --wildcard   # sudo apt, and anything after it
    ```
 
-2. Switch sudo on. The node must be running. It asks for the sudo password
-   of the account the commands run as: your own on a node you run yourself,
-   the account `install` took or `setup` chose on a node installed as a
-   [service](service.md#the-account-commands-run-as):
+2. Switch sudo on. The node must be running. It asks for your own sudo
+   password: a sudo command runs as you, the owner, also on a node installed
+   as a [service](service.md#the-accounts-commands-run-as) whose other
+   commands run as `nerve-run`:
 
    ```sh
    nerve-node sudo on
    ```
 
-   On a node installed as a service, `install` takes the account that ran
-   `sudo`. That account is no boundary: its owner logs in as it, and a
-   command can reach what the owner does with sudo. If it has `NOPASSWD`
-   sudo, every command is root. `install` and `setup` warn about this and
-   suggest `sudo nerve-node setup --create-user nerve-work`. An account made
-   that way has no password and no sudoers entry, so `sudo on` does not work
-   for it until you give it both. A node-only account that needs a password
-   for sudo and gets root no other way is fine.
+   A sudo command is yours: it runs as root through your sudo, in every
+   mode, and the folders do not hold it. Put on the sudo list only what you
+   would run yourself.
 
 3. Look or turn it off:
 

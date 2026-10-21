@@ -523,6 +523,29 @@ fn every_page_light_and_dark() {
     perm.set_edit_list(1);
     shots.take_full("permissions-edit", 2150);
     perm.set_edit_list(-1);
+    // The installed Linux node: folder mode runs as nerve-run, with the
+    // folders it always has; allowlist mode as nerve-run or as the owner; a
+    // folder grant that failed (issue #142).
+    perm.set_separate(true);
+    perm.set_account("nerve-run".into());
+    perm.set_built_in("/tmp, /var/tmp and its home /var/lib/nerve-run".into());
+    perm.set_mode("folder".into());
+    shots.take_full("permissions-nerve-run", 2150);
+    perm.set_grant_errors("/home/alex/usb-stick: its file system does not support POSIX ACLs, so nerve-run cannot be given it; give a folder on another file system (ext4, xfs, btrfs and tmpfs have them)".into());
+    shots.take("permissions-grant-errors");
+    perm.set_grant_errors("".into());
+    perm.set_mode("allowlist".into());
+    perm.set_as_owner(true);
+    shots.take("permissions-allowlist-as-owner");
+    perm.set_mode_choice("folder".into());
+    perm.set_mode_open(true);
+    shots.take("permissions-mode-folder-nerve-run");
+    perm.set_mode_open(false);
+    perm.set_as_owner(false);
+    perm.set_separate(false);
+    perm.set_account("".into());
+    perm.set_built_in("".into());
+    perm.invoke_pick(0);
     // Allowlist mode: the allow list, the deny rules as its exceptions.
     let office = perm.get_centers().iter().position(|c| c == OFFICE).unwrap();
     for (list, rule) in [

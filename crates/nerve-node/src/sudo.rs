@@ -131,9 +131,11 @@ impl Shared {
                 "the sudo password is empty or has a line break".into(),
             ));
         }
-        // The password is the owner's: a sudo command runs as the owner
-        // whatever account the pairing's other commands use, so sudo asks
-        // for the owner's.
+        // The password is the owner's, and sudo checks it: it shows that the
+        // owner, who lets the sudo list run as root, may run commands as
+        // root here. The sudo commands of the owner's own pairings run
+        // through the owner's sudo with it; those of `nerve-run`'s pairings
+        // are started as root by the node and do not use it (crate::link).
         let checked_for = self.owner_name(&self.config());
         let account = self
             .owner_account(&self.config())

@@ -159,7 +159,9 @@ rules and runs the command.
 - The node's own folders are in none of the sets.
 - A `sudo` command runs without Landlock, which would stop sudo from gaining
   privileges. Every other command runs with `no_new_privs`.
-- Without Landlock (`confinement none`), `folder` mode refuses every command.
+- Without Landlock (`confinement none`), `folder` mode on a node run by hand
+  refuses every command. The installed Linux node runs them as `nerve-run`
+  without Landlock, held back by that account alone (`daemon::folder_refusal`).
 - In every mode a command runs in a cgroup of its own, with the memory, CPU
   and processes of `limits.command` (`crate::cgroup`, node-local §2,
   Commands). That is a bound on what it uses, not on what it reaches.

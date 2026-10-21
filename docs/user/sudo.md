@@ -39,7 +39,9 @@ for it.
    - **as `nerve-run`** (`folder` mode and `allowlist` mode on the installed
      Linux node): the node starts the command as root itself. `nerve-run`
      has no sudo and no password of its own, and your password is not used
-     for it: the sudo list is the only way to root for it.
+     for it: the sudo list is the only way to root for it. Switching sudo on
+     still asks for your password: it shows that you, who give these
+     commands root, may run commands as root on this machine yourself.
 
 3. Look or turn it off:
 
@@ -54,9 +56,8 @@ for it.
 
 On Linux (Windows differs, see [sudo on Windows](#sudo-on-windows)):
 
-- It checks the password with `sudo -S -k -v`, run as the account the
-  commands run as, so sudo checks that account's password and its sudoers
-  entries. A wrong password is refused and the switch stays as it was.
+- It checks the password with `sudo -S -k -v`, run as you (the owner on the
+  installed node), so sudo checks your password and your sudoers entries. A wrong password is refused and the switch stays as it was.
 - It keeps the password in memory only. Turning sudo off drops it. A node that
   restarts has sudo off.
 - It never sends the password to a center. It replaces any copy in a frame or

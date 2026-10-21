@@ -214,8 +214,11 @@ and no other groups; `uninstall` removes both.
   everything below it, with the rights of its flags, and a default entry, so
   that what it makes there stays yours to use as well. A folder of yours
   above a grant that others may not enter gets an entry that lets it pass
-  through and nothing more. Removing the grant takes the entries off your
-  files again. `ls -l` shows a `+` on such files, and their group bits show
+  through it: with Landlock that is all it does there, without Landlock it
+  can then read what others may read inside that folder ([your
+  home](#your-home-and-other-accounts)). Removing the grant takes the entries
+  off your files again, and a default ACL of your own on a folder below it
+  (one you set with `setfacl -d`) is left as you had it. `ls -l` shows a `+` on such files, and their group bits show
   the ACL's mask. The account is one for all pairings, so its entries are the
   union of the folders of every pairing whose commands run as `nerve-run`;
   Landlock holds each command to its own pairing's. A pairing in `user` mode,
@@ -226,7 +229,9 @@ and no other groups; `uninstall` removes both.
   It can no longer get to them through your folders above, which lost its
   entry, unless those folders are open to everyone ([your
   home](#your-home-and-other-accounts)). Files you put into such a folder later get its entry from the
-  folder's default entries. `uninstall` takes every entry off, also those.
+  folder's default entries. `uninstall` takes every entry off, also those,
+  and gives what `nerve-run` made in your folders to you, as its account
+  goes.
 - A grant that fails (a folder below it closed to you, a file system without
   ACLs) is named by `folder add` and `folder set` and in `nerve-node status`,
   also after a restart, and is tried again: at the node's start, with the
@@ -248,7 +253,14 @@ and no other groups; `uninstall` removes both.
   status` names the folder.
 - A link that is put on the way to a granted folder after you gave it, or in
   place of a folder below it, is not followed: that grant fails until its
-  path is a plain folder again.
+  path is a plain folder again. Where you remove such a grant inside another
+  one you still give, the node takes its entries off by going through the
+  outer folder, wherever the inner one lies in it now.
+- While the node cannot take an entry off that `nerve-run` should have lost,
+  no command of `nerve-run` runs, for any pairing: `folder rm`, `nerve-node
+  status` and the app (**nerve-run keeps access it should have lost**) name
+  the folder and why. Fix what stops it (a folder closed to you, a file
+  system without ACLs); the node tries again before the next command.
 - A file or folder a command makes private (mode 0600 or 0700) stays its
   own: the ACL mask hides your entry then, and you cannot read it without
   `sudo` (`sudo cat`, or `sudo chown` it to you). That is known and
@@ -267,10 +279,11 @@ nerve-node status
 
 The first line reads `daemon: running (confinement landlock v…)`. With
 `confinement none` the kernel has no Landlock. The installed node then runs
-`folder` mode and `allowlist` mode commands as `nerve-run` without it: the
-account and the ACL entries alone hold it to the folders you give it, and
-each pairing's line in `status` says `as nerve-run, without Landlock` (the
-app says **Without Landlock**). What sets one pairing's folders apart from
+`folder` mode and `allowlist` mode commands as `nerve-run` without it: its
+account alone holds it back, so it reaches the folders you give it and
+whatever other accounts may reach ([your
+home](#your-home-and-other-accounts)), and each pairing's line in `status`
+says `as nerve-run, without Landlock` (the app says **Without Landlock**). What sets one pairing's folders apart from
 another's is then gone, as the account is one for all of them, and so is
 the narrower set Landlock gives (`w` without `r`, `x` without listing). A
 node you run yourself refuses every `folder` mode command without Landlock,
@@ -278,20 +291,29 @@ and a line `folder mode runs no command: …` says why.
 
 ### Your home and other accounts
 
-`nerve-run` is an account like any other on the machine: in your home it may
-read what you let every account read. Where your home is open to others
-(mode 755 or 711, `ls -ld ~`), it may list your home and read your files that
-are readable by all (most are 644), outside the folders you gave it; Landlock
-holds it off them where the kernel has it, and nothing does where it has
-none. `install`, `nerve-node status` (`warning: your home … is open to other
-accounts`) and the app say so. Close it:
+With Landlock, each command of `nerve-run` is held to its own pairing's
+folders, and nothing below is a concern.
 
-```sh
-chmod 750 ~
-```
+Without Landlock, `nerve-run` is an account like any other on the machine:
+in your home it may read every file that you let other accounts read (most
+are 644), not only the folders you give it. It gets into your home in two
+ways:
 
-(or `chmod 700 ~`). The node then gives `nerve-run` a pass-through entry on
-your home for the folders you grant below it, and nothing more.
+- Your home is open to others (mode 755 or 711, `ls -ld ~`). `chmod 750 ~`
+  (or `700`) closes it.
+- You give it a folder in your home, such as `~/project`. Then it needs to
+  pass through your home to get there, and the node gives it a pass-through
+  entry on your home and on the folders on the way. With that it reaches
+  every folder and file below your home that others may read, by name,
+  whatever the mode of your home. Closing your home does not change that.
+
+`install` (once, before any folder is given), `nerve-node status` (`warning:
+Without Landlock, nerve-run can read every file in your home …`) and the app
+(**nerve-run can read more of your home**) say so, and say which of the two
+it is. To keep it to its folders: give it folders outside your home (such
+as `/srv/work`), make your files readable by you and your group only (`umask
+027` for new ones, `chmod -R o-rwx` for those there), or use a kernel with
+Landlock.
 
 ## What a command can reach in `folder` mode (Windows)
 

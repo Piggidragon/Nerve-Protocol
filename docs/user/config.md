@@ -273,26 +273,35 @@ the settings say `keyring` and no keyring answers, setup asks:
 
 ```
 No system keyring answers for nerve: ….
-nerve-node can install GNOME Keyring: `apt-get update`, `apt-get install -y gnome-keyring dbus-user-session`, `loginctl enable-linger nerve`, so that nerve keeps a session after a reboot, and a login keyring for nerve that opens without a password.
+nerve-node can install GNOME Keyring: `/usr/bin/apt-get update`, `/usr/bin/apt-get install -y --no-install-recommends gnome-keyring dbus-user-session`, `/usr/bin/loginctl enable-linger nerve`, so that nerve keeps a session after a reboot, and a login keyring for nerve that opens without a password.
 Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in /var/lib/nerve/.local/share/keyrings, readable by nerve as the key files are; the node keeps centers out of it as it does out of the key files, except a command you let a center run outside folder mode that asks the keyring itself (secret-tool and the like). It becomes the default keyring of nerve: any other program of nerve that keeps a secret in the system keyring keeps it there, unencrypted too.
 Install it now? [y/N]
 ```
 
 Enter or `n` installs nothing, and the keys stay in their files (or the node
 keeps refusing, when the settings say `keyring`). `y` installs GNOME Keyring
-with the system's package manager (apt, dnf or pacman), keeps a session for
-the node's user from boot on, makes a login keyring for it without a
-password, and checks that it answers. `install` asks the same when an
-earlier install's settings say `keyring` and it runs in a terminal.
+and what it needs (nothing it only recommends) with the system's package
+manager (apt, dnf or pacman), keeps a session for the node's user from boot
+on, makes a login keyring for it without a password, and checks that it
+answers. These steps run as root: the programs from the system's own
+folders, by their full path, with a fixed environment, in `/`, and without
+your input. `install` asks the same when an earlier install's settings say
+`keyring` and it runs in a terminal.
+
+The question comes only when you run setup at a terminal. Answers piped
+into setup, or a setup without a terminal, get the refusal and install
+nothing, whatever they say; so does input that ends before the answer.
 
 Setup offers this only where the user has no desktop session. On a desktop,
 start the desktop's keyring instead (GNOME Keyring, or KWallet with its
 Secret Service on).
 
 A node that runs and found no keyring before does not look for one again
-until it restarts. After installing one, setup restarts the installed node.
-For a node you run yourself, setup stops and asks you to restart it, then to
-run setup again.
+until it restarts. After installing one, `sudo nerve-node setup` restarts
+the installed node. `nerve-node setup` without sudo runs inside the node, so
+it stops and asks you to run `nerve-node service restart`, then setup again;
+for a node you run yourself, it asks you to restart it, then to run setup
+again.
 
 Such a keyring survives a reboot, but as the question says, it keeps the
 keys unencrypted on disk, as safe as the files. Whether a server should

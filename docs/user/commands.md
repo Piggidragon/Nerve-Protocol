@@ -107,8 +107,12 @@ one JSON value from stdout:
   `"as_owner"` and `"landlock"` (whether Landlock holds its commands now),
   the running Linux node's `"folder_grants"` (`"errors"`, `"stale"`,
   `"failed"`, `"skipped"`: what giving `nerve-run` its folders left; a failed
-  grant is tried again) and `"home_open"` (`{"home", "mode", "warning"}` when
-  the owner's home is open to other accounts, else `null`).
+  grant is tried again; while `"stale"` names a folder, no command of
+  `nerve-run` runs) and `"home_warning"` (on a kernel without Landlock,
+  `{"home", "mode", "below", "warning"}` when `nerve-run` gets into the
+  owner's home: `"mode"` when the home is open to other accounts, else
+  `null`, `"below"` the folders given in it; `null` with Landlock or where
+  neither is so).
   `service status` has `"installed"`, `"state"` (`"running"`, `"stopped"`,
   `"starting"`, `"stopping"` or `"failed"`; `null` when not installed),
   `"enabled"` (it starts with the machine), `"program"` (where the program
@@ -134,7 +138,11 @@ one JSON value from stdout:
   `"address"`, where a new link says the relay is,
   `backup` adds `"backup"` (`file`, `centers`, `saved`, and `left_out`, each
   with `what` and `why`: `keyring`, `does-not-fit` or `missing`),
-  `center rotate-key` adds `"public_key"`, the new key, and
+  `center rotate-key` adds `"public_key"`, the new key,
+  `folder add`, `folder set` and `folder rm` on the installed Linux node add
+  `"grant_errors"` (what giving `nerve-run` its folders left, each
+  `<path>: <why>`) and `"grant_stale"` (folders whose access `nerve-run`
+  keeps although it should have lost it) when there are any, and
   `restore` adds `"restored"` (`centers`, `kept`, `no_key`, and `notes`,
   each with `text` and, when it asks you to set something again, `fix`:
   `proxy`, `sudo`, `sudo-file`, `pin` with its `center`, or `relay`).

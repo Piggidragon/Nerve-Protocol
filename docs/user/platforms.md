@@ -24,13 +24,16 @@ Fedora 36 and later) and fontconfig.
   v…`, or `confinement none` when the kernel has no Landlock (some
   container hosts, older kernels). On the node installed as a service,
   `folder` and `allowlist` mode then run their commands as `nerve-run`
-  without Landlock, held to the folders you give it by the account alone;
-  `status` says `as nerve-run, without Landlock`. A node you run yourself
-  refuses every `folder` mode command without Landlock.
-- `nerve-run` is another account: in your home it reads what any account
-  may. When your home is open to others (`ls -ld ~` shows `drwxr-xr-x` or
-  `drwx--x--x`), `install`, `status` and the app say so. `chmod 750 ~` (or
-  `700`) closes it; most distributions make homes like that already.
+  without Landlock, held back by the account alone; `status` says `as
+  nerve-run, without Landlock`. A node you run yourself refuses every
+  `folder` mode command without Landlock.
+- Without Landlock, `nerve-run` reads in your home what any other account
+  may: when your home is open to others (`ls -ld ~` shows `drwxr-xr-x` or
+  `drwx--x--x`), and when you give it a folder in your home, which it passes
+  through. `install`, `status` and the app say so. Give it folders outside
+  your home, use `umask 027`, or use a kernel with Landlock; see
+  [modes](modes.md#your-home-and-other-accounts). With Landlock nothing is
+  said: it holds each command to its folders.
 - Commands run with `no_new_privs`, so setuid programs cannot gain privileges.
   Only a command on the [sudo list](sudo.md) runs without it.
 - When a call ends, the node kills the command's whole process group.

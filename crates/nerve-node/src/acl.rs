@@ -12,7 +12,11 @@
 //! for all pairings, so its entries are the union of every pairing's grants.
 //!
 //! A folder of the owner's above a grant that others may not enter gets an
-//! entry that lets `nerve-run` pass through it and nothing more. The node
+//! entry that lets `nerve-run` pass through it. With Landlock that is all
+//! it does there; without, `nerve-run` reaches through it whatever below is
+//! open to others, which the node tells (crate::account::home_warning). A
+//! default ACL of the owner's own on a folder below a grant keeps its plain
+//! entries when the grant goes ([`Record::defaults`]). The node
 //! changes only what the owner owns, acting with the owner's file system
 //! ids (crate::account::FsAs): a file of anyone else's is left as it is, and
 //! so is a link and what lies on another file system below a grant. A file

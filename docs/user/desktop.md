@@ -249,7 +249,17 @@ switches between `nerve-run` and you (`mode set allowlist --as-owner`).
 Under **Folders**, the line **Always** names what `nerve-run` has besides
 the folders you give it: `/tmp`, `/var/tmp` and its home. A folder that
 `nerve-run` could not be given (a file system without ACLs, a folder of
-another account's on its way) shows above the list with the reason.
+another account's on its way) shows above the list with the reason. Access
+`nerve-run` keeps although it should have lost it (a folder you removed
+whose entries the node could not take off) shows on every center whose
+commands run as `nerve-run`, as **nerve-run keeps access it should have
+lost**: none of its commands runs until that is fixed.
+
+Where the kernel has no Landlock, a center whose commands run as `nerve-run`
+shows **Without Landlock** under the mode, and **nerve-run can read more of
+your home** when your home is open to other accounts or a folder you gave
+lies in it ([modes](modes.md#your-home-and-other-accounts)). With Landlock
+neither shows.
 
 On **Permissions**, a center that lacks the guard against changing the node
 (a pairing from before it, or one you took a rule off) shows **Add the

@@ -953,7 +953,7 @@ impl Secrets for NodeSecrets {
                     // keyring for the life of the process: a running node
                     // that met one asks no keyring installed after it.
                     SecretStorage::Keyring if !self.locks && store::failed() => {
-                        " (this running node found no keyring and does not look again until it is restarted; on a Linux without a desktop, `nerve-node setup` installs one and restarts the installed node)"
+                        " (this running node found no keyring and does not look again until it is restarted; on a Linux without a desktop, `nerve-node setup` installs one, then restart the node: `nerve-node service restart`)"
                     }
                     SecretStorage::Keyring => {
                         " (on a Linux without a desktop, `nerve-node setup` can install a keyring)"

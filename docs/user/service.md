@@ -139,13 +139,14 @@ it runs, in every mode, so no command keeps them.
 `nerve-node setup` asks these things, one at a time. Enter keeps what is
 in brackets. It is optional: `center add` and `folder add` do the same. The
 owner runs it without `sudo`: its one step that needs root, installing a
-keyring, takes root by the service's own rights, for that step alone.
+keyring, takes root by the service's own rights, for that step alone, and
+only after you answer yes at a terminal.
 
 1. The node's name, as centers show it. The host name by default.
 2. Where the node keeps its keys: `file` or `keyring`
    ([keys](config.md#where-the-node-keeps-its-keys)). With `keyring` and no
    keyring that answers, it offers to install one where `nerve` has no
-   desktop. If the node had found none when it started, it needs a
+   desktop, when you run it at a terminal. If the node had found none when it started, it needs a
    restart: run as root, setup restarts it; run by the owner, it says so,
    and you run `nerve-node service restart` and setup again. Not
    asked on the installed node on Windows, which keeps them in files
@@ -153,7 +154,8 @@ keyring, takes root by the service's own rights, for that step alone.
 3. A pairing link from the center's web UI. Enter skips it. The node shows
    the center and asks before it pairs, as `center add` does.
 4. The mode of that center: `folder`, `allowlist` or `user`
-   ([modes](modes.md)). For `folder` it asks for one folder and its rights.
+   ([modes](modes.md)). For `folder` it asks for one folder and its rights;
+   Enter gives `+rwx`, so that commands can work there.
 
 Each answer is saved when you give it, through the running node, like every
 other command. You can stop setup at any point and run it again. It works on
@@ -209,8 +211,8 @@ sudo nerve-node uninstall --purge   # deletes them too
 ```
 
 `uninstall` stops and disables the service, removes the unit, takes every
-ACL entry of `nerve-run` off your folders, removes `nerve-run` with its
-home, the polkit files and the helper, the user `nerve` and
+ACL entry of `nerve-run` off your folders, gives what `nerve-run` made in
+them to you, removes `nerve-run` with its home, the polkit files and the helper, the user `nerve` and
 `/usr/local/bin/nerve-node`. If an ACL entry cannot be taken off, it stops
 before it removes anything and says which: a uid nobody has must not keep
 them. A session that a keyring gave `nerve` is ended first. Without

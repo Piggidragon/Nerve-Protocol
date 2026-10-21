@@ -5,10 +5,10 @@
 //! a command root runs on folders that belong to another user runs as that
 //! user ([`become_owner`]), so whatever it writes stays the node's.
 //!
-//! The node runs a center's commands, in every mode, as an ordinary account
-//! (`machine.user`, [`crate::account`]), not as `nerve`, so they cannot read
-//! the node's keys. `install` takes the account that ran it; `setup` can
-//! choose or make another.
+//! The node runs a center's commands as another account than `nerve`, so
+//! they cannot read the node's keys ([`crate::account`]): `nerve-run`, which
+//! `install` makes with a home of its own, and in user mode the owner, the
+//! account that ran `install`, which the unit names.
 //!
 //! What these commands do to the machine beyond the node's files (the user,
 //! systemd, running a program) goes through [`System`], so the tests run
@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 
 use nerve_policy::audit::AuditLog;
 use nerve_policy::config::SecretStorage;
-use nerve_policy::settings::SettingsStore;
 
 use crate::paths::NodePaths;
 
@@ -42,10 +41,10 @@ pub struct Layout {
     pub unit: PathBuf,
     /// The program the service runs.
     pub bin: PathBuf,
-    /// The home of the service's user: a command's working folder when the
-    /// call names none, and the `~` of the protected list. It holds the
-    /// state folder.
+    /// The home of the service's user. It holds the state folder.
     pub home: PathBuf,
+    /// The home of the account commands run as, `nerve-run` (Linux).
+    pub run_home: PathBuf,
     pub paths: NodePaths,
     /// Where `update` finds the programs of the latest release and their
     /// `SHA256SUMS`.
@@ -82,6 +81,7 @@ impl Layout {
                     .join(format!("{program}.exe")),
                 paths: NodePaths::new(data.join("config"), data.join("state")),
                 home: data,
+                run_home: PathBuf::new(),
                 release,
                 edition,
             };
@@ -90,6 +90,7 @@ impl Layout {
             unit: PathBuf::from("/etc/systemd/system").join(UNIT_NAME),
             bin: PathBuf::from("/usr/local/bin").join(program),
             home: "/var/lib/nerve".into(),
+            run_home: crate::account::RUN_HOME.into(),
             paths: NodePaths::new("/etc/nerve", "/var/lib/nerve/state"),
             release,
             edition,
@@ -104,7 +105,7 @@ impl Layout {
         self.unit.is_file()
     }
 
-    /// The polkit rule that lets the owners start and stop the service
+    /// The polkit rule that lets the owner start and stop the service
     /// (crate::owner): `/etc/polkit-1/rules.d`, beside the unit's `/etc`.
     pub fn polkit_rule(&self) -> PathBuf {
         self.etc().join("polkit-1/rules.d").join(POLKIT_RULE)
@@ -116,7 +117,7 @@ impl Layout {
     }
 
     /// The helper that starts, stops and restarts the service and does
-    /// nothing else, which the owners run through pkexec
+    /// nothing else, which the owner runs through pkexec
     /// ([`service_helper_text`]): beside the program's `bin`, in
     /// `/usr/local/lib/nerve-node`.
     pub fn service_helper(&self) -> PathBuf {
@@ -138,7 +139,7 @@ impl Layout {
             .join(format!("{POLKIT_ACTION}.policy"))
     }
 
-    /// The `.pkla` file that lets the owners run the helper on a polkit
+    /// The `.pkla` file that lets the owner run the helper on a polkit
     /// without rules (0.105).
     pub fn polkit_pkla(&self) -> PathBuf {
         self.etc()
@@ -157,22 +158,24 @@ impl Layout {
         }
     }
 
-    /// The service unit. The node runs as its own user with the folders
-    /// given; stopping the service ends every command it runs, and a node
-    /// that fails is started again. CAP_SETUID and CAP_SETGID are the one
-    /// privilege it keeps: they let it start a command as the
-    /// account `machine.user` names. Every command drops them before it
-    /// runs; the bounding set stays as it is, since an allowed sudo command
-    /// needs root's. The service's cgroup is the node's to divide
+    /// The service unit, for the owner `owner`. The node runs as its own
+    /// user with the folders given; stopping the service ends every command
+    /// it runs, and a node that fails is started again. CAP_SETUID and
+    /// CAP_SETGID are the one privilege it keeps: they let it start a
+    /// command as `nerve-run` or the owner. Every command drops them before
+    /// it runs; the bounding set stays as it is, since an allowed sudo
+    /// command needs root's. The service's cgroup is the node's to divide
     /// (`Delegate=`): each command runs in one of its own below it, held to
     /// its limits (crate::cgroup). A command the kernel kills for its memory
     /// leaves the node running (`OOMPolicy=`, which `Delegate=` defaults to
-    /// already). systemd makes the node's runtime folder, where its owners
-    /// reach it (crate::owner); every account may enter it. The node holds
-    /// the owners' group besides its own, so that it can give them its owner
-    /// token to read, and nothing else: who is an owner is looked up in the
-    /// account database, which does not name the node's user.
-    pub fn unit_text(&self) -> String {
+    /// already). systemd makes the node's runtime folder, where its owner
+    /// reaches it (crate::owner); every account may enter it. The owner is
+    /// named here, where only root writes and everyone reads
+    /// ([`owner_in_unit`]).
+    pub fn unit_text(&self, owner: Option<&str>) -> String {
+        let owner = owner.map_or_else(String::new, |o| {
+            format!("Environment={}={o}\n", crate::owner::OWNER_VAR)
+        });
         format!(
             "# Written by `nerve-node install`; `nerve-node uninstall` removes it.
 [Unit]
@@ -185,9 +188,8 @@ After=network-online.target
 Type=simple
 User={USER}
 Group={USER}
-SupplementaryGroups={owners}
 Environment=HOME={home}
-AmbientCapabilities=CAP_SETUID CAP_SETGID
+{owner}AmbientCapabilities=CAP_SETUID CAP_SETGID
 Delegate=cpu memory pids
 OOMPolicy=continue
 ExecStart={bin} --config-dir {config} --state-dir {state} run
@@ -206,13 +208,32 @@ WantedBy=multi-user.target
             bin = self.bin.display(),
             config = self.paths.config_dir.display(),
             state = self.paths.state_dir.display(),
-            owners = crate::owner::GROUP,
             runtime = Path::new(crate::owner::RUNTIME_DIR)
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy(),
         )
     }
+}
+
+/// The owner of the node on `paths` when it is the installed one, as its
+/// unit names it.
+pub fn owner_of(paths: &NodePaths) -> Option<String> {
+    let layout = Layout::system();
+    if *paths != layout.paths {
+        return None;
+    }
+    owner_in_unit(&std::fs::read_to_string(&layout.unit).ok()?)
+}
+
+/// The owner a unit's text names ([`Layout::unit_text`]).
+pub fn owner_in_unit(text: &str) -> Option<String> {
+    let prefix = format!("Environment={}=", crate::owner::OWNER_VAR);
+    text.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .map(str::trim)
+        .filter(|o| nerve_policy::config::valid_account_name(o))
+        .map(String::from)
 }
 
 /// The file name of the polkit rule ([`Layout::polkit_rule`]).
@@ -229,7 +250,7 @@ pub const SERVICE_HELPER: &str = "service-control";
 
 /// The service helper: a script that starts, stops or restarts the
 /// installed unit and does nothing else. pkexec runs it as root for the
-/// owners without a password ([`polkit_action_text`]), also on polkit 0.105,
+/// owner without a password ([`polkit_action_text`]), also on polkit 0.105,
 /// which takes no rule that could limit systemd's own action to one unit.
 /// It takes one word and nothing from its environment: pkexec matches an
 /// action by the program's path only, never by its arguments.
@@ -238,8 +259,8 @@ pub fn service_helper_text() -> String {
         "#!/bin/sh
 # Written by `nerve-node install`; `nerve-node uninstall` removes it.
 # Starts, stops or restarts the Nerve node's service {UNIT_NAME}, and does
-# nothing else. The node's owners (the group {group}) run it through pkexec
-# without a password (polkit action {POLKIT_ACTION}).
+# nothing else. The node's owner runs it through pkexec without a password
+# (polkit action {POLKIT_ACTION}).
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 if [ \"$#\" -ne 1 ]; then
@@ -253,13 +274,12 @@ start | stop | restart) exec systemctl \"$1\" {UNIT_NAME} ;;
     exit 2
     ;;
 esac
-",
-        group = crate::owner::GROUP
+"
     )
 }
 
 /// The polkit action of the service helper at `helper`: an administrator by
-/// default; the owners by the rule ([`polkit_rule_text`]) or the `.pkla`
+/// default; the owner by the rule ([`polkit_rule_text`]) or the `.pkla`
 /// file ([`polkit_pkla_text`]).
 pub fn polkit_action_text(helper: &Path) -> String {
     format!(
@@ -285,39 +305,38 @@ pub fn polkit_action_text(helper: &Path) -> String {
     )
 }
 
-/// The `.pkla` file for polkit 0.105: the owners may run the service
+/// The `.pkla` file for polkit 0.105: the owner `owner` may run the service
 /// helper without a password from their own session at this machine
-/// (`ResultActive`); anyone else, and an owner elsewhere, keeps the
-/// action's default. Never one for systemd's `manage-units`, which would
-/// let them manage every unit.
-pub fn polkit_pkla_text() -> String {
+/// (`ResultActive`); anyone else, and the owner elsewhere, keeps the
+/// action's default. Never one for systemd's `manage-units`, which would let
+/// the owner manage every unit.
+pub fn polkit_pkla_text(owner: &str) -> String {
     format!(
         "# Written by `nerve-node install`; `nerve-node uninstall` removes it.
-# The members of {group}, the owners of the Nerve node, may start, stop and
-# restart its service through its helper from their own session at this
-# machine, and nothing else.
+# {owner}, the owner of the Nerve node, may start, stop and restart its
+# service through its helper from their own session at this machine, and
+# nothing else.
 [Nerve node: start, stop and restart]
-Identity=unix-group:{group}
+Identity=unix-user:{owner}
 Action={POLKIT_ACTION}
 ResultActive=yes
-",
-        group = crate::owner::GROUP
+"
     )
 }
 
-/// The polkit rule: the owners may start, stop and restart the node's
+/// The polkit rule: the owner `owner` may start, stop and restart the node's
 /// service, and nothing else: through systemd, which names the unit and the
 /// verb of each request (`org.freedesktop.systemd1.manage-units`), or
 /// through the service helper ([`POLKIT_ACTION`]).
-pub fn polkit_rule_text() -> String {
+pub fn polkit_rule_text(owner: &str) -> String {
     format!(
         "// Written by `nerve-node install`; `nerve-node uninstall` removes it.
-// The members of {group}, the owners of the Nerve node, may start, stop and
-// restart its service {UNIT_NAME} from their own session at this machine,
-// and nothing else. A program outside a session, such as a command the
-// node runs, is asked for an administrator's password as before.
+// {owner}, the owner of the Nerve node, may start, stop and restart its
+// service {UNIT_NAME} from their own session at this machine, and nothing
+// else. A program outside a session, such as a command the node runs, is
+// asked for an administrator's password as before.
 polkit.addRule(function(action, subject) {{
-    if (!subject.isInGroup(\"{group}\") || !subject.local || !subject.active) {{
+    if (subject.user != \"{owner}\" || !subject.local || !subject.active) {{
         return polkit.Result.NOT_HANDLED;
     }}
     if (action.id == \"{POLKIT_ACTION}\") {{
@@ -332,8 +351,7 @@ polkit.addRule(function(action, subject) {{
     }}
     return polkit.Result.NOT_HANDLED;
 }});
-",
-        group = crate::owner::GROUP
+"
     )
 }
 
@@ -365,9 +383,9 @@ pub fn polkit_of_version(said: &str) -> Option<Polkit> {
 
 /// Whether a node on `paths` is the installed service, however it was
 /// started: on the installed folders, or as the user `install` made. Such a
-/// node runs commands only as the account `machine.user` names, never as
-/// itself ([`crate::account::for_commands`]), even without the two
-/// capabilities the unit gives it.
+/// node runs commands only as `nerve-run` or the owner, never as itself
+/// ([`crate::account::for_commands`]), even without the two capabilities
+/// the unit gives it.
 pub fn is_service_node(paths: &NodePaths) -> bool {
     if *paths == Layout::system().paths {
         return true;
@@ -402,20 +420,9 @@ pub trait System {
     /// Whether systemd runs this machine.
     fn has_systemd(&self) -> bool;
     fn account(&self, name: &str) -> Result<Option<Account>, String>;
-    /// The groups of [`crate::account::ROOT_GROUPS`] the account is in.
-    fn root_groups(&self, account: &Account) -> Vec<String>;
-    /// Whether `account` gets root through sudo without a password
-    /// (`sudo -n true`, run as it).
-    fn sudo_without_password(&self, _account: &Account) -> bool {
-        false
-    }
-    /// Makes a system user with a group of the same name, the home given
-    /// (not created) and no login, marked with [`USER_MARK`].
-    fn add_account(&self, name: &str, home: &Path) -> Result<(), String>;
-    /// Makes an ordinary account for the commands, as `setup` offers: a
-    /// group of its own, the home given (created), no login, marked with
-    /// [`crate::account::MADE_MARK`].
-    fn add_user(&self, name: &str, home: &Path) -> Result<(), String>;
+    /// Makes a system user with a group of the same name and no other, the
+    /// home given (not created) and no login, marked with `mark`.
+    fn add_account(&self, name: &str, home: &Path, mark: &str) -> Result<(), String>;
     /// Removes the user and its group.
     fn remove_account(&self, name: &str) -> Result<(), String>;
     fn systemctl(&self, args: &[&str]) -> Result<(), String>;
@@ -434,22 +441,6 @@ pub trait System {
     /// `Ok(false)` when it had none.
     fn end_session(&self, _name: &str) -> Result<bool, String> {
         Ok(false)
-    }
-    /// Whether the group `name` is there.
-    fn has_group(&self, _name: &str) -> Result<bool, String> {
-        Ok(false)
-    }
-    /// Makes the system group `name`.
-    fn add_group(&self, name: &str) -> Result<(), String> {
-        Err(format!("cannot make the group {name} here"))
-    }
-    /// Puts the account `user` in the group `group`.
-    fn add_to_group(&self, user: &str, group: &str) -> Result<(), String> {
-        Err(format!("cannot put {user} in the group {group} here"))
-    }
-    /// Removes the group `name`.
-    fn remove_group(&self, name: &str) -> Result<(), String> {
-        Err(format!("cannot remove the group {name} here"))
     }
     /// What polkit takes here; the rules go to `rule`'s folder.
     fn polkit(&self, _rule: &Path) -> Polkit {
@@ -496,93 +487,7 @@ impl System for Host {
         crate::account::lookup(name)
     }
 
-    fn root_groups(&self, account: &Account) -> Vec<String> {
-        crate::account::root_groups(account)
-    }
-
-    fn sudo_without_password(&self, account: &Account) -> bool {
-        // Sudo run as root for the account, so no password is asked for
-        // the switch. The rules come first: an account whose rules surely
-        // grant no root command without a password is never run as,
-        // because its sudo would log a failed login and mail root about it.
-        // The rules are read to err towards running as the account.
-        let mut list = std::process::Command::new("sudo");
-        list.args(["-n", "-l", "-U", &account.name])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        regain_root(&mut list);
-        let Ok(o) = list.output() else {
-            return false;
-        };
-        let listing = String::from_utf8_lossy(&o.stdout);
-        if !crate::account::lists_no_password(&listing) {
-            return false;
-        }
-        // Where the account's sudo would call PAM even with `-n` (sudo-rs,
-        // `noninteractive_auth`), a probe counts as a failed login that
-        // can lock the account (pam_faillock): the rules say alone.
-        let mut v = std::process::Command::new("sudo");
-        v.arg("-V")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        regain_root(&mut v);
-        // Only a sudo that says so on stdout is known to stay out of PAM.
-        let version = match v.output() {
-            Ok(v) if v.status.success() => String::from_utf8_lossy(&v.stdout).into_owned(),
-            _ => String::new(),
-        };
-        if !crate::account::probe_stays_out_of_pam(&version, &listing) {
-            return true;
-        }
-        // The account's own sudo, which `-n` never lets ask, and `-k`
-        // keeps from taking the ticket its owner has just made by typing
-        // the password for this command. As root, whatever `runas_default`
-        // says: that is what the rules were read for.
-        let mut c = std::process::Command::new("sudo");
-        c.args([
-            "-n",
-            "-u",
-            &account.name,
-            "--",
-            "sudo",
-            "-n",
-            "-k",
-            "-u",
-            "root",
-            "--",
-            "true",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-        regain_root(&mut c);
-        c.status().is_ok_and(|s| s.success())
-    }
-
-    fn add_user(&self, name: &str, home: &Path) -> Result<(), String> {
-        let mut c = std::process::Command::new("useradd");
-        c.args(["--user-group", "--create-home", "--home-dir"])
-            .arg(home)
-            .args([
-                "--shell",
-                no_login(),
-                "--comment",
-                crate::account::MADE_MARK,
-                "--",
-                name,
-            ]);
-        // setup runs as the node's user and keeps root only as its saved
-        // id ([`become_owner`]); useradd gets it back.
-        regain_root(&mut c);
-        let o = c.output().map_err(|e| format!("useradd: {e}"))?;
-        if o.status.success() {
-            Ok(())
-        } else {
-            Err(format!("useradd {name}: {}", failure(&o)))
-        }
-    }
-
-    fn add_account(&self, name: &str, home: &Path) -> Result<(), String> {
+    fn add_account(&self, name: &str, home: &Path, mark: &str) -> Result<(), String> {
         let shell = no_login();
         run(
             "useradd",
@@ -595,7 +500,7 @@ impl System for Host {
                 "--shell",
                 shell,
                 "--comment",
-                USER_MARK,
+                mark,
                 name,
             ],
         )
@@ -721,28 +626,6 @@ impl System for Host {
         Ok(true)
     }
 
-    fn has_group(&self, name: &str) -> Result<bool, String> {
-        #[cfg(unix)]
-        return Ok(crate::owner::group_id(name).is_some());
-        #[cfg(not(unix))]
-        {
-            let _ = name;
-            Ok(false)
-        }
-    }
-
-    fn add_group(&self, name: &str) -> Result<(), String> {
-        run("groupadd", &["--system", name])
-    }
-
-    fn add_to_group(&self, user: &str, group: &str) -> Result<(), String> {
-        run("usermod", &["--append", "--groups", group, "--", user])
-    }
-
-    fn remove_group(&self, name: &str) -> Result<(), String> {
-        run("groupdel", &[name])
-    }
-
     fn has_pkexec(&self) -> bool {
         pkexec_program().is_some()
     }
@@ -761,7 +644,7 @@ impl System for Host {
             // pkexec's own: not authorized (or no agent to ask), and
             // dismissed.
             Some(126 | 127) => Err(format!(
-                "polkit did not let you {}: the owners do it without a password from their own session at this machine; elsewhere `sudo {} service {}` does ({})",
+                "polkit did not let you {}: the owner does it without a password from their own session at this machine; elsewhere `sudo {} service {}` does ({})",
                 args.join(" "),
                 crate::edition::get().program,
                 args.join(" "),
@@ -958,12 +841,12 @@ fn plain_log(log: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `install`: the user, the folders, the account of the commands, the
-/// program, the unit, the running service, in that order. `invoker` is the
-/// account that ran install (`SUDO_USER`, else root); it becomes the account
-/// of the commands unless one is chosen already, and the account chosen is
-/// warned about when it gets root. Running it again puts back
-/// what is missing and restarts the service.
+/// `install`: the node's user, the account of the commands with its home,
+/// the folders, the program, polkit, the unit, the running service, in that
+/// order. `invoker` is the account that ran install (`SUDO_USER`, the
+/// app's `PKEXEC_UID`, else root): it becomes the owner. Running it again
+/// puts back what is missing and restarts the service; run by root alone it
+/// keeps the owner the unit names.
 pub fn install(
     layout: &Layout,
     sys: &dyn System,
@@ -1000,7 +883,7 @@ pub fn install_asking(
     r?;
     let _ = writeln!(
         steps.out,
-        "Next: `sudo nerve-node setup` names the node and pairs it with its first center."
+        "Next: `nerve-node center add '<link>'` pairs the node with a center, and `nerve-node folder add <folder> +rw` gives it a folder."
     );
     Ok(())
 }
@@ -1026,25 +909,15 @@ fn install_steps(
             "run `sudo nerve-node install` again",
         ));
     }
-    let account = match sys.account(USER)? {
-        Some(a) if a.comment == USER_MARK => {
-            steps.did(format!("the user {USER} is there already"));
-            a
-        }
-        Some(_) => {
-            return Err(format!(
-                "a user {USER} exists already, and nerve-node install did not make it; the node needs a user of its own"
-            ));
-        }
-        None => {
-            sys.add_account(USER, &layout.home)?;
-            let a = sys
-                .account(USER)?
-                .ok_or_else(|| format!("useradd made no user {USER}"))?;
-            steps.did(format!("made the user {USER} (uid {})", a.uid));
-            a
-        }
-    };
+    let account = system_account(sys, USER, &layout.home, USER_MARK, "the user", steps)?;
+    let run = system_account(
+        sys,
+        crate::account::RUN_USER,
+        &layout.run_home,
+        crate::account::RUN_MARK,
+        "the account commands run as,",
+        steps,
+    )?;
     let dirs = [
         &layout.home,
         &layout.paths.config_dir,
@@ -1068,15 +941,22 @@ fn install_steps(
         layout.paths.config_dir.display(),
         layout.paths.state_dir.display()
     ));
-    let in_keyring = crate::secrets::stated_storage(&layout.paths) == SecretStorage::Keyring;
-    if in_keyring {
-        // Root does not open the keyring of the node's user, so the account
-        // is left to setup, which runs as that user.
-        steps
-            .did("the account of the commands stays as it is; `sudo nerve-node setup` chooses one");
-    } else {
-        default_account(layout, sys, invoker, steps);
+    // The home of the commands' account: its own, closed to others, where
+    // tool caches and configs go.
+    nerve_transport::files::create_private_dir(&layout.run_home)
+        .map_err(|e| format!("{}: {e}", layout.run_home.display()))?;
+    {
+        let _owner = as_owner_of(&layout.run_home)?;
+        set_mode(&layout.run_home, 0o700)?;
     }
+    sys.give(&layout.run_home, run.uid, run.gid)?;
+    steps.did(format!(
+        "{} is the home of {}",
+        layout.run_home.display(),
+        crate::account::RUN_USER
+    ));
+    let owner = owner_of_install(layout, sys, invoker, steps)?;
+    let in_keyring = crate::secrets::stated_storage(&layout.paths) == SecretStorage::Keyring;
     let real = |p: &Path| std::fs::canonicalize(p).ok();
     if real(exe).is_some() && real(exe) == real(&layout.bin) {
         steps.did(format!(
@@ -1098,8 +978,12 @@ fn install_steps(
             "the node's keys are in the system keyring of {USER}, and it answers"
         ));
     }
-    put_owners(layout, sys, invoker, true, steps)?;
-    write_file(&layout.unit, layout.unit_text().as_bytes(), 0o644)?;
+    put_polkit(layout, sys, owner.as_deref(), steps)?;
+    write_file(
+        &layout.unit,
+        layout.unit_text(owner.as_deref()).as_bytes(),
+        0o644,
+    )?;
     steps.did(format!("wrote the service unit {}", layout.unit.display()));
     sys.systemctl(&["daemon-reload"])?;
     sys.systemctl(&["enable", UNIT_NAME])?;
@@ -1111,55 +995,136 @@ fn install_steps(
     Ok(())
 }
 
-/// The owners' parts (crate::owner): the group, `invoker` in it, and the
-/// polkit rule for the service. `invoker` joins at install
-/// (`always`), and at an update only when the group is made then: an
-/// install from before the owners had none.
-fn put_owners(
+/// The system account `name` (`what` says what it is for), made with its
+/// `home` and `mark` when it is not there. One of that name that `install`
+/// did not make is refused: the node takes over no account.
+fn system_account(
+    sys: &dyn System,
+    name: &str,
+    home: &Path,
+    mark: &str,
+    what: &str,
+    steps: &mut Steps,
+) -> Result<Account, String> {
+    match sys.account(name)? {
+        Some(a) if a.comment == mark => {
+            steps.did(format!("{what} {name}, is there already"));
+            Ok(a)
+        }
+        Some(_) => Err(format!(
+            "an account {name} exists already, and nerve-node install did not make it; the node needs it for itself"
+        )),
+        None => {
+            sys.add_account(name, home, mark)?;
+            let a = sys
+                .account(name)?
+                .ok_or_else(|| format!("useradd made no account {name}"))?;
+            steps.did(format!("made {what} {name} (uid {})", a.uid));
+            Ok(a)
+        }
+    }
+}
+
+/// The owner of the install: `invoker`, the account that ran it, when that
+/// is an account the node can use; run by root alone, the owner the unit
+/// names already. Without one, user mode runs no command and only root
+/// changes the node.
+fn owner_of_install(
     layout: &Layout,
     sys: &dyn System,
     invoker: &str,
-    always: bool,
     steps: &mut Steps,
-) -> Result<(), String> {
-    let group = crate::owner::GROUP;
-    let made = !sys.has_group(group)?;
-    if made {
-        sys.add_group(group)?;
-        steps.did(format!("made the group {group} of the node's owners"));
+) -> Result<Option<String>, String> {
+    let before = std::fs::read_to_string(&layout.unit)
+        .ok()
+        .and_then(|t| owner_in_unit(&t));
+    let name = match (invoker, before) {
+        ("root", Some(b)) => {
+            steps.did(format!("{b} stays the owner of the node"));
+            return Ok(Some(b));
+        }
+        ("root", None) => {
+            steps.did(format!(
+                "Warning: no owner: install ran as root, not through sudo, so only root changes the node and user mode runs no command; `sudo {} install` from the owner's own account makes it the owner",
+                layout.edition.program
+            ));
+            return Ok(None);
+        }
+        (i, _) => i,
+    };
+    if let Err(e) = usable_owner(sys, &layout.paths, name) {
+        steps.did(format!(
+            "Warning: no owner: {e}; only root changes the node and user mode runs no command"
+        ));
+        return Ok(None);
     }
-    let program = layout.edition.program;
-    if always || made {
-        match sys.account(invoker)? {
-            Some(a) if a.uid != 0 => {
-                sys.add_to_group(invoker, group)?;
-                steps.did(format!(
-                    "{invoker} is an owner of the node ({group}): `{program}` changes its settings and starts and stops it without sudo"
-                ));
-            }
-            _ => steps.did(format!(
-                "no owner besides root: `sudo usermod --append --groups {group} NAME` makes NAME one"
-            )),
+    steps.did(format!(
+        "{name} is the owner of the node: `{}` changes its settings and starts and stops it without sudo, and user mode runs commands as {name}",
+        layout.edition.program
+    ));
+    Ok(Some(name.to_string()))
+}
+
+/// `name` as the owner, or why not: it must exist, and must not be root, one
+/// of the node's own accounts nor reach the node's folders, where the keys
+/// are.
+pub fn usable_owner(sys: &dyn System, paths: &NodePaths, name: &str) -> Result<Account, String> {
+    let a = sys
+        .account(name)?
+        .ok_or_else(|| format!("there is no account {name}"))?;
+    #[cfg(unix)]
+    let owner = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&paths.config_dir).ok().map(|m| m.uid())
+    };
+    #[cfg(not(unix))]
+    let owner: Option<u32> = None;
+    let own = [USER, crate::account::RUN_USER].contains(&name)
+        || [USER_MARK, crate::account::RUN_MARK].contains(&a.comment.as_str());
+    if a.uid == 0 || own || owner == Some(a.uid) {
+        return Err(format!(
+            "{name} is root or one of the node's own accounts, and cannot be its owner"
+        ));
+    }
+    for dir in [&paths.config_dir, &paths.state_dir] {
+        if crate::account::reaches(dir, &a) {
+            return Err(format!(
+                "{name} could open {}, where the node keeps its keys",
+                dir.display()
+            ));
         }
     }
+    Ok(a)
+}
+
+/// The polkit files that let `owner` start, stop and restart the service
+/// without a password: the helper and its action on every polkit, and the
+/// rule, or on 0.105 the `.pkla` file; only the one this polkit reads is
+/// kept. Without an owner there are none.
+fn put_polkit(
+    layout: &Layout,
+    sys: &dyn System,
+    owner: Option<&str>,
+    steps: &mut Steps,
+) -> Result<(), String> {
+    let Some(owner) = owner else {
+        return remove_polkit(layout, steps);
+    };
     let rule = layout.polkit_rule();
     let polkit = sys.polkit(&rule);
     if polkit == Polkit::Missing {
         steps.did("Warning: polkit is not installed: starting and stopping the service needs sudo");
         return Ok(());
     }
-    // The helper and its action on every polkit; what lets the owners run
-    // it is the rule, or on 0.105 the `.pkla` file, and only the one this
-    // polkit reads is kept.
     let helper = layout.service_helper();
     let mut wrote = false;
     for (path, text, mode) in [
         (helper.clone(), service_helper_text(), 0o755),
         (layout.polkit_action(), polkit_action_text(&helper), 0o644),
         if polkit == Polkit::Rules {
-            (rule.clone(), polkit_rule_text(), 0o644)
+            (rule.clone(), polkit_rule_text(owner), 0o644)
         } else {
-            (layout.polkit_pkla(), polkit_pkla_text(), 0o644)
+            (layout.polkit_pkla(), polkit_pkla_text(owner), 0o644)
         },
     ] {
         if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
@@ -1179,7 +1144,7 @@ fn put_owners(
             _ => format!("{} (polkit 0.105)", layout.polkit_pkla().display()),
         };
         steps.did(format!(
-            "polkit lets the owners start, stop and restart the service without a password, by {by} and the helper {}",
+            "polkit lets {owner} start, stop and restart the service without a password, by {by} and the helper {}",
             helper.display()
         ));
     }
@@ -1195,9 +1160,8 @@ fn remove_if_there(path: &Path) -> Result<bool, String> {
     }
 }
 
-/// Removes the owners' parts again: the polkit files, the service helper
-/// and the group.
-fn remove_owners(layout: &Layout, sys: &dyn System, steps: &mut Steps) -> Result<(), String> {
+/// Removes the polkit files and the service helper again.
+fn remove_polkit(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
     let helper = layout.service_helper();
     for path in [
         layout.polkit_rule(),
@@ -1213,211 +1177,7 @@ fn remove_owners(layout: &Layout, sys: &dyn System, steps: &mut Steps) -> Result
     if let Some(dir) = helper.parent() {
         let _ = std::fs::remove_dir(dir);
     }
-    let group = crate::owner::GROUP;
-    if sys.has_group(group)? {
-        sys.remove_group(group)?;
-        steps.did(format!("removed the group {group} of the node's owners"));
-    }
     Ok(())
-}
-
-/// The account of the commands at install: the one chosen before, else
-/// `invoker`. What fails here is said and left to `setup`; the node then
-/// runs no command until an account is chosen.
-fn default_account(layout: &Layout, sys: &dyn System, invoker: &str, steps: &mut Steps) {
-    let p = &layout.paths;
-    let r = (|| {
-        // Written as the folders' owner, so the files are the node's and
-        // root follows no link in them.
-        let _owner = as_owner_of(&p.state_dir)?;
-        let mut store = SettingsStore::open(
-            p.config_file(),
-            p.config_key(),
-            AuditLog::new(p.audit_log()),
-        )?;
-        if let Some(u) = &store.config().machine.user {
-            // An earlier install or setup chose it; its warning holds
-            // today as well.
-            if let Ok(Some(a)) = sys.account(u) {
-                warn_about(sys, &a, invoker, steps.out);
-            }
-            return Ok(format!("commands run as {u}, as chosen before"));
-        }
-        let a = usable_account(sys, p, invoker)?;
-        store
-            .update(|c| {
-                c.machine.user = Some(invoker.to_string());
-                Ok(())
-            })
-            .map_err(|e| e.to_string())?;
-        warn_about(sys, &a, invoker, steps.out);
-        Ok::<_, String>(format!("commands run as {invoker}, who ran install"))
-    })();
-    match r {
-        Ok(step) => steps.did(step),
-        Err(e) => steps.did(format!(
-            "no account for commands: {e}; {}",
-            crate::account::NO_ACCOUNT_SETUP
-        )),
-    }
-}
-
-/// `name` as the account of the commands, or why not: it must exist, and
-/// must not be the node's own user nor reach the node's folders, where the
-/// keys are. Root is allowed: the caller warns.
-pub fn usable_account(sys: &dyn System, paths: &NodePaths, name: &str) -> Result<Account, String> {
-    let a = sys
-        .account(name)?
-        .ok_or_else(|| format!("there is no account {name}"))?;
-    if a.uid == 0 {
-        return Ok(a);
-    }
-    #[cfg(unix)]
-    let owner = {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(&paths.config_dir).ok().map(|m| m.uid())
-    };
-    #[cfg(not(unix))]
-    let owner: Option<u32> = None;
-    if name == USER || a.comment == USER_MARK || owner == Some(a.uid) {
-        return Err(format!(
-            "{name} is the node's own user, which owns its keys; choose another account"
-        ));
-    }
-    for dir in [&paths.config_dir, &paths.state_dir] {
-        if crate::account::reaches(dir, &a) {
-            return Err(format!(
-                "{name} could open {}, where the node keeps its keys; choose another account",
-                dir.display()
-            ));
-        }
-    }
-    Ok(a)
-}
-
-/// Warns when `a` as the account of the commands lets them get root: root
-/// itself, the account that ran sudo (`invoker`), an account in a group
-/// that gets root without a password, or one with sudo that asks for none.
-/// It never stops the command that calls it.
-fn warn_about(sys: &dyn System, a: &Account, invoker: &str, out: &mut dyn Write) {
-    let groups = if a.uid == 0 {
-        Vec::new()
-    } else {
-        sys.root_groups(a)
-    };
-    for w in crate::account::root_warnings(a, invoker, &groups, || sys.sudo_without_password(a)) {
-        let _ = writeln!(out, "{w}");
-    }
-}
-
-/// The account `setup` chose for the commands, and whether it made it.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Chosen {
-    pub name: String,
-    pub made: bool,
-}
-
-/// The account step of `setup` on the installed node: which account
-/// the node runs commands as. Enter keeps `current`, else takes
-/// `suggested` (the account that runs setup). An account that does not
-/// exist is made when the owner says yes. `None`: nothing changes. The
-/// account that stays is warned about as well as one chosen, with
-/// `invoker` the account that ran sudo.
-pub fn choose_account(
-    sys: &dyn System,
-    paths: &NodePaths,
-    current: Option<&str>,
-    suggested: Option<&str>,
-    invoker: &str,
-    input: &mut dyn BufRead,
-    out: &mut dyn Write,
-) -> Result<Option<Chosen>, String> {
-    let default = current.or(suggested);
-    let answer = crate::cli::ask(
-        input,
-        out,
-        &format!(
-            "Account that commands from centers run as [{}]: ",
-            default.unwrap_or("none")
-        ),
-    )?;
-    let name = match (answer.as_str(), default) {
-        ("", Some(d)) => d.to_string(),
-        ("", None) => {
-            let _ = writeln!(
-                out,
-                "No account: the node runs no command until one is chosen."
-            );
-            return Ok(None);
-        }
-        (a, _) => a.to_string(),
-    };
-    if current == Some(name.as_str()) {
-        if let Ok(Some(a)) = sys.account(&name) {
-            warn_about(sys, &a, invoker, out);
-        }
-        return Ok(None);
-    }
-    if !nerve_policy::config::valid_account_name(&name) {
-        return Err(format!("{name:?} is not an account name"));
-    }
-    let mut made = false;
-    if sys.account(&name)?.is_none() {
-        if !crate::account::makeable_name(&name) {
-            return Err(format!(
-                "there is no account {name}, and setup makes accounts only with a name of a-z, 0-9, _ and -"
-            ));
-        }
-        let yes = crate::cli::ask(
-            input,
-            out,
-            &format!(
-                "There is no account {name}. Make it, with a group and a home of its own and no login? [y/N] "
-            ),
-        )?;
-        if !matches!(yes.as_str(), "y" | "Y" | "yes") {
-            return Err(format!("there is no account {name}; nothing changed"));
-        }
-        sys.add_user(&name, &crate::account::made_home(&name))?;
-        let _ = writeln!(out, "made the account {name}");
-        made = true;
-    }
-    let a = usable_account(sys, paths, &name)?;
-    warn_about(sys, &a, invoker, out);
-    Ok(Some(Chosen { name, made }))
-}
-
-/// `setup --create-user`: `name` becomes the account of the commands
-/// without a question, made as [`choose_account`] makes one when it is not
-/// there. An account that is there is taken if the node can use it.
-pub fn create_account(
-    sys: &dyn System,
-    paths: &NodePaths,
-    name: &str,
-    invoker: &str,
-    out: &mut dyn Write,
-) -> Result<Chosen, String> {
-    if !nerve_policy::config::valid_account_name(name) || !crate::account::makeable_name(name) {
-        return Err(format!(
-            "{name:?} is not a name setup makes accounts with: a-z, 0-9, _ and -, starting with a letter or _"
-        ));
-    }
-    if name == USER {
-        return Err(format!(
-            "{name} is the node's own user, which owns its keys; choose another account"
-        ));
-    }
-    let made = sys.account(name)?.is_none();
-    if made {
-        sys.add_user(name, &crate::account::made_home(name))?;
-        let _ = writeln!(out, "made the account {name}");
-    }
-    let a = usable_account(sys, paths, name)?;
-    warn_about(sys, &a, invoker, out);
-    Ok(Chosen {
-        name: name.to_string(),
-        made,
-    })
 }
 
 /// `uninstall`: stops and removes the service, then the folders (deleted
@@ -1488,7 +1248,29 @@ fn uninstall_steps(
             layout.paths.state_dir.display()
         ));
     }
-    remove_owners(layout, sys, steps)?;
+    remove_polkit(layout, steps)?;
+    // The commands' account and its home go: a uid nobody has must not own
+    // files, since the next account to get it would. Its processes ended
+    // with the service.
+    if layout.run_home.exists() {
+        std::fs::remove_dir_all(&layout.run_home)
+            .map_err(|e| format!("{}: {e}", layout.run_home.display()))?;
+        steps.did(format!("deleted {}", layout.run_home.display()));
+    }
+    match sys.account(crate::account::RUN_USER)? {
+        Some(a) if a.comment == crate::account::RUN_MARK => {
+            sys.remove_account(crate::account::RUN_USER)?;
+            steps.did(format!("removed the account {}", crate::account::RUN_USER));
+        }
+        Some(_) => {
+            let _ = writeln!(
+                steps.out,
+                "left the account {} as it is: nerve-node install did not make it",
+                crate::account::RUN_USER
+            );
+        }
+        None => {}
+    }
     match sys.account(USER)? {
         Some(a) if a.comment == USER_MARK => {
             if sys.end_session(USER)? {
@@ -1558,7 +1340,6 @@ pub async fn update(
     layout: &Layout,
     sys: &dyn System,
     from: Option<&Path>,
-    invoker: &str,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     supported(sys, "update")?;
@@ -1572,7 +1353,7 @@ pub async fn update(
         done: Vec::new(),
         out,
     };
-    let r = update_steps(layout, sys, from, invoker, &mut steps).await;
+    let r = update_steps(layout, sys, from, &mut steps).await;
     audit(&layout.paths, "update", &steps.done, &r, steps.out);
     r
 }
@@ -1581,7 +1362,6 @@ async fn update_steps(
     layout: &Layout,
     sys: &dyn System,
     from: Option<&Path>,
-    invoker: &str,
     steps: &mut Steps<'_>,
 ) -> Result<(), String> {
     let program = layout.edition.program;
@@ -1645,18 +1425,6 @@ async fn update_steps(
     std::fs::rename(&staged, &layout.bin).map_err(|e| format!("{}: {e}", layout.bin.display()))?;
     let old_v = old_v.map_or_else(|| "?".to_string(), |v| v.to_string());
     steps.did(format!("replaced {program} {old_v} with {new_v}"));
-    // The unit of this version (the owners' runtime folder) and the owners'
-    // parts an earlier install did not make; what is there stays.
-    let unit = layout.unit_text();
-    if std::fs::read_to_string(&layout.unit).ok().as_deref() != Some(unit.as_str()) {
-        write_file(&layout.unit, unit.as_bytes(), 0o644)?;
-        sys.systemctl(&["daemon-reload"])?;
-        steps.did(format!(
-            "wrote the service unit {} of this version",
-            layout.unit.display()
-        ));
-    }
-    put_owners(layout, sys, invoker, false, steps)?;
     let started = sys
         .systemctl(&["restart", UNIT_NAME])
         .and_then(|()| sys.wait_running(&layout.paths));
@@ -2384,6 +2152,7 @@ pub fn check_access(paths: &NodePaths) -> Result<(), String> {
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod tests {
     use super::*;
+    use nerve_policy::settings::SettingsStore;
     use std::cell::RefCell;
 
     /// A machine in a temporary folder: the user is the test's own, and
@@ -2397,14 +2166,8 @@ pub(crate) mod tests {
         given: RefCell<Vec<(PathBuf, u32)>>,
         /// Whether a node started by the service answers.
         starts: std::cell::Cell<bool>,
-        /// The accounts in a group that gets root, and that group.
-        root_groups: RefCell<Vec<(String, String)>>,
-        /// The accounts whose sudo asks for no password.
-        sudo_without_password: RefCell<Vec<String>>,
         /// Whether the node's user keeps a session (a keyring's linger).
         lingers: std::cell::Cell<bool>,
-        /// The groups and their members.
-        pub(crate) groups: RefCell<Vec<(String, Vec<String>)>>,
         /// What polkit takes here.
         pub(crate) polkit: std::cell::Cell<Polkit>,
         /// Whether the command runs as root, and whether pkexec is there.
@@ -2420,23 +2183,11 @@ pub(crate) mod tests {
                 calls: RefCell::new(Vec::new()),
                 given: RefCell::new(Vec::new()),
                 starts: std::cell::Cell::new(true),
-                root_groups: RefCell::new(Vec::new()),
-                sudo_without_password: RefCell::new(Vec::new()),
                 lingers: std::cell::Cell::new(false),
-                groups: RefCell::new(Vec::new()),
                 polkit: std::cell::Cell::new(Polkit::Rules),
                 root: std::cell::Cell::new(true),
                 pkexec_here: std::cell::Cell::new(true),
             }
-        }
-
-        /// The members of `group`, `None` when it is not there.
-        pub(crate) fn members(&self, group: &str) -> Option<Vec<String>> {
-            self.groups
-                .borrow()
-                .iter()
-                .find(|(g, _)| g == group)
-                .map(|(_, m)| m.clone())
         }
 
         pub(crate) fn calls(&self) -> Vec<String> {
@@ -2498,39 +2249,30 @@ pub(crate) mod tests {
                 .find(|a| a.name == name)
                 .cloned())
         }
-        fn root_groups(&self, account: &Account) -> Vec<String> {
-            self.root_groups
-                .borrow()
-                .iter()
-                .filter(|(a, _)| *a == account.name)
-                .map(|(_, g)| g.clone())
-                .collect()
-        }
-        fn sudo_without_password(&self, account: &Account) -> bool {
-            self.sudo_without_password.borrow().contains(&account.name)
-        }
-        fn add_user(&self, name: &str, home: &Path) -> Result<(), String> {
+        /// `nerve` is the test's own account; any other is another uid.
+        fn add_account(&self, name: &str, home: &Path, mark: &str) -> Result<(), String> {
             self.calls
                 .borrow_mut()
                 .push(format!("useradd {name} {}", home.display()));
-            let uid = 5000 + self.others.borrow().len() as u32;
-            self.others.borrow_mut().push(Account {
-                comment: crate::account::MADE_MARK.into(),
-                home: home.into(),
-                ..other(name, uid)
-            });
-            Ok(())
-        }
-        fn add_account(&self, name: &str, home: &Path) -> Result<(), String> {
-            self.calls
-                .borrow_mut()
-                .push(format!("useradd {name} {}", home.display()));
-            *self.user.borrow_mut() = Some(me());
+            if name == USER {
+                *self.user.borrow_mut() = Some(me());
+            } else {
+                let uid = 5000 + self.others.borrow().len() as u32;
+                self.others.borrow_mut().push(Account {
+                    comment: mark.into(),
+                    home: home.into(),
+                    ..other(name, uid)
+                });
+            }
             Ok(())
         }
         fn remove_account(&self, name: &str) -> Result<(), String> {
             self.calls.borrow_mut().push(format!("userdel {name}"));
-            *self.user.borrow_mut() = None;
+            if name == USER {
+                *self.user.borrow_mut() = None;
+            } else {
+                self.others.borrow_mut().retain(|a| a.name != name);
+            }
             Ok(())
         }
         fn systemctl(&self, args: &[&str]) -> Result<(), String> {
@@ -2593,34 +2335,6 @@ pub(crate) mod tests {
             Ok(true)
         }
 
-        fn has_group(&self, name: &str) -> Result<bool, String> {
-            Ok(self.members(name).is_some())
-        }
-
-        fn add_group(&self, name: &str) -> Result<(), String> {
-            self.calls.borrow_mut().push(format!("groupadd {name}"));
-            self.groups.borrow_mut().push((name.into(), Vec::new()));
-            Ok(())
-        }
-
-        fn add_to_group(&self, user: &str, group: &str) -> Result<(), String> {
-            self.calls
-                .borrow_mut()
-                .push(format!("usermod {user} {group}"));
-            for (g, m) in self.groups.borrow_mut().iter_mut() {
-                if g == group && !m.iter().any(|u| u == user) {
-                    m.push(user.into());
-                }
-            }
-            Ok(())
-        }
-
-        fn remove_group(&self, name: &str) -> Result<(), String> {
-            self.calls.borrow_mut().push(format!("groupdel {name}"));
-            self.groups.borrow_mut().retain(|(g, _)| g != name);
-            Ok(())
-        }
-
         fn polkit(&self, _rule: &Path) -> Polkit {
             self.polkit.get()
         }
@@ -2631,6 +2345,7 @@ pub(crate) mod tests {
             unit: root.join("etc/systemd/system").join(UNIT_NAME),
             bin: root.join("usr/local/bin/nerve-node"),
             home: root.join("var/lib/nerve"),
+            run_home: root.join("var/lib/nerve-run"),
             paths: NodePaths::new(root.join("etc/nerve"), root.join("var/lib/nerve/state")),
             release: "http://127.0.0.1:1/none".into(),
             edition: &crate::edition::NODE,
@@ -2676,51 +2391,54 @@ pub(crate) mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("made the user nerve"), "{out}");
         assert!(
-            out.contains("commands run as alice, who ran install"),
+            out.contains("made the account commands run as, nerve-run (uid"),
             "{out}"
         );
-        // The account that ran sudo is no boundary: the warning is there,
-        // and install went on.
-        assert!(out.contains("alice is the account that ran sudo"), "{out}");
-        assert!(out.contains("setup --create-user nerve-work"), "{out}");
-        let cfg = SettingsStore::peek(&l.paths.config_file(), &l.paths.config_key()).unwrap();
-        assert_eq!(cfg.machine.user.as_deref(), Some("alice"));
-        assert!(out.contains("sudo nerve-node setup"), "{out}");
-        // The user, made once with the home the unit names.
+        assert!(out.contains("alice is the owner of the node"), "{out}");
+        assert!(out.contains("nerve-node center add"), "{out}");
+        // The two accounts, each made once with its home; no group.
         assert_eq!(
             sys.calls(),
             [
                 format!("useradd nerve {}", l.home.display()),
-                "groupadd nerve-admin".into(),
-                "usermod alice nerve-admin".into(),
+                format!("useradd nerve-run {}", l.run_home.display()),
                 "systemctl daemon-reload".into(),
                 format!("systemctl enable {UNIT_NAME}"),
                 format!("systemctl restart {UNIT_NAME}"),
             ]
         );
-        // The one who installed is an owner, and polkit lets the owners
-        // start and stop this unit only.
-        assert_eq!(
-            sys.members(crate::owner::GROUP),
-            Some(vec!["alice".to_string()])
-        );
-        assert!(
-            out.contains("alice is an owner of the node (nerve-admin)"),
-            "{out}"
-        );
+        let run = sys.account(crate::account::RUN_USER).unwrap().unwrap();
+        assert_eq!(run.comment, crate::account::RUN_MARK);
+        assert_eq!(run.home, l.run_home);
+        assert_eq!(run.groups, [run.gid], "no other groups");
+        // Its home is its own and closed to others.
+        assert_eq!(mode(&l.run_home), 0o700);
+        assert!(sys.given.borrow().contains(&(l.run_home.clone(), run.uid)));
+        // polkit lets the owner start and stop this unit only.
         let rule = l.polkit_rule();
         assert_eq!(
             rule,
             d.path().join("etc/polkit-1/rules.d/50-nerve-node.rules")
         );
-        assert_eq!(std::fs::read_to_string(&rule).unwrap(), polkit_rule_text());
+        assert_eq!(
+            std::fs::read_to_string(&rule).unwrap(),
+            polkit_rule_text("alice")
+        );
+        assert!(polkit_rule_text("alice").contains("subject.user != \"alice\""));
         assert_eq!(mode(&rule), 0o644);
         // The program, the unit, and the folders, private to the user.
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.0.0\n");
         assert_eq!(mode(&l.bin), 0o755);
         let unit = std::fs::read_to_string(&l.unit).unwrap();
-        assert_eq!(unit, l.unit_text());
-        assert!(unit.contains("\nUser=nerve\n"), "{unit}");
+        assert_eq!(unit, l.unit_text(Some("alice")));
+        assert!(unit.contains("\nUser=nerve\nGroup=nerve\n"), "{unit}");
+        assert!(!unit.contains("SupplementaryGroups"), "{unit}");
+        // The owner is named where everyone reads and only root writes.
+        assert!(
+            unit.contains("\nEnvironment=NERVE_NODE_OWNER=alice\n"),
+            "{unit}"
+        );
+        assert_eq!(owner_in_unit(&unit).as_deref(), Some("alice"));
         // The one privilege: switching to the account of the commands. Nothing
         // narrows the bounding set or sets no_new_privs, which an allowed
         // sudo command needs.
@@ -2732,14 +2450,9 @@ pub(crate) mod tests {
         // The cgroup of the service is the node's, for one per command.
         assert!(unit.contains("\nDelegate=cpu memory pids\n"), "{unit}");
         assert!(unit.contains("\nOOMPolicy=continue\n"), "{unit}");
-        // The owners' socket's folder, which every account may enter, and
-        // their group, to give them the owner token.
+        // The owner socket's folder, which every account may enter.
         assert!(
             unit.contains("\nRuntimeDirectory=nerve-node\nRuntimeDirectoryMode=0755\n"),
-            "{unit}"
-        );
-        assert!(
-            unit.contains("\nGroup=nerve\nSupplementaryGroups=nerve-admin\n"),
             "{unit}"
         );
         assert!(
@@ -2760,30 +2473,72 @@ pub(crate) mod tests {
         assert_eq!(a[0]["event"], "install");
         assert!(a[0].get("error").is_none());
         assert_eq!(a[0]["steps"].as_array().unwrap().len(), 9, "{}", a[0]);
-        // Again: the user is reused, the program replaced, the service
-        // restarted, the account kept.
+        // Again, by root alone: the accounts are reused, the program
+        // replaced, the service restarted, the owner kept.
         std::fs::write(&exe, "nerve-node 1.0.1\n").unwrap();
         let mut out = Vec::new();
         install(&l, &sys, &exe, "root", &mut out).unwrap();
-        assert!(
-            String::from_utf8(out.clone())
-                .unwrap()
-                .contains("commands run as alice, as chosen before")
-        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("alice stays the owner of the node"), "{out}");
+        assert_eq!(owner_of_unit(&l).as_deref(), Some("alice"));
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.0.1\n");
         assert_eq!(
             sys.calls()
                 .iter()
                 .filter(|c| c.starts_with("useradd"))
                 .count(),
-            1
+            2
         );
-        assert!(
-            String::from_utf8(out)
-                .unwrap()
-                .contains("the user nerve is there already")
-        );
+        assert!(out.contains("the user nerve, is there already"), "{out}");
+        assert!(out.contains("nerve-run, is there already"), "{out}");
         assert_eq!(audit_events(&l).len(), 2);
+    }
+
+    /// The owner the unit of `l` names.
+    fn owner_of_unit(l: &Layout) -> Option<String> {
+        owner_in_unit(&std::fs::read_to_string(&l.unit).unwrap())
+    }
+
+    /// Only two accounts: the one that ran install becomes the owner; root
+    /// alone, an account that is not there or one of the node's own makes
+    /// none, and install does the rest all the same. A `nerve-run` that
+    /// install did not make is refused.
+    #[test]
+    fn install_makes_the_invoker_the_owner_and_no_other_account() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        for who in ["root", "ghost", USER, crate::account::RUN_USER] {
+            let l = layout(&d.path().join(who));
+            let mut out = Vec::new();
+            install(&l, &sys, Path::new("/bin/true"), who, &mut out).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("Warning: no owner"), "{who}: {out}");
+            assert_eq!(owner_of_unit(&l), None, "{who}");
+            assert!(!l.unit_text(None).contains("NERVE_NODE_OWNER"));
+            assert!(!l.polkit_rule().exists(), "{who}");
+        }
+        // Another owner installs over it: the owner changes, as the polkit
+        // rule does.
+        sys.others.borrow_mut().push(other("bob", 4343));
+        let l = layout(&d.path().join("root"));
+        install(&l, &sys, Path::new("/bin/true"), "bob", &mut Vec::new()).unwrap();
+        assert_eq!(owner_of_unit(&l).as_deref(), Some("bob"));
+        assert_eq!(
+            std::fs::read_to_string(l.polkit_rule()).unwrap(),
+            polkit_rule_text("bob")
+        );
+        // A nerve-run of someone else's.
+        let sys = Fake::new();
+        sys.others
+            .borrow_mut()
+            .push(other(crate::account::RUN_USER, 4444));
+        let l = layout(&d.path().join("taken"));
+        let e = install(&l, &sys, Path::new("/bin/true"), "alice", &mut Vec::new()).unwrap_err();
+        assert!(
+            e.contains("nerve-run exists already") && e.contains("did not make it"),
+            "{e}"
+        );
+        assert!(!l.unit.exists());
     }
 
     /// An earlier install's config keeps the keys in the system keyring:
@@ -2841,53 +2596,10 @@ pub(crate) mod tests {
         assert_eq!(k.installed.borrow().len(), 1);
         assert!(started(&sys));
         assert!(out.contains("keyring of nerve, and it answers"), "{out}");
-        // Root does not open the keyring, so the account is setup's.
-        assert!(out.contains("`sudo nerve-node setup` chooses one"), "{out}");
         // Once it answers, nothing is asked.
         let (r, out) = install(&sys, None);
         r.unwrap();
         assert!(!out.contains("[y/N]"), "{out}");
-    }
-
-    /// On a kernel below Landlock ABI 9, an earlier install's config that
-    /// keeps the keys in the keyring is refused before install changes
-    /// anything, with the command that moves them into files on these
-    /// folders.
-    #[test]
-    fn install_refuses_keys_in_the_keyring_below_landlock_9() {
-        use crate::keyring_setup::tests::FakeKeyring;
-        let d = tempfile::tempdir().unwrap();
-        let sys = Fake::new();
-        let l = layout(d.path());
-        let mut store = SettingsStore::open_with(
-            l.paths.config_file(),
-            Box::new(crate::secrets::NodeSecrets::new(&l.paths)),
-            AuditLog::new(l.paths.audit_log()),
-        )
-        .unwrap();
-        store
-            .update(|c| {
-                c.machine.secret_storage = SecretStorage::Keyring;
-                Ok(())
-            })
-            .unwrap();
-        drop(store);
-        crate::secrets::for_tests::pretend_landlock(&l.paths, crate::secrets::Landlock::Abi(6));
-        let exe = d.path().join("nerve-node");
-        std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
-        let k = FakeKeyring::new(true);
-        let e = install_asking(&l, &sys, &k, None, &exe, "alice", &mut Vec::new()).unwrap_err();
-        assert!(e.contains("install changed nothing"), "{e}");
-        assert!(e.contains("Landlock ABI 6, below 9"), "{e}");
-        assert!(e.contains("cannot run programs from its folders"), "{e}");
-        let command = format!(
-            "`nerve-node --config-dir \"{}\" --state-dir \"{}\" config set machine.secret_storage file`",
-            l.paths.config_dir.display(),
-            l.paths.state_dir.display()
-        );
-        assert!(e.contains(&command), "{e}");
-        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
-        assert!(!l.bin.exists() && !l.unit.exists());
     }
 
     #[test]
@@ -2910,196 +2622,6 @@ pub(crate) mod tests {
         assert!(out.contains("ended the session of nerve"), "{out}");
     }
 
-    #[test]
-    fn install_takes_root_with_a_warning_and_leaves_an_unusable_account_to_setup() {
-        let d = tempfile::tempdir().unwrap();
-        let sys = Fake::new();
-        let l = layout(d.path());
-        let mut out = Vec::new();
-        install(&l, &sys, Path::new("/bin/true"), "root", &mut out).unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("commands run as root"), "{out}");
-        assert!(
-            out.contains("Warning: commands from a center then run as root")
-                && out.contains("You are responsible"),
-            "{out}"
-        );
-        let user = |l: &Layout| {
-            SettingsStore::peek(&l.paths.config_file(), &l.paths.config_key())
-                .unwrap()
-                .machine
-                .user
-        };
-        assert_eq!(user(&l).as_deref(), Some("root"));
-        // An account that is not there, or the node's own: no account, and
-        // install still does the rest.
-        for who in ["ghost", USER] {
-            let l = layout(&d.path().join(who));
-            let mut out = Vec::new();
-            install(&l, &sys, Path::new("/bin/true"), who, &mut out).unwrap();
-            let out = String::from_utf8(out).unwrap();
-            assert!(out.contains("no account for commands"), "{out}");
-            assert!(out.contains("sudo nerve-node setup"), "{out}");
-            assert_eq!(user(&l), None);
-            assert!(l.unit.is_file());
-        }
-    }
-
-    /// Setup's account step, with what the owner types.
-    fn choose(
-        sys: &Fake,
-        l: &Layout,
-        current: Option<&str>,
-        typed: &str,
-    ) -> (Result<Option<Chosen>, String>, String) {
-        let mut out = Vec::new();
-        let mut input = std::io::Cursor::new(typed.as_bytes().to_vec());
-        let r = choose_account(
-            sys,
-            &l.paths,
-            current,
-            Some("alice"),
-            "alice",
-            &mut input,
-            &mut out,
-        );
-        (r, String::from_utf8(out).unwrap())
-    }
-
-    #[test]
-    fn setup_chooses_or_makes_the_account_of_the_commands() {
-        let d = tempfile::tempdir().unwrap();
-        let sys = Fake::new();
-        let l = installed(d.path(), &sys, "1.0.0");
-        let chosen = |name: &str, made| {
-            Some(Chosen {
-                name: name.into(),
-                made,
-            })
-        };
-        // Default: Enter takes the account that runs setup, or keeps the
-        // one chosen.
-        let (r, out) = choose(&sys, &l, None, "\n");
-        assert_eq!(r.unwrap(), chosen("alice", false));
-        assert!(out.contains("[alice]"), "{out}");
-        // Kept: nothing changes, and the warning is said again.
-        let (r, out) = choose(&sys, &l, Some("alice"), "\n");
-        assert_eq!(r.unwrap(), None);
-        assert!(out.contains("alice is the account that ran sudo"), "{out}");
-        // Chosen: another account that exists, and a boundary.
-        sys.others.borrow_mut().push(other("carol", 4343));
-        let (r, out) = choose(&sys, &l, Some("alice"), "carol\n");
-        assert_eq!(r.unwrap(), chosen("carol", false));
-        assert!(!out.contains("Warning"), "{out}");
-        // Made: setup asks, then makes it.
-        let (r, out) = choose(&sys, &l, Some("alice"), "bob\ny\n");
-        assert_eq!(r.unwrap(), chosen("bob", true));
-        assert!(out.contains("There is no account bob. Make it"), "{out}");
-        assert!(sys.calls().contains(&"useradd bob /home/bob".to_string()));
-        // Root: allowed, with the warning.
-        let (r, out) = choose(&sys, &l, Some("alice"), "root\n");
-        assert_eq!(r.unwrap(), chosen("root", false));
-        assert!(
-            out.contains("run as root") && out.contains("You are responsible"),
-            "{out}"
-        );
-        // An account in a group that gets root: allowed, with a warning.
-        sys.root_groups
-            .borrow_mut()
-            .push(("carol".into(), "docker".into()));
-        let (r, out) = choose(
-            &sys,
-            &l,
-            Some("alice"),
-            "carol
-",
-        );
-        assert_eq!(r.unwrap(), chosen("carol", false));
-        assert!(out.contains("carol is in the group docker"), "{out}");
-        assert!(out.contains("--create-user nerve-work"), "{out}");
-        let (_, out) = choose(
-            &sys,
-            &l,
-            Some("carol"),
-            "alice
-",
-        );
-        assert!(out.contains("alice is the account that ran sudo"), "{out}");
-        // Refused: one that is not there and is not to be made, a name
-        // useradd would not take, the node's own user.
-        let made = sys.calls().len();
-        let e = choose(&sys, &l, None, "dave\nn\n").0.unwrap_err();
-        assert!(e.contains("there is no account dave"), "{e}");
-        let e = choose(&sys, &l, None, "Dave.X\n").0.unwrap_err();
-        assert!(e.contains("there is no account Dave.X"), "{e}");
-        let e = choose(&sys, &l, None, "a:b\n").0.unwrap_err();
-        assert!(e.contains("not an account name"), "{e}");
-        assert_eq!(sys.calls().len(), made, "nothing was made");
-        let e = choose(&sys, &l, None, "nerve\n").0.unwrap_err();
-        assert!(e.contains("node's own user"), "{e}");
-    }
-
-    /// An account whose sudo asks for no password is warned about by
-    /// install and by setup, kept or chosen, and neither stops.
-    #[test]
-    fn a_sudo_without_a_password_is_warned_about() {
-        let d = tempfile::tempdir().unwrap();
-        let sys = Fake::new();
-        sys.others.borrow_mut().push(other("carol", 4343));
-        sys.sudo_without_password.borrow_mut().push("carol".into());
-        // Install, for the account chosen before as for a new one.
-        let l = layout(d.path());
-        let install_as = |who: &str| {
-            let mut out = Vec::new();
-            install(&l, &sys, Path::new("/bin/true"), who, &mut out).unwrap();
-            String::from_utf8(out).unwrap()
-        };
-        let out = install_as("carol");
-        assert!(
-            out.contains("carol may use sudo without a password"),
-            "{out}"
-        );
-        assert!(
-            out.contains("sudo nerve-node setup --create-user nerve-work"),
-            "{out}"
-        );
-        assert!(out.contains("commands run as carol"), "{out}");
-        let out = install_as("alice");
-        assert!(
-            out.contains("commands run as carol, as chosen before"),
-            "{out}"
-        );
-        assert!(
-            out.contains("carol may use sudo without a password"),
-            "{out}"
-        );
-        assert!(!out.contains("alice is the account"), "{out}");
-        // Setup: kept, chosen, and made with --create-user.
-        let (r, out) = choose(&sys, &l, Some("carol"), "\n");
-        assert_eq!(r.unwrap(), None);
-        assert!(
-            out.contains("carol may use sudo without a password"),
-            "{out}"
-        );
-        let (r, out) = choose(&sys, &l, Some("bob"), "carol\n");
-        assert!(r.unwrap().is_some());
-        assert!(
-            out.contains("carol may use sudo without a password"),
-            "{out}"
-        );
-        let mut out = Vec::new();
-        create_account(&sys, &l.paths, "carol", "alice", &mut out).unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(
-            out.contains("carol may use sudo without a password"),
-            "{out}"
-        );
-        // An account made for the node is a boundary.
-        let mut out = Vec::new();
-        create_account(&sys, &l.paths, "nerve-work", "alice", &mut out).unwrap();
-        assert!(!String::from_utf8(out).unwrap().contains("Warning"));
-    }
-
     /// The installed node is known by its folders, not by how it started.
     #[test]
     fn the_installed_folders_make_the_service_node() {
@@ -3111,59 +2633,11 @@ pub(crate) mod tests {
         )));
     }
 
-    /// `setup --create-user`: makes the account without a question, by the
-    /// rules of the interactive step.
-    #[test]
-    fn create_user_makes_the_account_without_asking() {
-        let d = tempfile::tempdir().unwrap();
-        let sys = Fake::new();
-        let l = installed(d.path(), &sys, "1.0.0");
-        let create = |name: &str| {
-            let mut out = Vec::new();
-            let r = create_account(&sys, &l.paths, name, "alice", &mut out);
-            (r, String::from_utf8(out).unwrap())
-        };
-        let (r, out) = create("bob");
-        assert_eq!(
-            r.unwrap(),
-            Chosen {
-                name: "bob".into(),
-                made: true
-            }
-        );
-        assert!(out.contains("made the account bob"), "{out}");
-        assert!(sys.calls().contains(&"useradd bob /home/bob".to_string()));
-        let bob = sys.account("bob").unwrap().unwrap();
-        assert_eq!(bob.home, Path::new("/home/bob"));
-        assert_eq!(bob.comment, "Nerve user mode");
-        // There already, and usable: taken, not made again.
-        let made = sys.calls().len();
-        assert!(!create("bob").0.unwrap().made);
-        assert!(!create("alice").0.unwrap().made);
-        // Refused, with nothing made: nerve, the node's user under another
-        // name, and names useradd would not take.
-        sys.others.borrow_mut().push(Account {
-            name: "svc".into(),
-            ..me()
-        });
-        for (name, why) in [
-            ("nerve", "node's own user"),
-            ("svc", "node's own user"),
-            ("Bob", "not a name setup makes"),
-            ("a:b", "not a name setup makes"),
-            ("-x", "not a name setup makes"),
-        ] {
-            let e = create(name).0.unwrap_err();
-            assert!(e.contains(why), "{name}: {e}");
-        }
-        assert_eq!(sys.calls().len(), made, "nothing was made");
-    }
-
-    /// The account of the commands cannot read the keys: they are 0600 in
-    /// folders private to `nerve`. An account that could open those folders
+    /// The owner and `nerve-run` cannot read the keys: they are 0600 in
+    /// folders private to `nerve`. An owner that could open those folders
     /// is refused.
     #[test]
-    fn the_account_of_the_commands_cannot_read_the_keys() {
+    fn the_accounts_of_the_commands_cannot_read_the_keys() {
         use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();
         // Open down to the node's folders, as / and /etc are.
@@ -3176,24 +2650,49 @@ pub(crate) mod tests {
         }
         let key = l.paths.key_file("lab");
         nerve_transport::files::write_private(&key, b"key").unwrap();
-        let cfg = SettingsStore::peek(&l.paths.config_file(), &l.paths.config_key()).unwrap();
-        let name = cfg.machine.user.unwrap();
-        let account = sys.account(&name).unwrap().unwrap();
-        assert_ne!(account.uid, me().uid);
-        for p in [
-            key.clone(),
-            l.paths.config_key(),
+        // The signed config and its key, as the node's first start makes
+        // them.
+        SettingsStore::open(
             l.paths.config_file(),
-            l.paths.audit_log(),
-        ] {
-            assert!(p.exists(), "{p:?}");
-            assert!(!crate::account::reaches(&p, &account), "{p:?}");
-            assert!(crate::account::reaches(&p, &me()), "{p:?}");
+            l.paths.config_key(),
+            AuditLog::new(l.paths.audit_log()),
+        )
+        .unwrap()
+        .update(|c| {
+            c.node.name = Some("lab".into());
+            Ok(())
+        })
+        .unwrap();
+        let alice = sys.account("alice").unwrap().unwrap();
+        let run = sys.account(crate::account::RUN_USER).unwrap().unwrap();
+        for account in [&alice, &run] {
+            assert_ne!(account.uid, me().uid);
+            for p in [
+                key.clone(),
+                l.paths.config_key(),
+                l.paths.config_file(),
+                l.paths.audit_log(),
+            ] {
+                assert!(p.exists(), "{p:?}");
+                assert!(!crate::account::reaches(&p, account), "{p:?}");
+                assert!(crate::account::reaches(&p, &me()), "{p:?}");
+            }
         }
         assert_eq!(mode(&key), 0o600);
-        usable_account(&sys, &l.paths, &name).unwrap();
+        usable_owner(&sys, &l.paths, "alice").unwrap();
+        // Root and the node's own accounts are no owner.
+        for who in ["root", USER, crate::account::RUN_USER] {
+            let e = usable_owner(&sys, &l.paths, who);
+            if who == USER {
+                // The fake's nerve is the test's own account.
+                assert!(e.is_err());
+                continue;
+            }
+            let e = e.unwrap_err();
+            assert!(e.contains("cannot be its owner"), "{who}: {e}");
+        }
         // Opened to others, the folder and the key are in its reach, and
-        // the account is refused.
+        // the owner is refused.
         std::fs::set_permissions(&l.paths.config_dir, std::fs::Permissions::from_mode(0o755))
             .unwrap();
         std::fs::set_permissions(
@@ -3202,8 +2701,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(crate::account::reaches(&key, &account));
-        let e = usable_account(&sys, &l.paths, &name).unwrap_err();
+        assert!(crate::account::reaches(&key, &alice));
+        let e = usable_owner(&sys, &l.paths, "alice").unwrap_err();
         assert!(e.contains("could open"), "{e}");
     }
 
@@ -3331,13 +2830,7 @@ pub(crate) mod tests {
             fn account(&self, _: &str) -> Result<Option<Account>, String> {
                 unreachable!()
             }
-            fn root_groups(&self, _: &Account) -> Vec<String> {
-                unreachable!()
-            }
-            fn add_user(&self, _: &str, _: &Path) -> Result<(), String> {
-                unreachable!()
-            }
-            fn add_account(&self, _: &str, _: &Path) -> Result<(), String> {
+            fn add_account(&self, _: &str, _: &Path, _: &str) -> Result<(), String> {
                 unreachable!()
             }
             fn remove_account(&self, _: &str) -> Result<(), String> {
@@ -3377,7 +2870,7 @@ pub(crate) mod tests {
                 format!("{what} needs root: run `sudo nerve-node {what}`")
             );
         }
-        // Starting and stopping is polkit's to allow (the owners' rule), so
+        // Starting and stopping is polkit's to allow (the owner's rule), so
         // it is not refused for want of root here.
         let e = control(&l, &NotRoot, ServiceAction::Stop, &mut Vec::new()).unwrap_err();
         assert!(e.contains("not installed as a service"), "{e}");
@@ -3398,14 +2891,16 @@ pub(crate) mod tests {
                 format!("systemctl disable --now {UNIT_NAME}"),
                 "systemctl daemon-reload".into(),
                 format!("systemctl reset-failed {UNIT_NAME}"),
-                "groupdel nerve-admin".into(),
+                "userdel nerve-run".into(),
                 "userdel nerve".into(),
             ]),
             "{:?}",
             sys.calls()
         );
         assert!(!l.polkit_rule().exists());
-        assert_eq!(sys.members(crate::owner::GROUP), None);
+        // The commands' account goes with its home, whatever --purge says.
+        assert_eq!(sys.account(crate::account::RUN_USER).unwrap(), None);
+        assert!(!l.run_home.exists());
         // The config and state stay, and the audit log has both commands.
         assert_eq!(
             std::fs::read_to_string(l.paths.config_file()).unwrap(),
@@ -3419,7 +2914,13 @@ pub(crate) mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("uninstall --purge"), "{out}");
         // No uid that may come to another user owns them: they are root's.
-        let given = sys.given.borrow().clone();
+        let given: Vec<_> = sys
+            .given
+            .borrow()
+            .iter()
+            .filter(|(_, uid)| *uid == 0)
+            .cloned()
+            .collect();
         assert_eq!(
             given,
             [
@@ -3518,73 +3019,10 @@ pub(crate) mod tests {
         std::fs::write(l.paths.config_key(), "mac key").unwrap();
     }
 
-    /// An install from before the owners gets them at its update: the
-    /// group with the one who updates in it, the polkit rule and the unit
-    /// with the owners' runtime folder and their group for the owner token.
-    /// An update after that changes no owner.
-    #[tokio::test]
-    async fn an_update_gives_an_earlier_install_its_owners() {
-        let d = tempfile::tempdir().unwrap();
-        let sys = Fake::new();
-        let l = installed(d.path(), &sys, "1.0.0");
-        // As an install before them left it.
-        sys.groups.borrow_mut().clear();
-        std::fs::remove_file(l.polkit_rule()).unwrap();
-        let old_unit = l
-            .unit_text()
-            .replace(
-                "RuntimeDirectory=nerve-node\nRuntimeDirectoryMode=0755\n",
-                "",
-            )
-            .replace("SupplementaryGroups=nerve-admin\n", "");
-        std::fs::write(&l.unit, &old_unit).unwrap();
-        let new = d.path().join("new");
-        std::fs::write(&new, "nerve-node 1.2.0\n").unwrap();
-        let mut out = Vec::new();
-        update(&l, &sys, Some(&new), "alice", &mut out)
-            .await
-            .unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert_eq!(std::fs::read_to_string(&l.unit).unwrap(), l.unit_text());
-        assert!(out.contains("wrote the service unit"), "{out}");
-        assert_eq!(
-            sys.members(crate::owner::GROUP),
-            Some(vec!["alice".to_string()])
-        );
-        assert_eq!(
-            std::fs::read_to_string(l.polkit_rule()).unwrap(),
-            polkit_rule_text()
-        );
-        // The unit is read again before the restart that takes it.
-        let calls = sys.calls();
-        let reload = calls.iter().rposition(|c| c == "systemctl daemon-reload");
-        let restart = calls
-            .iter()
-            .rposition(|c| *c == format!("systemctl restart {UNIT_NAME}"));
-        assert!(reload < restart, "{calls:?}");
-        // The next update keeps the owners as they are.
-        let before = sys.calls().len();
-        std::fs::write(&new, "nerve-node 1.3.0\n").unwrap();
-        let mut out = Vec::new();
-        update(&l, &sys, Some(&new), "root", &mut out)
-            .await
-            .unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(!out.contains("owner"), "{out}");
-        assert!(!out.contains("polkit"), "{out}");
-        assert!(
-            !sys.calls()[before..]
-                .iter()
-                .any(|c| c.starts_with("usermod") || c.starts_with("groupadd")),
-            "{:?}",
-            sys.calls()
-        );
-    }
-
-    /// Without polkit the owners are told that starting and stopping needs
-    /// sudo; root alone installing makes no owner.
+    /// Without polkit the owner is told that starting and stopping needs
+    /// sudo.
     #[test]
-    fn install_says_what_polkit_and_the_owners_are_here() {
+    fn install_says_what_polkit_is_here() {
         let d = tempfile::tempdir().unwrap();
         let sys = Fake::new();
         sys.polkit.set(Polkit::Missing);
@@ -3592,7 +3030,7 @@ pub(crate) mod tests {
         let exe = d.path().join("nerve-node-x86_64-linux");
         std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
         let mut out = Vec::new();
-        install(&l, &sys, &exe, "root", &mut out).unwrap();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("Warning: polkit is not installed"), "{out}");
         for f in [
@@ -3603,16 +3041,15 @@ pub(crate) mod tests {
         ] {
             assert!(!f.exists(), "{}", f.display());
         }
-        assert!(out.contains("no owner besides root"), "{out}");
-        assert_eq!(sys.members(crate::owner::GROUP), Some(Vec::new()));
     }
 
-    /// On polkit 0.105, which takes no rules, the owners get the service
+    /// On polkit 0.105, which takes no rules, the owner gets the service
     /// helper through its own action and a `.pkla` file for it, never one
     /// for systemd's `manage-units`; on a newer polkit through the rule.
-    /// An update moves from one to the other, and uninstall removes them.
-    #[tokio::test]
-    async fn polkit_0105_gets_the_helper_and_a_pkla_file_and_newer_the_rule() {
+    /// An install again moves from one to the other, and uninstall removes
+    /// them.
+    #[test]
+    fn polkit_0105_gets_the_helper_and_a_pkla_file_and_newer_the_rule() {
         let d = tempfile::tempdir().unwrap();
         let sys = Fake::new();
         sys.polkit.set(Polkit::Old);
@@ -3650,9 +3087,9 @@ pub(crate) mod tests {
                 .join("etc/polkit-1/localauthority/50-local.d/50-nerve-node.pkla")
         );
         let text = std::fs::read_to_string(&pkla).unwrap();
-        assert_eq!(text, polkit_pkla_text());
+        assert_eq!(text, polkit_pkla_text("alice"));
         for line in [
-            "Identity=unix-group:nerve-admin",
+            "Identity=unix-user:alice",
             "Action=org.nerve-protocol.node.service-control",
             "ResultActive=yes",
         ] {
@@ -3666,10 +3103,7 @@ pub(crate) mod tests {
         sys.polkit.set(Polkit::Rules);
         let new = d.path().join("new");
         std::fs::write(&new, "nerve-node 1.1.0\n").unwrap();
-        let mut out = Vec::new();
-        update(&l, &sys, Some(&new), "alice", &mut out)
-            .await
-            .unwrap();
+        install(&l, &sys, &new, "root", &mut Vec::new()).unwrap();
         let rule = std::fs::read_to_string(l.polkit_rule()).unwrap();
         assert!(rule.contains(POLKIT_ACTION), "{rule}");
         assert!(!pkla.exists());
@@ -3750,9 +3184,7 @@ pub(crate) mod tests {
         let new = d.path().join("new");
         std::fs::write(&new, "nerve-node 1.2.0\n").unwrap();
         let mut out = Vec::new();
-        update(&l, &sys, Some(&new), "alice", &mut out)
-            .await
-            .unwrap();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(
             out.contains("replaced nerve-node 1.0.0 with 1.2.0"),
@@ -3779,9 +3211,7 @@ pub(crate) mod tests {
         // The same program again changes nothing.
         let calls = sys.calls().len();
         let mut out = Vec::new();
-        update(&l, &sys, Some(&new), "alice", &mut out)
-            .await
-            .unwrap();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
         assert!(
             String::from_utf8(out)
                 .unwrap()
@@ -3801,7 +3231,7 @@ pub(crate) mod tests {
             ("something else\n", "is not nerve-node"),
         ] {
             std::fs::write(&new, text).unwrap();
-            let e = update(&l, &sys, Some(&new), "alice", &mut Vec::new())
+            let e = update(&l, &sys, Some(&new), &mut Vec::new())
                 .await
                 .unwrap_err();
             assert!(e.contains(why), "{e}");
@@ -3810,7 +3240,7 @@ pub(crate) mod tests {
         }
         std::fs::write(&new, "nerve-node 2.0.0\n").unwrap();
         sys.starts.set(false);
-        let e = update(&l, &sys, Some(&new), "alice", &mut Vec::new())
+        let e = update(&l, &sys, Some(&new), &mut Vec::new())
             .await
             .unwrap_err();
         assert!(e.contains("did not start"), "{e}");
@@ -3830,7 +3260,7 @@ pub(crate) mod tests {
     async fn update_needs_an_installed_node() {
         let d = tempfile::tempdir().unwrap();
         let sys = Fake::new();
-        let e = update(&layout(d.path()), &sys, None, "alice", &mut Vec::new())
+        let e = update(&layout(d.path()), &sys, None, &mut Vec::new())
             .await
             .unwrap_err();
         assert!(e.contains("not installed"), "{e}");
@@ -3910,7 +3340,7 @@ pub(crate) mod tests {
         )
         .await;
         let mut out = Vec::new();
-        update(&l, &sys, None, "alice", &mut out).await.unwrap();
+        update(&l, &sys, None, &mut out).await.unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("checked it against its SHA256SUMS"), "{out}");
         assert_eq!(std::fs::read(&l.bin).unwrap(), program);
@@ -3918,16 +3348,12 @@ pub(crate) mod tests {
         // A program that does not match its line is refused.
         let mut l2 = installed(&d.path().join("two"), &sys, "1.0.0");
         l2.release = release(program, format!("{}  {asset}\n", sha(b"other"))).await;
-        let e = update(&l2, &sys, None, "alice", &mut Vec::new())
-            .await
-            .unwrap_err();
+        let e = update(&l2, &sys, None, &mut Vec::new()).await.unwrap_err();
         assert!(e.contains("does not match"), "{e}");
         assert_eq!(std::fs::read(&l2.bin).unwrap(), b"nerve-node 1.0.0\n");
         // So is a release that does not list it.
         l2.release = release(program, format!("{}  other\n", sha(program))).await;
-        let e = update(&l2, &sys, None, "alice", &mut Vec::new())
-            .await
-            .unwrap_err();
+        let e = update(&l2, &sys, None, &mut Vec::new()).await.unwrap_err();
         assert!(e.contains("lists no"), "{e}");
     }
 
@@ -4017,16 +3443,14 @@ pub(crate) mod tests {
         // its parts put back.
         let new = d.path().join("new");
         std::fs::write(&new, "nerve-node 1.1.0\n").unwrap();
-        let e = update(&l, &sys, Some(&new), "alice", &mut Vec::new())
+        let e = update(&l, &sys, Some(&new), &mut Vec::new())
             .await
             .unwrap_err();
         assert!(e.contains("is not nerve-node-desktop"), "{e}");
         std::fs::remove_file(&entry).unwrap();
         std::fs::write(&new, "nerve-node-desktop 1.1.0\n").unwrap();
         let mut out = Vec::new();
-        update(&l, &sys, Some(&new), "alice", &mut out)
-            .await
-            .unwrap();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(
             out.contains("replaced nerve-node-desktop 1.0.0 with 1.1.0"),
@@ -4077,9 +3501,7 @@ pub(crate) mod tests {
         assert!(!String::from_utf8(out).unwrap().contains("is a link"));
         let new = d.path().join("new");
         std::fs::write(&new, "nerve-node-desktop 1.1.0\n").unwrap();
-        update(&l, &sys, Some(&new), "alice", &mut Vec::new())
-            .await
-            .unwrap();
+        update(&l, &sys, Some(&new), &mut Vec::new()).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(&node.bin).unwrap(),
             "nerve-node-desktop 1.1.0\n"

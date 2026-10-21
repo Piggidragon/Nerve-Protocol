@@ -443,25 +443,6 @@ fn every_page_light_and_dark() {
     shots.take_as_is("overview-restart-soon");
     store.set_toast_shown(false);
     store.set_restart_due(false);
-    // Commands run as the app's user, an owner of the node.
-    store.set_commands_as_you(true);
-    store.set_commands_account("alex".into());
-    store.set_commands_root_via("docker and sudo".into());
-    shots.take("overview-commands-as-you");
-    store.set_commands_root_via("".into());
-    shots.take("overview-commands-as-you-plain");
-    // Hidden by its owner: Settings, General keeps the line.
-    store.invoke_show(Page::Settings);
-    prefs.set_tab(0);
-    // As the node's status says it, which reading the page asked anew.
-    store.set_commands_as_you(true);
-    store.set_commands_dismissed(true);
-    store.set_commands_root_via("docker and sudo".into());
-    prefs.set_account("alex".into());
-    shots.take("settings-general-commands-as-you");
-    store.invoke_show(Page::Overview);
-    store.set_commands_dismissed(false);
-    store.set_commands_as_you(false);
     // Commands without their limits: one line, and the restart.
     let st = store.get_status();
     let mut off = st.clone();
@@ -643,10 +624,8 @@ fn every_page_light_and_dark() {
     shots.take_full("settings-limits", 1150);
     prefs.set_tab(0);
     shots.take_full("settings-general", 1000);
-    // Where no keyring can hold the keys, an account to choose, a limit
-    // being saved and one refused, and a setting by its name.
-    prefs.set_account_new("nerve-work".into());
-    shots.take("settings-general-choices");
+    // Where no keyring can hold the keys, a limit being saved and one
+    // refused, and a setting by its name.
     store.set_keyring_usable(false);
     store.set_keyring_why(nerve_node_desktop::view::no_keyring("windows-service").into());
     prefs.set_tab(1);
@@ -666,7 +645,6 @@ fn every_page_light_and_dark() {
     shots.take("settings-advanced-filled");
     prefs.set_tab(2);
     store.set_keyring_usable(usable);
-    prefs.set_account_new("".into());
     prefs.set_raw_key("".into());
     prefs.set_raw_value("".into());
     // The limits as they were: the edits above were only shown.

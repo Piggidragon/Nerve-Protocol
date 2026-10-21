@@ -54,27 +54,18 @@ pub fn newer(a: &str, b: &str) -> bool {
 }
 
 /// What a service command said, as the steps it did and what it warned
-/// about. Its advice for a terminal (`Next: …`, the commands that choose an
-/// account) is the app's to give, in its own words: the app asked for root
-/// through pkexec, and the account is chosen in its Settings.
+/// about. Its advice for a terminal (`Next: …`, the command that asks for
+/// the Windows password again) is the app's to give, in its own words: the
+/// app asked for root through pkexec, and the password is in its Settings.
 pub fn steps(v: &Value) -> (Vec<String>, Vec<String>) {
-    use nerve_node::account::{
-        CREATE_USER_HINT, CREATE_USER_HINT_ROOT, NO_ACCOUNT_INSTALL, NO_ACCOUNT_SETUP, RAN_SUDO,
-    };
+    use nerve_node::account::NO_ACCOUNT_INSTALL;
     let (mut did, mut warn) = (Vec::new(), Vec::new());
     for line in v["messages"].as_array().into_iter().flatten() {
         let Some(line) = line.as_str() else { continue };
         if line.starts_with("Next:") {
             continue;
         }
-        if line == CREATE_USER_HINT || line == CREATE_USER_HINT_ROOT {
-            warn.push(ACCOUNT_HINT.to_string());
-            continue;
-        }
-        let line = line
-            .replace(RAN_SUDO, "is your own account, the one you log in as")
-            .replace(NO_ACCOUNT_SETUP, CHOOSE_ACCOUNT)
-            .replace(NO_ACCOUNT_INSTALL, ENTER_PASSWORD);
+        let line = line.replace(NO_ACCOUNT_INSTALL, ENTER_PASSWORD);
         if line.starts_with("Warning:") || line.starts_with("no account for commands") {
             warn.push(line);
         } else {
@@ -84,10 +75,8 @@ pub fn steps(v: &Value) -> (Vec<String>, Vec<String>) {
     (did, warn)
 }
 
-/// Where the app chooses the account of the commands, for what a service
-/// command says of it.
-const ACCOUNT_HINT: &str = "An account only the node uses is the boundary: Settings, General, Account for commands, makes one and runs commands as it.";
-const CHOOSE_ACCOUNT: &str = "choose one in Settings, General, Account for commands";
+/// Where the app takes the password of the account of the commands on
+/// Windows, for what a service command says of it.
 const ENTER_PASSWORD: &str = "enter its password in Settings, General, Account for commands";
 
 fn shared(lines: Vec<String>) -> ModelRc<SharedString> {
@@ -431,31 +420,23 @@ mod tests {
         assert!(!newer("0.0.5", ""));
         let v = serde_json::json!({"messages": [
             "made the user nerve (uid 991)",
-            nerve_node::account::invoker_warning("alice"),
-            nerve_node::account::CREATE_USER_HINT,
+            "Warning: no owner: there is no account bob; only root changes the node and user mode runs no command",
             format!("no account for commands: the password of alice is wrong; {}", nerve_node::account::NO_ACCOUNT_INSTALL),
-            format!("no account for commands: there is no account bob; {}", nerve_node::account::NO_ACCOUNT_SETUP),
             "the service nerve-node.service runs as nerve and starts with the machine",
-            "Next: `sudo nerve-node setup` names the node and pairs it with its first center.",
+            "Next: `nerve-node center add '<link>'` pairs the node with a center.",
         ]});
         let (did, warn) = steps(&v);
         assert_eq!(did.len(), 2);
-        assert_eq!(warn.len(), 4);
+        assert_eq!(warn.len(), 2);
+        assert!(warn[0].starts_with("Warning: no owner"), "{}", warn[0]);
         assert!(
-            warn[0].starts_with("Warning: alice is your own account"),
-            "{}",
-            warn[0]
-        );
-        assert!(warn[1].contains("Settings, General, Account for commands"));
-        assert!(
-            warn[2].starts_with("no account")
-                && warn[2]
+            warn[1].starts_with("no account")
+                && warn[1]
                     .ends_with("enter its password in Settings, General, Account for commands")
         );
-        assert!(warn[3].ends_with("choose one in Settings, General, Account for commands"));
-        // Nothing sends the owner to a terminal, nor says it ran sudo.
+        // Nothing sends the owner to a terminal.
         for line in did.iter().chain(&warn) {
-            assert!(!line.contains('`') && !line.contains("ran sudo"), "{line}");
+            assert!(!line.contains('`'), "{line}");
         }
     }
 }

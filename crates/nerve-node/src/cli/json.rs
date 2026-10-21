@@ -229,7 +229,7 @@ async fn status(paths: &NodePaths) -> Result<Value, String> {
         "daemon": "not running",
         "version": cfg.version,
         "locked": cfg.locked,
-        "account": cfg.machine.user,
+        "owner": crate::service::owner_of(paths),
         "sudo": if sudo_is_on(paths).await? { "on" } else { "off" },
         "command_limits": crate::cgroup::status(
             &cfg.limits.command,
@@ -246,6 +246,7 @@ fn center(paths: &NodePaths, c: &nerve_policy::CenterEntry, now: u64) -> Value {
         "url": c.url,
         "mode": c.policy.mode_at(now).as_str(),
         "until": c.policy.until,
+        "as_owner": c.policy.as_owner,
         "settings": c.settings,
         "paused": c.paused,
         "revoked": c.revoked,

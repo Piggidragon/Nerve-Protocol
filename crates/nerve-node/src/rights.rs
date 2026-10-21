@@ -24,13 +24,13 @@ pub fn full_rights() -> bool {
     }
 }
 
-/// What can take the full rights away from a command: on Unix a root node
-/// can run commands as `machine.user`; on Windows nothing can, the commands
-/// keep the node's token.
+/// What can take the full rights away from a command: on Unix the
+/// installed node runs commands as `nerve-run` or its owner; on Windows
+/// nothing can, the commands keep the node's token.
 #[cfg(windows)]
 const UNLESS: &str = "";
 #[cfg(not(windows))]
-const UNLESS: &str = "unless machine.user names another account, ";
+const UNLESS: &str = "unless it is the installed node, which runs them as nerve-run or its owner, ";
 
 /// The warning for a node that runs as `who` with full rights.
 pub fn warning_for(who: &str) -> String {
@@ -77,11 +77,11 @@ mod tests {
     }
 
     /// Only a Unix node can hand commands to another account; on Windows the
-    /// warning must not offer `machine.user` as a way out.
+    /// warning must not offer that as a way out.
     #[test]
-    fn the_warning_offers_machine_user_only_where_it_works() {
+    fn the_warning_offers_another_account_only_where_it_works() {
         let w = warning_for(WHO);
-        assert_eq!(w.contains("machine.user"), cfg!(unix), "{w}");
+        assert_eq!(w.contains("nerve-run"), cfg!(unix), "{w}");
     }
 
     /// The token check must agree with the system's own report: a process

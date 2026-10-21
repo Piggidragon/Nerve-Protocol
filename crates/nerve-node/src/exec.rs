@@ -386,7 +386,6 @@ pub fn landlock_spec(
         read: leave_out(&[nerve_sandbox::system_dirs(), f.read].concat(), own),
         write: leave_out(&[nerve_sandbox::system_writable(), f.write].concat(), own),
         exec: leave_out(&[nerve_sandbox::system_dirs(), f.exec].concat(), own),
-        connect: None,
     }
 }
 
@@ -557,15 +556,6 @@ fn real_checked(p: &Path) -> std::io::Result<PathBuf> {
     {
         Ok(c)
     }
-}
-
-/// Where a command of `folders` mode may connect to socket files while the
-/// node's keys are in the keyring: anywhere but the folders in `own`, which
-/// then hold the session bus the keyring answers on
-/// (crate::paths::keyring_places). With the files the rule is not set, and
-/// commands connect where they did.
-pub fn connect_rule(own: &[PathBuf]) -> Vec<PathBuf> {
-    leave_out(&[PathBuf::from("/")], own)
 }
 
 /// The configured folders where commands may write: the `w` folders of every
@@ -1082,6 +1072,9 @@ pub struct RunOptions {
     /// The account the command runs as (the installed node, every mode,
     /// crate::account); `None` runs it as the node's own user.
     pub account: Option<crate::service::Account>,
+    /// Whether that account is `nerve-run`, whose command gets the
+    /// environment of its own home ([`separate_env`]).
+    pub separate: bool,
     /// The node's own folders, which the account must not reach.
     pub own: Vec<PathBuf>,
     /// Linux: the command runs in a cgroup of its own below these, held to
@@ -1090,6 +1083,28 @@ pub struct RunOptions {
         std::sync::Arc<crate::cgroup::Cgroups>,
         nerve_policy::config::Granted,
     )>,
+}
+
+/// The environment of a command of `nerve-run` besides HOME, USER and
+/// LOGNAME: what it sets, and what it takes away. Its tools keep their
+/// configs and caches in its own `home` (the XDG folders), it has no session
+/// of anyone's to talk to, and git trusts the repositories it reaches: they
+/// belong to the owner, whose folders it was given, and git refuses them as
+/// another account's otherwise ("dubious ownership"). The setting goes in as
+/// git's command-line configuration (`GIT_CONFIG_COUNT`, git 2.31 on), the
+/// one place besides the account's own files it honours `safe.directory`.
+pub fn separate_env(home: &Path) -> (Vec<(String, String)>, Vec<&'static str>) {
+    let under = |p: &str| home.join(p).display().to_string();
+    let set = vec![
+        ("XDG_CONFIG_HOME".into(), under(".config")),
+        ("XDG_CACHE_HOME".into(), under(".cache")),
+        ("XDG_DATA_HOME".into(), under(".local/share")),
+        ("XDG_STATE_HOME".into(), under(".local/state")),
+        ("GIT_CONFIG_COUNT".into(), "1".into()),
+        ("GIT_CONFIG_KEY_0".into(), "safe.directory".into()),
+        ("GIT_CONFIG_VALUE_0".into(), "*".into()),
+    ];
+    (set, vec!["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"])
 }
 
 /// What a sudo command needs: the password and the prompt sudo was told to
@@ -1598,6 +1613,13 @@ pub async fn run(
             cmd.env("HOME", &a.home)
                 .env("USER", &a.name)
                 .env("LOGNAME", &a.name);
+            if opts.separate {
+                let (set, unset) = separate_env(&a.home);
+                cmd.envs(set);
+                for k in unset {
+                    cmd.env_remove(k);
+                }
+            }
         }
         None => {
             cmd.current_dir(&call.cwd);
@@ -1948,6 +1970,7 @@ mod tests {
             timeouts: Timeouts::default(),
             sudo: None,
             account: None,
+            separate: false,
             own: Vec::new(),
             limits: None,
         }
@@ -2425,24 +2448,6 @@ mod tests {
         let (r, _) = within_a_few_seconds(&c, &o).await;
         let e = r.unwrap_err();
         assert!(e.message.contains("past timeout_ms"), "{}", e.message);
-    }
-
-    /// With the keys in the keyring a command connects to socket files anywhere
-    /// but the node's own folders, the session bus's among them: no rule holds
-    /// those.
-    #[test]
-    fn the_connect_rule_leaves_the_own_folders_out() {
-        let d = tempfile::tempdir().unwrap();
-        let w = std::fs::canonicalize(d.path()).unwrap();
-        for dir in ["run/user/1000", "run/user/1001", "run/lock"] {
-            std::fs::create_dir_all(w.join(dir)).unwrap();
-        }
-        let bus = w.join("run/user/1000");
-        let got = connect_rule(std::slice::from_ref(&bus));
-        assert!(got.contains(&w.join("run/user/1001")), "{got:?}");
-        assert!(got.contains(&w.join("run/lock")), "{got:?}");
-        assert!(!got.iter().any(|p| bus.starts_with(p)), "{got:?}");
-        assert!(!got.iter().any(|p| p.starts_with(&bus)), "{got:?}");
     }
 
     #[test]
@@ -3330,6 +3335,7 @@ mod windows_tests {
             timeouts: Timeouts::default(),
             sudo: None,
             account: None,
+            separate: false,
             own: Vec::new(),
             limits: None,
         }

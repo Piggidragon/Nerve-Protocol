@@ -701,23 +701,8 @@ fn the_app_drives_the_cli_end_to_end() {
     prefs.set_raw_value("fs:~/private/*".into());
     prefs.invoke_raw_add();
     assert_eq!(prefs.get_raw_error(), "");
-    // The account commands run as: none here, and choosing one is the
-    // installed node's (setup --create-user), which the CLI says.
+    // The account commands run as: Windows's alone, none here.
     assert_eq!(prefs.get_account(), "");
-    prefs.set_account_new("nerve-work".into());
-    prefs.invoke_account_use();
-    // On Windows the account is install's, which the CLI says instead.
-    let why = if cfg!(windows) {
-        "nerve-node install"
-    } else {
-        "installed as a service"
-    };
-    assert!(
-        prefs.get_account_error().contains(why),
-        "{}",
-        prefs.get_account_error()
-    );
-    assert!(!prefs.get_account_busy());
     let denied = |r: &str| {
         config(&paths).centers[0]
             .policy

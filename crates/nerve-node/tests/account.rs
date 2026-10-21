@@ -41,6 +41,7 @@ fn opts(policy: &CenterPolicy, account: &Account, own: &[PathBuf]) -> RunOptions
         timeouts: Default::default(),
         sudo: None,
         account: Some(account.clone()),
+        separate: false,
         own: own.to_vec(),
         limits: None,
     }

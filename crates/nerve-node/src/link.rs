@@ -1458,6 +1458,9 @@ impl Link {
         let (cfg, entry) = self
             .entry()
             .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "this center was removed"))?;
+        // The gate and the sandbox see the built-in folders of `nerve-run`
+        // too; the config keeps the owner's.
+        let entry = self.shared.with_built_in(&cfg, entry);
         let view =
             descriptor::for_call(&cfg, &entry, crate::now_ms(), &self.shared.providers.caps());
         let cap = view.capability(&inv.cap).ok_or_else(|| {
@@ -1521,10 +1524,10 @@ impl Link {
             ("exec", "run") => self.exec_run(id, &cfg, &entry, effect, &inv).await,
             ("fs", a) => {
                 // On the installed node the node reads and writes as the
-                // account the commands run as (crate::account::FsAs), from
-                // the paths of the call to the files it makes. A missing
+                // account the pairing's commands run as (crate::account::FsAs),
+                // from the paths of the call to the files it makes. A missing
                 // account stops the call once it is decided and audited.
-                let account = self.shared.command_account(&cfg);
+                let account = self.shared.command_account(&cfg, &entry.policy);
                 let known = account.as_ref().ok().cloned().flatten();
                 let call = {
                     let _as = act_as(known.as_ref())?;
@@ -1584,11 +1587,12 @@ impl Link {
         self.shared.rules_home(&self.shared.config())
     }
 
-    /// The account the commands run as, when there is one to use. Not
-    /// called while the store is locked: it reads the config.
+    /// The owner's account, whose view of the files the protected list
+    /// is made with, when there is one to use. Not called while the store
+    /// is locked: it reads the config.
     fn account(&self) -> Option<crate::service::Account> {
         self.shared
-            .command_account(&self.shared.config())
+            .owner_account(&self.shared.config())
             .ok()
             .flatten()
     }
@@ -1601,16 +1605,16 @@ impl Link {
         )
     }
 
-    /// The folders no center reaches (Shared::sealed). Not called while the
+    /// The folders no center reaches (Shared::own). Not called while the
     /// store is locked: it reads the config.
     fn own(&self) -> Vec<std::path::PathBuf> {
-        self.shared.sealed(&self.shared.config())
+        self.shared.own(&self.shared.config())
     }
 
     /// This node's protected list with a center's options. On the
-    /// installed node its `~` is the account's home, and its entries are
-    /// looked at as that account (crate::account::FsAs), which may see
-    /// where the node's user may not.
+    /// installed node its `~` is the owner's home, and its entries are
+    /// looked at as the owner (crate::account::FsAs), who may see where the
+    /// node's user may not.
     fn protected_with(
         &self,
         opts: &nerve_policy::config::ProtectedOptions,
@@ -1649,10 +1653,11 @@ impl Link {
             now_ms: crate::now_ms(),
         };
         // The policy looks at the paths as the account (crate::account::FsAs);
-        // the audit entry below is the node's own again.
+        // the audit entry below is the node's own again. `~` is the owner's.
         let decision = {
             let protected = self.protected(entry);
-            let home = account.map_or(&self.shared.home, |a| &a.home);
+            let home = self.home();
+            let home = &home;
             let _as = act_as(account)?;
             let env = Env {
                 home,
@@ -1806,20 +1811,32 @@ impl Link {
         effect: Effect,
         inv: &Invoke,
     ) -> Result<Value, RpcError> {
-        // The installed node runs every command as the account the owner
-        // chose (crate::account), from its home; folder mode confines it.
-        // A missing account stops the command after the call is decided and
-        // audited.
-        let account = self.shared.command_account(cfg);
+        // The installed node runs a command as `nerve-run`, or as the owner
+        // where the pairing runs as the owner (crate::account), from that
+        // account's home. A sudo command runs as the owner, whose password
+        // the switch holds. A missing account stops the command after the
+        // call is decided and audited.
+        let sudo_call = inv
+            .args
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|c| nerve_policy::sudo_command(c).is_some());
+        let account = if sudo_call {
+            self.shared.owner_account(cfg)
+        } else {
+            self.shared.command_account(cfg, &entry.policy)
+        };
         let known = account.as_ref().ok().cloned().flatten();
-        let home = known
+        let start_in = known
             .as_ref()
             .map_or(&self.shared.home, |a| &a.home)
             .clone();
+        // `~` of the folders and rules: the owner's.
+        let home = self.shared.rules_home(cfg);
         // The paths are looked at as the account (crate::account::FsAs).
         let rc = {
             let _as = act_as(known.as_ref())?;
-            RunCall::parse(&inv.args, &home)?
+            RunCall::parse(&inv.args, &start_in)?
         };
         // A call may ask for less than the owner's most, never for more.
         let granted = cfg
@@ -1838,8 +1855,9 @@ impl Link {
         // that passes cannot let a command the gate judged by the folders run
         // without Landlock. A limit only ever turns folder mode into allowlist,
         // which the gate then judges, so the sandbox is never less than what it
-        // judged.
+        // judged. A command of `nerve-run` is confined in every mode.
         let by_folders = entry.policy.mode_at(crate::now_ms()) == Mode::Folder;
+        let separate = self.shared.separate(&entry.policy) && !sudo_call;
         let unconfined = self.shared.unconfined_as(cfg, || known.clone());
         self.gate(
             entry,
@@ -1869,7 +1887,8 @@ impl Link {
             sudo = Some(exec::SudoInput { password, prompt });
         }
         // Folder mode confines: Landlock on Linux, the pairing's AppContainer
-        // on Windows, by the answer the gate went by.
+        // on Windows, by the answer the gate went by; `nerve-run` is
+        // confined in allowlist mode too, where Landlock is there.
         let folder = sudo.is_none() && by_folders && unconfined.is_none();
         let container = if folder && self.shared.confinement.appcontainer {
             Some(self.container(entry, cfg, &home).await?)
@@ -1877,28 +1896,20 @@ impl Link {
             None
         };
         let guard = Running::start(self, id.clone(), cfg.limits.max_running as usize)?;
-        // The account's home is the `~` of its rules: its own shell
-        // profiles and keys stay out of them.
         let own = self.shared.own(cfg);
-        let landlock = (folder && self.shared.confinement.landlock_abi.is_some()).then(|| {
+        let confine = folder || separate && self.shared.exe.is_some();
+        let landlock = (confine && self.shared.confinement.landlock_abi.is_some()).then(|| {
             // The folders' entries are listed as the account.
             let _as = act_as(known.as_ref()).ok().flatten();
             // The folders a command of any center may write: a link it puts
             // in place of a folder inside one leads nowhere the next
             // command gets rules for.
             let writable = exec::write_folders(cfg, &home);
-            let sealed = self.shared.sealed(cfg);
-            let mut spec = exec::landlock_spec(&entry.policy, &home, &sealed, &writable);
-            // The keys in the keyring are behind the session bus, a socket
-            // file in the own folders then.
-            if cfg.machine.secret_storage == nerve_policy::config::SecretStorage::Keyring {
-                spec.connect = Some(exec::connect_rule(&own));
-            }
-            spec
+            exec::landlock_spec(&entry.policy, &home, &own, &writable)
         });
         // Counted while it runs, so the keys do not move into the keyring
         // meanwhile, and not started when they moved after `cfg` was taken.
-        let open = crate::daemon::reaches_bus(landlock.as_ref(), || known.clone())
+        let open = crate::daemon::reaches_bus(landlock.as_ref(), || account.clone())
             .then(|| self.shared.open_to_bus())
             .transpose()
             .map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?;
@@ -1911,6 +1922,7 @@ impl Link {
             timeouts: exec::Timeouts::from_limits(&cfg.limits),
             sudo,
             account,
+            separate,
             own,
             limits: self
                 .shared

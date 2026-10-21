@@ -688,12 +688,13 @@ impl CenterEntry {
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Default deny: a call runs only when an allow rule lets it through.
-    /// What a new center starts in.
+    /// What a pairing whose file names no mode is in, and where `folder` and
+    /// `user` fall back to when their time runs out.
     #[default]
     Allowlist,
     /// Full access inside the folders, by their flags: reading where `r` is
     /// set, writing where `w` is, commands where `x` is, in the folders and
-    /// everything below them.
+    /// everything below them. What a new pairing starts in.
     Folder,
     /// Full access as the user, protected paths aside.
     User,

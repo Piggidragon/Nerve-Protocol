@@ -85,6 +85,8 @@ async fn the_daemon_logs_its_links_changes_and_failed_calls() {
         .expect("pair");
     let rule = format!("fs.read:{home}/*");
     nerve_node::cli::edit(&paths, |c| {
+        // The rule counts in allowlist mode; a new pairing is in folder mode.
+        c.centers[0].policy.mode = nerve_policy::Mode::Allowlist;
         c.centers[0].policy.allow.push(rule.clone());
         Ok(())
     })

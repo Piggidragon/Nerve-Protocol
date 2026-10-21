@@ -451,7 +451,8 @@ fn the_app_drives_the_cli_end_to_end() {
     store.invoke_show(Page::Policy);
     assert_eq!(perm.get_center(), "home");
     assert_eq!(perm.get_load(), Load::Ready, "{}", perm.get_error());
-    assert_eq!(perm.get_mode(), "allowlist");
+    // A new pairing starts in folder mode.
+    assert_eq!(perm.get_mode(), "folder");
     assert!(perm.get_caps().iter().any(|c| c.name == "exec.run"));
     perm.invoke_mode_pick("user".into());
     assert!(perm.get_mode_open());

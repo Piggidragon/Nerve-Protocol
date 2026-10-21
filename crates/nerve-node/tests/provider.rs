@@ -62,6 +62,8 @@ async fn node(
             name: "desk".into(),
             exe: exe.into(),
         }];
+        // The rules count in allowlist mode; a new pairing is in folder mode.
+        c.centers[0].policy.mode = nerve_policy::Mode::Allowlist;
         policy(&mut c.centers[0].policy);
     })
     .await;

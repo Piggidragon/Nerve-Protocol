@@ -84,6 +84,8 @@ async fn node_with(
         cfg.machine.sudo_path = Some(sudo.clone());
         cfg.centers[0].settings = SettingsGrant::Write;
         let policy = &mut cfg.centers[0].policy;
+        // The rules count in allowlist mode; a new pairing is in folder mode.
+        policy.mode = nerve_policy::Mode::Allowlist;
         policy.sudo_allow.push("sudo echo *".into());
         policy.allow.push("exec.run:echo *".into());
         policy

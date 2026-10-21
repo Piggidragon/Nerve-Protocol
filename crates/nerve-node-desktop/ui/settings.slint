@@ -137,6 +137,7 @@ export component SettingsPage inherits PageFrame {
     // and how much the node logs.
     Reveal {
         shown: Prefs.tab == 0;
+        fade: true;
         gap: Space.xl;
         VerticalLayout {
             spacing: Space.xl;
@@ -313,6 +314,7 @@ export component SettingsPage inherits PageFrame {
     // Keys: where the node keeps them.
     Reveal {
         shown: Prefs.tab == 1;
+        fade: true;
         gap: Space.xl;
         Group {
             icon: @image-url("icons/key.svg");
@@ -349,6 +351,7 @@ export component SettingsPage inherits PageFrame {
     // Network: the proxy. (The relay has a page of its own.)
     Reveal {
         shown: Prefs.tab == 2;
+        fade: true;
         gap: Space.xl;
         VerticalLayout {
             spacing: Space.xl;
@@ -451,6 +454,7 @@ export component SettingsPage inherits PageFrame {
     // own.
     Reveal {
         shown: Prefs.tab == 3;
+        fade: true;
         gap: Space.xl;
         VerticalLayout {
             spacing: Space.xl;
@@ -504,6 +508,7 @@ export component SettingsPage inherits PageFrame {
     // Backup: the config and the keys in a file, and back.
     Reveal {
         shown: Prefs.tab == 4;
+        fade: true;
         gap: Space.xl;
         Group {
             icon: @image-url("icons/archive.svg");
@@ -534,6 +539,7 @@ export component SettingsPage inherits PageFrame {
     // at the foot of the sidebar.)
     Reveal {
         shown: Prefs.tab == 5;
+        fade: true;
         gap: Space.xl;
         VerticalLayout {
             spacing: Space.xl;
@@ -586,6 +592,7 @@ export component SettingsPage inherits PageFrame {
     // Advanced: any setting by its name.
     Reveal {
         shown: Prefs.tab == 6;
+        fade: true;
         gap: Space.xl;
         VerticalLayout {
             Group {

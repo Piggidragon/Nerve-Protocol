@@ -1,7 +1,7 @@
 // The window: the sidebar of pages, the page, and the dialogs over it.
 
 import { Palette } from "std-widgets.slint";
-import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
+import { Theme, Type, Space, Radius, Size, Tone, Motion, Curve } from "theme.slint";
 import {
     Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
     HelpArg, RefRow, RefGroup, RelayNodeRow, TunnelRow, Pick, Limit,
@@ -25,7 +25,7 @@ import {
 import { InstallerView } from "installer.slint";
 
 export {
-    Store, Perm, Logs, Manual, Prefs, Install, Type, Tone, Page, Load, NodeStatus, CenterRow, AuditRow,
+    Store, Perm, Logs, Manual, Prefs, Install, Type, Motion, Tone, Page, Load, NodeStatus, CenterRow, AuditRow,
     PairPreview, FolderRow, CapRow, LogRow, HelpArg, RefRow, RefGroup, RelayNodeRow, TunnelRow,
     Pick, Limit,
 }
@@ -329,6 +329,7 @@ export component AppWindow inherits Window {
                 // asks for; until it has them, this says why and how.
                 Reveal {
                     shown: Store.elevate-needed;
+                    smooth: true;
                     Rectangle {
                         background: Theme.window;
                         VerticalLayout {
@@ -358,6 +359,19 @@ export component AppWindow inherits Window {
             }
         }
 
+        // The page waits behind a dialog, under one veil for all of them, so
+        // a dialog that opens from another keeps it. It fades in with the
+        // dialog and lifts when the last one closed; it takes no clicks, so
+        // they reach the page at once.
+        Rectangle {
+            background: Theme.scrim;
+            opacity: root.dialog-open ? 1 : 0;
+            animate opacity {
+                duration: root.dialog-open ? Motion.enter : Motion.leave;
+                easing: Curve.ease;
+            }
+            visible: self.opacity > 0;
+        }
         if Store.pair-open: PairDialog { }
         if Store.confirm-open: ConfirmDialog { }
         if Store.about-open: AboutDialog { }
@@ -379,13 +393,21 @@ export component AppWindow inherits Window {
         if Install.other-open: OtherCopyDialog { }
     }
 
-    if Store.toast-shown: Toast {
+    // The note in the corner rises and fades in, and fades out when its
+    // time is up; it takes no clicks, so it may stay while it goes.
+    property <float> toast-in: Store.toast-shown ? 1 : 0;
+    animate toast-in {
+        duration: Store.toast-shown ? Motion.base : Motion.leave;
+        easing: Curve.ease;
+    }
+    if Store.toast-shown || root.toast-in > 0: Toast {
         text: Store.toast;
         tone: Store.toast-tone;
         width: min(440px, root.width - 48px - Size.sidebar);
         height: self.preferred-height;
         x: root.width - self.width - 24px;
-        y: root.height - self.height - 24px;
+        y: root.height - self.height - 24px + (1 - root.toast-in) * Motion.rise;
+        opacity: root.toast-in;
     }
     Timer {
         interval: 5s;

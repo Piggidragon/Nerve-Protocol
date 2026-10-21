@@ -3,9 +3,12 @@
 //! pages (tests/shots.rs). There is no event loop; [`Exec::Inline`]
 //! (crate::app) runs the commands at once instead. The window keeps the
 //! sizes the app asks of a real one, so a test sees whether it fits a screen.
+//! Its clock can be stopped and moved by hand, so a test can draw an
+//! animation at the moment it chooses.
 
 use std::cell::Cell;
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 use slint::platform::software_renderer::{RepaintBufferType, SoftwareRenderer};
 use slint::platform::{
@@ -50,19 +53,38 @@ impl WindowAdapter for Window {
     }
 }
 
+/// The time of the animations and timers: the real one, unless a test
+/// stopped it.
+struct Clock {
+    start: Instant,
+    stopped: Cell<Option<Duration>>,
+}
+
+impl Clock {
+    fn now(&self) -> Duration {
+        self.stopped.get().unwrap_or_else(|| self.start.elapsed())
+    }
+}
+
 struct Headless {
     window: Rc<Window>,
+    clock: Rc<Clock>,
 }
 
 impl Platform for Headless {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
         Ok(self.window.clone())
     }
+
+    fn duration_since_start(&self) -> Duration {
+        self.clock.now()
+    }
 }
 
 /// The screen of this thread's windows.
 pub struct Screen {
     window: Rc<Window>,
+    clock: Rc<Clock>,
 }
 
 impl Screen {
@@ -75,8 +97,13 @@ impl Screen {
             size: Cell::new(PhysicalSize::default()),
             constraints: Cell::new(LayoutConstraints::default()),
         });
+        let clock = Rc::new(Clock {
+            start: Instant::now(),
+            stopped: Cell::new(None),
+        });
         slint::platform::set_platform(Box::new(Headless {
             window: window.clone(),
+            clock: clock.clone(),
         }))
         .map_err(|e| format!("the headless platform: {e}"))?;
         window
@@ -85,7 +112,17 @@ impl Screen {
                 scale_factor: scale,
             });
         window.window.set_size(PhysicalSize::new(width, height));
-        Ok(Screen { window })
+        Ok(Screen { window, clock })
+    }
+
+    /// Stops the clock of the animations and timers where it is.
+    pub fn stop_clock(&self) {
+        self.clock.stopped.set(Some(self.clock.now()));
+    }
+
+    /// Moves the stopped clock on by `by`.
+    pub fn advance(&self, by: Duration) {
+        self.clock.stopped.set(Some(self.clock.now() + by));
     }
 
     /// Makes the window `width` by `height` pixels: a long page in one

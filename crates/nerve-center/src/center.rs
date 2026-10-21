@@ -78,6 +78,12 @@ pub struct Inner {
     /// The end of a rotation failed and said so; it says so again once it
     /// worked.
     rotation_failed: AtomicBool,
+    /// The stored state. Code that holds it takes no other lock of the
+    /// center or of a session, only ones that take nothing more (a link's
+    /// `status`, the log's): everything else is copied out before it is
+    /// locked. A lock taken under it that is also
+    /// held while the state is taken would deadlock two requests, and with
+    /// them every runtime worker (issue #150).
     store: Mutex<Store>,
     dirty: AtomicBool,
     codes: Mutex<Codes>,
@@ -1821,7 +1827,16 @@ impl Center {
     /// The nodes as the web UI and `nodes` show them.
     pub fn nodes_json(&self) -> Value {
         let links: BTreeMap<String, Arc<Link>> = self.links.lock().unwrap().clone();
+        // Which sessions use each node, read before the state is locked (see
+        // `Inner::store`): `sessions_json` holds a session's node set while
+        // it names the nodes.
         let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let mut used: HashMap<String, Vec<String>> = HashMap::new();
+        for x in &sessions {
+            for n in x.nodes.lock().unwrap().iter() {
+                used.entry(n.clone()).or_default().push(x.id.clone());
+            }
+        }
         let nodes: Vec<Value> = self.read(|s| {
             s.nodes
                 .values()
@@ -1836,11 +1851,7 @@ impl Center {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let used_by: Vec<&str> = sessions
-                        .iter()
-                        .filter(|x| x.nodes.lock().unwrap().contains(&n.id))
-                        .map(|x| x.id.as_str())
-                        .collect();
+                    let used_by = used.get(&n.id).cloned().unwrap_or_default();
                     json!({
                         "id": n.id,
                         "name": n.name,
@@ -1945,19 +1956,14 @@ impl Center {
     }
 
     pub fn sessions_json(&self) -> Value {
-        let list: Vec<Value> = self
-            .sessions
-            .lock()
-            .unwrap()
-            .values()
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let list: Vec<Value> = sessions
+            .iter()
             .map(|s| {
-                let nodes: Vec<String> = s
-                    .nodes
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|n| self.node_name(n))
-                    .collect();
+                // Copied out before the names are read: the state is never
+                // locked under a session's lock (see `Inner::store`).
+                let ids: Vec<String> = s.nodes.lock().unwrap().iter().cloned().collect();
+                let nodes: Vec<String> = ids.iter().map(|n| self.node_name(n)).collect();
                 json!({
                     "id": s.id,
                     "transport": s.transport,
@@ -3007,6 +3013,52 @@ mod tests {
             profile: "exec".into(),
             effect: nerve_proto::Effect::Execute,
         }
+    }
+
+    /// The web UI's node and session lists read at the same time (two
+    /// overview polls) do not deadlock: the session list held a session's
+    /// node set while it named the nodes from the state, the node list held
+    /// the state while it read every session's node set, and two requests
+    /// that met that way stopped every runtime worker for good (issue #150).
+    /// Both lists still say who uses what.
+    #[test]
+    fn the_node_and_session_lists_read_together_do_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let ids: Vec<String> = (0..16).map(|i| format!("n{i}")).collect();
+        c.update(|s| {
+            for id in &ids {
+                s.nodes.insert(id.clone(), node_record(id, "linux"));
+            }
+        });
+        let sessions: Vec<Arc<Session>> = (0..16).map(|_| c.new_session("test")).collect();
+        for s in &sessions {
+            s.nodes.lock().unwrap().extend(ids.iter().cloned());
+        }
+        let (done, finished) = std::sync::mpsc::channel();
+        for i in 0..4 {
+            let (c, done) = (c.clone(), done.clone());
+            std::thread::spawn(move || {
+                for _ in 0..300 {
+                    if i % 2 == 0 {
+                        c.nodes_json();
+                    } else {
+                        c.sessions_json();
+                    }
+                }
+                let _ = done.send(());
+            });
+        }
+        for _ in 0..4 {
+            finished
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the node and session lists deadlocked");
+        }
+        let nodes = c.nodes_json();
+        assert_eq!(nodes[0]["sessions"].as_array().unwrap().len(), 16);
+        let list = c.sessions_json();
+        assert_eq!(list[0]["nodes"].as_array().unwrap().len(), 16);
+        assert_eq!(list[0]["nodes"][0], "n0");
     }
 
     /// The checker gate refuses a blocklisted command before the node, with a

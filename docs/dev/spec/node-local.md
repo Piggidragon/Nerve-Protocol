@@ -1103,12 +1103,8 @@ a token at each start,
 The CLI reads the file and sends it. The
 file lies in the node's own folders, which a `folder` mode command's rules
 leave out, so such a command, and a process it left behind, are refused for
-every method.
-
-The one answer without the token is `status`: `{"ok": {"running": true}}`,
-nothing of the config. `update` of 0.0.2 asks it that way to wait for the
-node it restarted, and puts the old program back if it does not answer `ok`;
-since 0.0.3 `install`, `update` and `setup` send the token.
+every method. `install`, `update` and `setup` send the token too when they
+ask `status` to wait for the node they restarted.
 
 The token holds as far as the sandbox does, and the sandbox holds the
 command's own processes only. Any program of the commands' account that runs

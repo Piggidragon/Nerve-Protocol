@@ -1161,6 +1161,41 @@ pub fn sudo_line(sudo_path: &str, args: &str, prompt: &str) -> String {
     )
 }
 
+/// The line root's shell gets for an allowed `sudo <args>` that the node
+/// starts as root itself ([`AsRoot`]): `args` without a leading `-n` and
+/// `--`, which change nothing for a start without sudo (it asks for no
+/// password, and the command is what follows). Any other option of sudo
+/// (`-E`, `-u <user>`, …) asks for something this start does not do, and
+/// the shell would read it as an option of its own, so the call is refused
+/// with the reason; so is a line that names no command.
+pub fn root_line(args: &str) -> Result<&str, RpcError> {
+    let mut rest = args.trim_start();
+    loop {
+        let end = rest
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        let (word, after) = rest.split_at(end);
+        match word {
+            "-n" => rest = after.trim_start(),
+            "--" => {
+                rest = after.trim_start();
+                break;
+            }
+            _ => break,
+        }
+    }
+    if rest.is_empty() {
+        return Err(RpcError::invalid_args("the sudo command names no command"));
+    }
+    if rest.starts_with('-') {
+        let word = rest.split_ascii_whitespace().next().unwrap_or(rest);
+        return Err(RpcError::invalid_args(format!(
+            "a sudo command of a pairing whose commands run as nerve-run starts as root without the sudo program, so it takes no sudo option but -n and -- (this one starts with {word}); allow and send the command without it"
+        )));
+    }
+    Ok(rest)
+}
+
 /// An allowed sudo command of a pairing whose commands run as `nerve-run`,
 /// which the node starts as root itself (crate::link). Its shell gets only
 /// the line the sudo allow list named, and starts in `folder`: the call's
@@ -3244,6 +3279,40 @@ mod text_tests {
         Timeouts {
             default: secs(default),
             max: secs(max),
+        }
+    }
+
+    /// Root's shell gets an allowed sudo line without a leading `-n` and
+    /// `--`; any other option of sudo, and a line that names no command,
+    /// are refused with the reason (#142).
+    #[test]
+    fn a_root_line_takes_only_n_and_the_end_of_options() {
+        for (args, line) in [
+            ("apt update", "apt update"),
+            ("-n apt update", "apt update"),
+            ("-- apt update", "apt update"),
+            ("-n -- apt update", "apt update"),
+            ("-n  -n\tapt -y install x", "apt -y install x"),
+        ] {
+            assert_eq!(root_line(args).unwrap(), line, "{args:?}");
+        }
+        for args in [
+            "-E apt update",
+            "-u bob id",
+            "-n -E id",
+            "-nE id",
+            "-- -x",
+            "-i",
+        ] {
+            let e = root_line(args).unwrap_err();
+            assert!(
+                e.message.contains("no sudo option but -n and --"),
+                "{args:?}: {e:?}"
+            );
+        }
+        for args in ["", "-n", "--", "-n --  "] {
+            let e = root_line(args).unwrap_err();
+            assert!(e.message.contains("names no command"), "{args:?}: {e:?}");
         }
     }
 

@@ -387,6 +387,20 @@ except OSError as e:
     pw("second-pass-142");
     let r = run(&mut conn, &proj, "sudo id -un").await.unwrap();
     assert_eq!(out(&r), "root\n", "{r}");
+    // A leading `-n` goes; another option of sudo is refused with the
+    // reason, also where the sudo list names the line.
+    for line in ["-n id -un", "-E id -un"] {
+        let (ok, said) = as_owner(&owner, &["rule", "add", "sudo", "--", line]);
+        assert!(ok, "{said}");
+    }
+    let r = run(&mut conn, &proj, "sudo -n id -un").await.unwrap();
+    assert_eq!(out(&r), "root\n", "{r}");
+    let r = run(&mut conn, &proj, "sudo -E id -un").await;
+    assert!(
+        r.as_ref()
+            .is_err_and(|e| e.contains("no sudo option but -n and --")),
+        "{r:?}"
+    );
     // It starts in its folder, here one closed to all but the owner, whose
     // odd name stays a name.
     let odd = proj.join("od d;$(touch ran)\n-x");

@@ -1048,7 +1048,9 @@ commands run as the owner runs through sudo as the owner, with that
 password; one of a pairing whose commands run as `nerve-run` runs as root,
 started by the node itself (`/bin/sh -c '<the command>'`, the allowed line
 and nothing around it, root's group only, no Landlock), without the password
-or the sudo program. Its environment is fixed: `PATH`
+or the sudo program. The line takes no option of sudo: a leading `-n` and
+`--` are dropped, and one that starts with any other option (`-E`, `-u`, …)
+is refused with `invalid_args` and the reason. Its environment is fixed: `PATH`
 `/usr/sbin:/usr/bin:/sbin:/bin`, and `HOME`, `USER` and `LOGNAME` of root;
 nothing of the node's. Its paths are looked at as the owner's, and its
 default folder is the owner's home. The node opens the working folder as

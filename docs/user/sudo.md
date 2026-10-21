@@ -82,7 +82,11 @@ On Linux (Windows differs, see [sudo on Windows](#sudo-on-windows)):
   nothing else, with a fixed environment (the system's `PATH`, root's
   `HOME`); it reads the line as root, so `~` is root's home there. The node
   enters the working folder for it as you, so a folder in your closed home
-  works. The sudo program and its sudoers rules play no part in it.
+  works. The sudo program and its sudoers rules play no part in it. So the
+  line takes no option of sudo: a leading `-n` and `--` are dropped, as
+  they change nothing here, and a command that starts with any other one,
+  such as `sudo -E …` or `sudo -u bob …`, is refused with the reason. Allow
+  and send it without the option.
 - Every other command runs with `no_new_privs`. A `sudo` later in a command
   line, or any setuid program, cannot gain privileges.
 

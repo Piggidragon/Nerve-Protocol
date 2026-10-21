@@ -158,6 +158,37 @@ async fn a_root_command_gets_a_fixed_environment() {
     );
 }
 
+/// An allowed line with a leading `-n` or `--` runs as the line without
+/// them: the shell never sees sudo's options as its own. Another option of
+/// sudo is refused before anything starts (exec::root_line).
+#[tokio::test]
+async fn a_root_command_runs_without_a_leading_n_and_is_refused_other_sudo_options() {
+    let d = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(d.path()).unwrap();
+    let root = me(&base);
+    for args in ["pwd -P", "-n pwd -P", "-- pwd -P", "-n -- pwd -P"] {
+        let line = exec::root_line(args).unwrap();
+        let start = AsRoot::open(&base, None).unwrap();
+        let r = exec::run(&call(line, &base), &opts(&root, start), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(r["exit_code"], 0, "{args:?}: {r}");
+        assert_eq!(
+            r["stdout"],
+            format!("{}\n", base.display()),
+            "{args:?}: {r}"
+        );
+        assert_eq!(r["stderr"], "", "{args:?}: {r}");
+    }
+    for args in ["-E true", "-u nobody true", "-n -i"] {
+        let e = exec::root_line(args).unwrap_err();
+        assert!(
+            e.message.contains("no sudo option but -n and --"),
+            "{args:?}: {e:?}"
+        );
+    }
+}
+
 #[test]
 fn a_root_command_does_not_start_behind_a_link() {
     let d = tempfile::tempdir().unwrap();

@@ -1907,12 +1907,14 @@ impl Link {
             // The one simple command the sudo allow list named (the gate
             // takes no other), as root, and nothing around it; it starts in
             // the folder the gate judged, which the node opens as the
-            // owner (exec::AsRoot).
+            // owner (exec::AsRoot). A leading `-n` or `--` goes, any other
+            // option of sudo is refused (exec::root_line).
             if !self.shared.sudo_on() {
                 return Err(RpcError::forbidden("sudo is off on this node"));
             }
+            let line = exec::root_line(args)?.to_string();
             root = Some(exec::AsRoot::open(&rc.cwd, looks_as.as_ref())?);
-            rc.command = args.to_string();
+            rc.command = line;
         } else if let Some(args) = nerve_policy::sudo_command(&rc.command) {
             let password = self
                 .shared

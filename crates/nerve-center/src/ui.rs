@@ -1069,6 +1069,141 @@ mod tests {
         assert_eq!(got["retention_days"], 5);
     }
 
+    /// The `/* … */` comments of a stylesheet, gone.
+    fn without_comments(css: &str) -> String {
+        let mut out = String::new();
+        let mut rest = css;
+        while let Some(at) = rest.find("/*") {
+            out.push_str(&rest[..at]);
+            rest = rest[at..]
+                .find("*/")
+                .map_or("", |end| &rest[at + end + 2..]);
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The declarations of the first rule whose selector line is `head`.
+    fn css_block<'a>(css: &'a str, head: &str) -> &'a str {
+        let at = css
+            .find(&format!("{head} {{"))
+            .unwrap_or_else(|| panic!("no `{head}` rule"));
+        let body = &css[at..];
+        &body[..body.find('}').unwrap()]
+    }
+
+    /// `name: value` of each `out property` of a global of theme.slint.
+    fn slint_global(theme: &str, global: &str) -> Vec<(String, String)> {
+        let at = theme
+            .find(&format!("export global {global} {{"))
+            .unwrap_or_else(|| panic!("no global {global}"));
+        let body = &theme[at..];
+        let body = &body[..body.find("\n}").unwrap()];
+        body.lines()
+            .filter_map(|l| l.trim().strip_prefix("out property <"))
+            .filter_map(|l| {
+                let (_, rest) = l.split_once("> ")?;
+                let (name, value) = rest.split_once(": ")?;
+                Some((name.to_string(), value.trim_end_matches(';').to_string()))
+            })
+            .collect()
+    }
+
+    /// The web UI takes the desktop app's design tokens from its
+    /// theme.slint: every colour in light and dark, the type scale, the
+    /// spaces, the radii, the sizes and the motion, under the same names.
+    #[test]
+    fn the_web_ui_has_the_desktop_apps_tokens() {
+        let theme = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nerve-node-desktop/ui/theme.slint"
+        ))
+        .unwrap();
+        let css = without_comments(APP_CSS);
+        let light = css_block(&css, ":root");
+        let dark = css_block(&css, ":root[data-theme=\"dark\"]");
+        // Without the theme script the system's scheme picks the dark set.
+        let system = css_block(&css, "  :root:not([data-theme])");
+        let colours = slint_global(&theme, "Theme");
+        let mut seen = 0;
+        for (name, value) in &colours {
+            // `dark ? #0f1116 : #f4f5f9`; `dark` itself is a bool.
+            let Some((d, l)) = value
+                .strip_prefix("dark ? ")
+                .and_then(|v| v.split_once(" : "))
+            else {
+                continue;
+            };
+            seen += 1;
+            assert!(light.contains(&format!("--{name}: {l};")), "light --{name}");
+            assert!(dark.contains(&format!("--{name}: {d};")), "dark --{name}");
+            assert!(
+                system.contains(&format!("--{name}: {d};")),
+                "system --{name}"
+            );
+        }
+        assert!(seen > 25, "{colours:?}");
+        // Lengths and times, each under its prefix; Motion's are those it
+        // has when motion is on.
+        let lengths = [
+            ("Type", "fs-"),
+            ("Space", "sp-"),
+            ("Radius", "r-"),
+            ("Size", ""),
+        ];
+        for (global, prefix) in lengths.into_iter().chain([("Motion", "")]) {
+            for (name, value) in slint_global(&theme, global) {
+                let value = value
+                    .strip_prefix("on ? ")
+                    .map_or(value.as_str(), |v| v.split(" : ").next().unwrap());
+                if !(value.ends_with("px") || value.ends_with("ms")) || name.starts_with("icon") {
+                    continue;
+                }
+                let name = if name == "sidebar" {
+                    "sidebar-width"
+                } else {
+                    &name
+                };
+                assert!(
+                    light.contains(&format!("--{prefix}{name}: {value};")),
+                    "--{prefix}{name}: {value}"
+                );
+            }
+        }
+        assert!(light.contains("--ease: cubic-bezier(0.25, 1, 0.5, 1);"));
+        // Less motion when the system asks for it: no time, no rise.
+        let reduce = &css[css.find("@media (prefers-reduced-motion: reduce)").unwrap()..];
+        let reduce = css_block(reduce, ":root");
+        for token in ["--quick", "--base", "--enter", "--leave"] {
+            assert!(reduce.contains(&format!("{token}: 0ms;")), "{token}");
+        }
+        assert!(reduce.contains("--rise: 0px;"));
+    }
+
+    /// Help is built as the desktop app's: the keys and the command
+    /// reference, each a part that opens and closes, the reference by topic
+    /// or from A to Z and filtered.
+    #[test]
+    fn help_is_built_as_the_desktop_apps() {
+        let help = &APP_JS[APP_JS.find("function buildHelp").unwrap()..];
+        let help = &help[..help.find("\n}\n").unwrap()];
+        for part in [
+            "expander(\"Keyboard shortcuts\"",
+            "expander(\"Command reference\"",
+            "[\"By topic\", \"A to Z\"]",
+            "\"Filter the commands\"",
+            "\"No command matches.\"",
+            "el(\"details\", { class: \"cmd\"",
+            "el(\"details\", { class: \"ref-group\" }",
+        ] {
+            assert!(help.contains(part), "Help has no {part}");
+        }
+        // A part a page leaves out (null) is not drawn as the word.
+        let draw = &APP_JS[APP_JS.find("function draw(").unwrap()..];
+        let draw = &draw[..draw.find("\n}\n").unwrap()];
+        assert_eq!(draw.matches(".filter((p) => p != null)").count(), 2);
+    }
+
     #[test]
     fn loopback_hosts() {
         assert!(host_is_loopback(Some("127.0.0.1:7480")));

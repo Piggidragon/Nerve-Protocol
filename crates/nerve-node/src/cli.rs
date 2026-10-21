@@ -59,7 +59,7 @@ pub enum Cmd {
     /// Choose the folders a center may use and what it may do in each.
     #[command(subcommand)]
     Folder(FolderCmd),
-    /// Choose how much a center may do: only what allow rules name, what each folder allows, or all you can do.
+    /// Choose how much a center may do: only what allow rules name, what each folder allows (as nerve-run, an account of its own), or all you can do (as you).
     #[command(subcommand)]
     Mode(ModeCmd),
     /// Keep the lists of commands that are allowed, forbidden or run with sudo.
@@ -214,14 +214,19 @@ pub enum CenterCmd {
 pub enum ModeCmd {
     /// Pick allowlist, folder or user mode.
     Set {
-        /// `allowlist` (only what an allow rule names), `folder` (what each
-        /// folder's rights allow) or `user` (anything you could do yourself,
-        /// protected files aside).
+        /// `allowlist` (only what an allow rule names, as nerve-run), `folder`
+        /// (what each folder's rights allow, as nerve-run, the default) or
+        /// `user` (anything you could do yourself, as you, protected files
+        /// aside).
         mode: String,
         /// Go back to allowlist after this many hours (folder and user mode
         /// otherwise stay until you change them).
         #[arg(long = "for", value_name = "HOURS")]
         for_hours: Option<u64>,
+        /// With allowlist: run the allowed commands as you instead of as
+        /// nerve-run, outside the folders' sandbox (installed node, Linux).
+        #[arg(long)]
+        as_owner: bool,
         #[command(flatten)]
         center: CenterArg,
     },
@@ -1883,11 +1888,28 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                         "LOCKED (panic): nothing runs until `nerve-node unlock`".into(),
                     );
                 }
+                if let Some(o) = v["owner"].as_str() {
+                    w(out, format!("owner: {o}"));
+                }
+                for e in v["folder_grants"]["errors"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    w(
+                        out,
+                        format!("folder grant: {}", e.as_str().unwrap_or_default()),
+                    );
+                }
                 for c in v["centers"].as_array().into_iter().flatten() {
+                    // The installed node says as whom its commands run.
+                    let whom = c["account"]
+                        .as_str()
+                        .map_or_else(String::new, |a| format!(", as {a}"));
                     w(
                         out,
                         format!(
-                            "{}  {}  mode {}",
+                            "{}  {}  mode {}{whom}",
                             c["name"].as_str().unwrap_or_default(),
                             c["status"].as_str().unwrap_or_default(),
                             c["mode"].as_str().unwrap_or_default(),
@@ -1947,8 +1969,9 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Mode(ModeCmd::Set {
             mode,
             for_hours,
+            as_owner,
             center,
-        }) => set_mode(&paths, &mode, for_hours, &center, out).await,
+        }) => set_mode(&paths, &mode, for_hours, as_owner, &center, out).await,
         Cmd::Folder(FolderCmd::Add {
             path,
             rights,
@@ -2490,7 +2513,7 @@ async fn setup_steps(
         input,
         out,
         &format!(
-            "Mode for {center}: allowlist (only what allow rules name), folder (the folders you give it) or user (all you may do) [{now}]: "
+            "Mode for {center}: folder (the folders you give it, as nerve-run), allowlist (only what allow rules name) or user (all you may do, as you) [{now}]: "
         ),
     )?;
     let mode = if mode.is_empty() { now.clone() } else { mode };
@@ -2498,7 +2521,7 @@ async fn setup_steps(
         center: Some(center.clone()),
     };
     if mode != now {
-        set_mode(paths, &mode, None, &which, out).await?;
+        set_mode(paths, &mode, None, false, &which, out).await?;
         steps.push(format!("{center}: mode {mode}"));
     }
     if mode == "folder" {
@@ -2559,6 +2582,7 @@ async fn set_mode(
     paths: &NodePaths,
     mode: &str,
     for_hours: Option<u64>,
+    as_owner: bool,
     center: &CenterArg,
     out: &mut dyn Write,
 ) -> Result<(), String> {
@@ -2576,6 +2600,11 @@ async fn set_mode(
     if for_hours.is_some() && m == Mode::Allowlist {
         return Err("--for only goes with folder or user".into());
     }
+    if as_owner && m != Mode::Allowlist {
+        return Err(
+            "--as-owner only goes with allowlist: folder mode always runs as nerve-run, user mode always as you".into(),
+        );
+    }
     // No --for: no limit, and an old one is cleared. The end is a
     // millisecond count that the config file (a TOML integer) holds.
     let until = for_hours
@@ -2592,10 +2621,12 @@ async fn set_mode(
     let name = edit_center(paths, center, |e| {
         e.policy.mode = m;
         e.policy.until = until;
+        e.policy.as_owner = as_owner;
         Ok(())
     })
     .await?;
-    w(out, format!("{name}: mode {}", m.as_str()));
+    let whom = if as_owner { ", as you" } else { "" };
+    w(out, format!("{name}: mode {}{whom}", m.as_str()));
     Ok(())
 }
 
@@ -4586,7 +4617,7 @@ mod tests {
         assert!(e.contains("--center"), "{e}");
         run(&paths, &["mode", "set", "user", "--center", "b"]).unwrap();
         assert_eq!(load(&paths).center("b").unwrap().policy.mode, Mode::User);
-        // A new center is in default deny.
+        // A center whose file names no mode is in default deny.
         assert_eq!(
             load(&paths).center("a").unwrap().policy.mode,
             Mode::Allowlist
@@ -4602,6 +4633,24 @@ mod tests {
         assert!(e.contains("unknown mode"), "{e}");
         let e = run(&paths, &["cap", "set", "fs", "ask", "--center", "a"]).unwrap_err();
         assert!(e.contains("unknown setting"), "{e}");
+    }
+
+    /// Allowlist mode runs as the owner only when asked for, and setting a
+    /// mode again without the flag takes it back; the other modes refuse it.
+    #[test]
+    fn allowlist_mode_runs_as_the_owner_when_asked_for() {
+        let (_d, paths) = setup(&["home"]);
+        let policy = || load(&paths).centers[0].policy.clone();
+        let out = run(&paths, &["mode", "set", "allowlist", "--as-owner"]).unwrap();
+        assert!(out.contains("mode allowlist, as you"), "{out}");
+        assert!(policy().as_owner && policy().runs_as_owner(crate::now_ms()));
+        run(&paths, &["mode", "set", "allowlist"]).unwrap();
+        assert!(!policy().as_owner);
+        for mode in ["folder", "user"] {
+            let e = run(&paths, &["mode", "set", mode, "--as-owner"]).unwrap_err();
+            assert!(e.contains("--as-owner only goes with allowlist"), "{e}");
+        }
+        assert!(!policy().as_owner);
     }
 
     #[test]

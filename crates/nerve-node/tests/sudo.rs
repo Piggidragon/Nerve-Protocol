@@ -65,7 +65,18 @@ async fn node_with(
     center: &FakeCenter,
     more: impl Fn(&mut nerve_policy::NodeConfig) -> Result<(), String>,
 ) -> Daemon {
+    node_of(root, center, None, more).await
+}
+
+/// [`node_with`] for the owner `owner`.
+async fn node_of(
+    root: &Path,
+    center: &FakeCenter,
+    owner: Option<&str>,
+    more: impl Fn(&mut nerve_policy::NodeConfig) -> Result<(), String>,
+) -> Daemon {
     let mut o = NodeOptions::new(NodePaths::new(root.join("config"), root.join("state")));
+    o.owner = owner.map(String::from);
     o.home = root.join("home");
     std::fs::create_dir_all(&o.home).unwrap();
     o.exe = Some(
@@ -323,6 +334,28 @@ async fn the_sudo_switch() {
     assert!(written.contains("oops [redacted] on stderr"), "{written}");
     assert_eq!(written.matches(RIGHT).count(), 1, "{written}");
 
+    node.stop().await;
+}
+
+/// With root as the owner `sudo -v` checks no password, so no center turns
+/// the switch on, with any password (#151).
+#[tokio::test(flavor = "multi_thread")]
+async fn no_center_turns_sudo_on_while_root_is_the_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = node_of(dir.path(), &center, Some("root"), |_| Ok(())).await;
+    let mut conn = linked(&mut center).await;
+    let mut seen = Seen { frames: Vec::new() };
+    let offer = seen.offer(&mut conn, &center).await;
+    let r = seen
+        .on(&mut conn, &seal(&offer, RIGHT, now()).unwrap())
+        .await;
+    assert_eq!(code(&r), ErrorCode::Forbidden);
+    let e = r.unwrap_err().message;
+    assert!(e.contains("root is the owner of this node"), "{e}");
+    assert!(e.contains("nerve-node sudo on"), "{e}");
+    assert_eq!(seen.sudo_state(&mut conn).await, "off");
+    assert_eq!(node.config().machine.sudo, Sudo::Off);
     node.stop().await;
 }
 

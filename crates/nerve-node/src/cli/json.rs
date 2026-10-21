@@ -228,6 +228,7 @@ async fn status(paths: &NodePaths) -> Result<Value, String> {
         "version": cfg.version,
         "locked": cfg.locked,
         "owner": crate::service::owner_of(paths),
+        "owner_is_root": crate::owner::is_root(crate::service::owner_of(paths).as_deref()),
         "sudo": if sudo_is_on(paths).await? { "on" } else { "off" },
         "command_limits": crate::cgroup::status(
             &cfg.limits.command,

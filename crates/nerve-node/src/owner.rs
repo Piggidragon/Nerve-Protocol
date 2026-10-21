@@ -200,7 +200,7 @@ fn with_rights(command: &str) -> String {
 pub fn refused(cmd: &Cmd) -> Option<String> {
     let (what, why) = match cmd {
         Cmd::Run => ("run", "it starts a node of its own"),
-        Cmd::Install => ("install", "it installs the program and the service"),
+        Cmd::Install { .. } => ("install", "it installs the program and the service"),
         Cmd::Update { .. } => ("update", "it replaces the program"),
         Cmd::Uninstall { .. } => ("uninstall", "it removes the program and the service"),
         Cmd::Service(_) => (
@@ -268,6 +268,16 @@ pub fn of_service(paths: &NodePaths) -> Option<String> {
         .ok()
         .filter(|n| nerve_policy::config::valid_account_name(n))
 }
+
+/// Whether `owner`, the installed node's owner, is root (Linux), which
+/// `install` makes it only after root confirmed it
+/// (crate::service::RootOwner): what runs as the owner then runs as root.
+pub fn is_root(owner: Option<&str>) -> bool {
+    !cfg!(windows) && owner == Some(crate::service::ROOT)
+}
+
+/// What `status` and the app say of root as the owner.
+pub const ROOT_OWNER_NOTE: &str = "root is the owner: commands of user mode, and of allowlist mode as the owner, run as root and can do everything on this machine, Nerve and its keys included";
 
 /// Whether the account running this is the owner of the installed node: the
 /// one its unit names on Linux, one of the service's owners on Windows.

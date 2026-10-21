@@ -45,9 +45,10 @@ Fedora 36 and later) and fontconfig.
   Delegate=yes`. Windows does not hold commands to these limits yet.
 - On the node [installed as a service](service.md), `folder` and `allowlist`
   mode commands run as `nerve-run`, an account of its own with no other
-  groups and no way to root ([modes](modes.md#the-account-nerve-run-linux)).
-  It reaches your files only where you grant a folder (POSIX ACLs), cannot
-  open the node's files, is refused by the owner socket, and your session's
+  groups and no way to root but the [sudo list](sudo.md)
+  ([modes](modes.md#the-account-nerve-run-linux)). It reaches your files only
+  where you grant a folder (POSIX ACLs), cannot open the node's files (a
+  sudo command runs as root and can), is refused by the owner socket, and your session's
   programs (the service manager, the session bus, tmux) take no requests
   from it, on every kernel. Landlock holds it to its own pairing's folders on
   top, where the kernel has it.

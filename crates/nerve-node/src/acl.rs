@@ -53,7 +53,7 @@
 //! no tool is needed. A file system without ACLs refuses them, and the grant
 //! of that folder fails with that reason.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{CStr, CString, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -347,7 +347,11 @@ pub struct Report {
     /// folder and has a second name, which may lie outside every grant. It
     /// is not given to the owner, as ownership goes with the file and not
     /// the name, so it keeps `nerve-run`'s uid (crate::service says so).
+    /// Counted by file, not by name or walk.
     pub not_given: usize,
+    /// The files (device, inode) in `not_given`, as a file lies under
+    /// more than one name and in more than one grant.
+    twins: HashSet<(u64, u64)>,
 }
 
 impl Report {
@@ -797,7 +801,9 @@ fn walk(
             && o.m.dev() == dev
         {
             if twin {
-                report.not_given += 1;
+                if report.twins.insert((o.m.dev(), o.m.ino())) {
+                    report.not_given += 1;
+                }
             } else if let Err(e) = give(&o, to) {
                 report.errors.push(failed(&path, &e));
                 whole = false;
@@ -1794,6 +1800,26 @@ mod tests {
             assert_eq!(owner(&p), (RUN, RUN), "{p:?}");
         }
         assert_eq!(owner(&work.join("one")), heir);
+
+        // A file is one file whatever its names and however many grants
+        // walk it: grants inside each other, and one file with a name
+        // outside them and one with both names inside.
+        let outer = root.join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let file = root.join("acl2.json");
+        let grants = [grant(&outer, "rw"), grant(&inner, "rw")];
+        assert!(sync(&file, &grants, who(), &none).errors.is_empty());
+        std::fs::write(inner.join("g"), "g").unwrap();
+        std::fs::hard_link(inner.join("g"), open.join("g")).unwrap();
+        std::fs::write(inner.join("h"), "h").unwrap();
+        std::fs::hard_link(inner.join("h"), outer.join("h2")).unwrap();
+        for p in [inner.join("g"), inner.join("h")] {
+            std::os::unix::fs::lchown(&p, Some(RUN), Some(RUN)).unwrap();
+        }
+        let r = remove_all(&file, &|_| heir);
+        assert!(r.errors.is_empty() && r.stale.is_empty(), "{r:?}");
+        assert_eq!(r.not_given, 2, "{r:?}");
     }
 
     /// A grant that failed (a folder below it closed) stays failed in the

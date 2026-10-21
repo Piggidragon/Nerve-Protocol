@@ -2646,6 +2646,16 @@ mod tests {
             if told {
                 assert_eq!(st["home_warning"]["home"], json!(linked), "{st}");
             }
+            // A folder around the real home, given by a name that is not
+            // around the home as named (`linked` resolves to `data`), is
+            // the home too.
+            pairings(vec![folder(&around.join("linked"), "r")]);
+            let st = daemon.status();
+            assert_eq!(
+                st["home_warning"]["below"] == json!([linked]),
+                told,
+                "{what}: {st}"
+            );
             daemon.stop().await;
         }
     }

@@ -113,17 +113,21 @@ A center's commands run as one of two accounts:
 
 There is no other account to choose. A command gets the account's groups,
 its home as `HOME` and, when the call names no folder, as its working
-folder. The node reads and writes files for a center (`fs`) as that account
+folder (a sudo command starts in the owner's home). The node reads and writes files for a center (`fs`) as that account
 as well: it sees what the account sees, and the files it makes belong to the
 account. `~` in [folders](modes.md), [rules](rules.md) and the
 [protected paths](protected-paths.md) is the owner's home.
 
-No command can read the node's keys: they are private to `nerve`. Before a
-command starts, the node checks that its account cannot open the node's
-folders, and refuses to run it if it can. `nerve-run` is in no group and
-cannot become root. The owner can, through `sudo` or a group such as
-`docker`: a `user` mode command runs as the owner and can do what the owner
-can, which is the owner's choice of mode ([modes](modes.md#user-mode)).
+The node's keys are private to `nerve`, and no command of `nerve-run` or
+the owner can read them. Before a command starts, the node checks that its
+account cannot open the node's folders, and refuses to run it if it can.
+`nerve-run` is in no group and has no sudo of its own: only a command on the
+[sudo list](sudo.md), with sudo on, runs as root, started by the node, and
+as root it can read what root can, the node's keys included. Put on the
+list only what you would run as root yourself. The owner can become root
+too, through `sudo` or a group such as `docker`: a `user` mode command runs
+as the owner and can do what the owner can, which is the owner's choice of
+mode ([modes](modes.md#user-mode)).
 
 ### The one privilege the service keeps
 

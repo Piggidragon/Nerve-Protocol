@@ -3305,6 +3305,8 @@ mod text_tests {
             "-n -E id",
             "-nE id",
             "-- -x",
+            "-- -n id",
+            "-- -- id",
             "-i",
         ] {
             let e = root_line(args).unwrap_err();

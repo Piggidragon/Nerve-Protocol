@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use serde_json::Value;
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use super::{Choose, Ctl, now_ms};
 use crate::{Load, Perm, Tone, view};
@@ -61,11 +61,19 @@ impl Ctl {
             .find(|c| c["name"] == center.as_str())
             .cloned()
             .unwrap_or(Value::Null);
-        // The installed Linux node names its owner and runs folder and
-        // allowlist mode as nerve-run (nerve_node::account).
-        let separate = cfg!(target_os = "linux") && st["owner"].is_string();
+        // The installed Linux node runs folder and allowlist mode as
+        // nerve-run (nerve_node::account): it names its owner, and a
+        // pairing's account, also when `install` found no owner.
+        let run = nerve_node::account::RUN_USER;
         let account = c["account"].as_str().unwrap_or_default().to_string();
-        let built_in = if separate && account == nerve_node::account::RUN_USER {
+        let separate = cfg!(target_os = "linux")
+            && (st["owner"].is_string()
+                || st["centers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|c| c["account"] == run));
+        let built_in = if cfg!(target_os = "linux") && account == run {
             format!(
                 "/tmp, /var/tmp and its home {}",
                 nerve_node::account::RUN_HOME
@@ -73,12 +81,22 @@ impl Ctl {
         } else {
             String::new()
         };
+        // The failed grants of this center's folders: the node's list is
+        // for all of them.
         let errors: Vec<&str> = st["folder_grants"]["errors"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
             .collect();
+        let folders: Vec<String> = self
+            .with_perm(|p| p.get_folders().iter().map(|f| f.path.to_string()).collect())
+            .unwrap_or_default();
+        let errors = if account == run {
+            view::grant_errors_for(&errors, &folders, &nerve_node::paths::home_dir())
+        } else {
+            Vec::new()
+        };
         self.with_perm(|p| {
             p.set_mode(c["mode"].as_str().unwrap_or_default().into());
             p.set_mode_until(view::mode_until(&c, now_ms()).into());
@@ -164,6 +182,8 @@ impl Ctl {
                     p.set_load(Load::Ready);
                     p.set_error(SharedString::new());
                 });
+                // Its failed grants follow its folders.
+                self.perm_mode();
             }
             Err(e) => {
                 self.with_perm(|p| {
@@ -206,6 +226,11 @@ impl Ctl {
 
     fn mode_pick(self: &Rc<Self>, mode: &str) {
         if mode == "allowlist" {
+            // The tile of the mode it is in: nothing to change, and setting
+            // it again would turn "Run them as you" off.
+            if self.with_perm(|p| p.get_mode() == "allowlist") == Some(true) {
+                return;
+            }
             let center = self.perm_center();
             self.perm_change(
                 vec!["mode".into(), "set".into(), "allowlist".into()],

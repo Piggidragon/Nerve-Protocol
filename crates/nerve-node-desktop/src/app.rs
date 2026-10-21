@@ -769,7 +769,9 @@ impl Ctl {
         });
     }
 
-    fn show_status(self: &Rc<Self>, answer: Result<Value, String>) {
+    /// Shows the node's answer to `status`: the pages that follow it too
+    /// (Permissions' mode and account).
+    pub fn show_status(self: &Rc<Self>, answer: Result<Value, String>) {
         match answer {
             Ok(v) => {
                 let (status, centers) = view::status(&v, now_ms());

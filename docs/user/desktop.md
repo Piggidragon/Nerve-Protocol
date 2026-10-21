@@ -131,7 +131,9 @@ start it first.
   the owner socket refuses it, your session's programs (the service manager,
   the session bus, tmux) take no requests from it, and it reaches your files
   only where you gave it a folder. In `allowlist` mode **Run them as you**
-  under the mode runs the allowed commands as you instead.
+  under the mode runs the allowed commands as you instead; a click on the
+  mode's own tile leaves that as it is. Under **Folders** a center shows the
+  folders of its own that `nerve-run` did not get, and why.
 - **`user` mode:** as you, with your rights and without a sandbox. It can
   change the node's settings as you can, also through a program of yours
   outside the node (your systemd user manager, a tmux server). That is your

@@ -474,6 +474,16 @@ fn the_app_drives_the_cli_end_to_end() {
         config(&paths).centers[0].policy.mode,
         nerve_policy::Mode::Allowlist
     );
+    // "Run them as you" goes through the CLI and comes back with the
+    // status; a click on the tile of the mode it is in keeps it.
+    perm.invoke_as_owner_set(true);
+    assert!(config(&paths).centers[0].policy.as_owner);
+    until(&ctl, "the chip on", || perm.get_as_owner());
+    perm.invoke_mode_pick("allowlist".into());
+    assert!(config(&paths).centers[0].policy.as_owner);
+    perm.invoke_as_owner_set(false);
+    assert!(!config(&paths).centers[0].policy.as_owner);
+    until(&ctl, "the chip off", || !perm.get_as_owner());
 
     perm.invoke_folder_choose();
     assert!(perm.get_folder_open());
@@ -493,6 +503,45 @@ fn the_app_drives_the_cli_end_to_end() {
         f.access.read && f.access.write && !f.access.execute,
         "{f:?}"
     );
+    // What the installed Linux node's status says of a pairing: who runs
+    // its commands, nerve-run's built-in folders, and the failed grants of
+    // its own folders only. Also without an owner (`install` as root alone).
+    for owner in [serde_json::json!("alice"), Value::Null] {
+        let mut st: Value = serde_json::from_str(
+            &std::process::Command::new(env!("CARGO_BIN_EXE_nerve-node-desktop"))
+                .arg("--config-dir")
+                .arg(&paths.config_dir)
+                .arg("--state-dir")
+                .arg(&paths.state_dir)
+                .args(["--json", "status"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap(),
+        )
+        .unwrap();
+        st["owner"] = owner.clone();
+        st["centers"][0]["account"] = serde_json::json!("nerve-run");
+        st["folder_grants"] = serde_json::json!({"errors": [
+            format!("{}: Permission denied (os error 13)", root.join("work/closed").display()),
+            "/elsewhere/proj: Permission denied (os error 13)",
+        ]});
+        ctl.show_status(Ok(st));
+        if cfg!(target_os = "linux") {
+            assert!(perm.get_separate(), "{owner}");
+            assert_eq!(perm.get_account(), "nerve-run");
+            assert!(
+                perm.get_built_in().contains("/var/lib/nerve-run"),
+                "{owner}"
+            );
+            let errors = perm.get_grant_errors();
+            assert!(errors.contains("work/closed"), "{errors}");
+            assert!(!errors.contains("/elsewhere"), "{errors}");
+        } else {
+            assert!(!perm.get_separate());
+            assert_eq!(perm.get_built_in(), "");
+        }
+    }
+    ctl.refresh_status();
     perm.invoke_folder_remove(path);
     assert!(config(&paths).centers[0].policy.folders.is_empty());
 

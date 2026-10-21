@@ -451,7 +451,8 @@ fn the_app_drives_the_cli_end_to_end() {
     store.invoke_show(Page::Policy);
     assert_eq!(perm.get_center(), "home");
     assert_eq!(perm.get_load(), Load::Ready, "{}", perm.get_error());
-    assert_eq!(perm.get_mode(), "allowlist");
+    // A new pairing starts in folder mode.
+    assert_eq!(perm.get_mode(), "folder");
     assert!(perm.get_caps().iter().any(|c| c.name == "exec.run"));
     perm.invoke_mode_pick("user".into());
     assert!(perm.get_mode_open());
@@ -473,6 +474,16 @@ fn the_app_drives_the_cli_end_to_end() {
         config(&paths).centers[0].policy.mode,
         nerve_policy::Mode::Allowlist
     );
+    // "Run them as you" goes through the CLI and comes back with the
+    // status; a click on the tile of the mode it is in keeps it.
+    perm.invoke_as_owner_set(true);
+    assert!(config(&paths).centers[0].policy.as_owner);
+    until(&ctl, "the chip on", || perm.get_as_owner());
+    perm.invoke_mode_pick("allowlist".into());
+    assert!(config(&paths).centers[0].policy.as_owner);
+    perm.invoke_as_owner_set(false);
+    assert!(!config(&paths).centers[0].policy.as_owner);
+    until(&ctl, "the chip off", || !perm.get_as_owner());
 
     perm.invoke_folder_choose();
     assert!(perm.get_folder_open());
@@ -492,6 +503,65 @@ fn the_app_drives_the_cli_end_to_end() {
         f.access.read && f.access.write && !f.access.execute,
         "{f:?}"
     );
+    // What the installed Linux node's status says of a pairing: who runs
+    // its commands, nerve-run's built-in folders, and the failed grants of
+    // its own folders only. Also without an owner (`install` as root alone).
+    for owner in [serde_json::json!("alice"), Value::Null] {
+        let mut st: Value = serde_json::from_str(
+            &std::process::Command::new(env!("CARGO_BIN_EXE_nerve-node-desktop"))
+                .arg("--config-dir")
+                .arg(&paths.config_dir)
+                .arg("--state-dir")
+                .arg(&paths.state_dir)
+                .args(["--json", "status"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap(),
+        )
+        .unwrap();
+        st["owner"] = owner.clone();
+        st["centers"][0]["account"] = serde_json::json!("nerve-run");
+        st["centers"][0]["landlock"] = serde_json::json!(false);
+        st["home_warning"] = serde_json::json!({"warning": "Without Landlock, nerve-run can read every file in your home /home/alice that other accounts may read (mode 755)"});
+        // A folder no center has any more whose access did not come off,
+        // and the node's record of them that could not be read: shown on
+        // this center although neither is one of its folders.
+        st["folder_grants"] = serde_json::json!({
+            "errors": [
+                format!("{}: Permission denied (os error 13)", root.join("work/closed").display()),
+                "/elsewhere/proj: Permission denied (os error 13)",
+                "/removed/folder/sub: Permission denied (os error 13)",
+                "/var/lib/nerve/state/acl.json: expected value at line 1 column 1",
+            ],
+            "stale": ["/removed/folder", "/var/lib/nerve/state/acl.json"],
+        });
+        ctl.show_status(Ok(st));
+        if cfg!(target_os = "linux") {
+            assert!(perm.get_separate(), "{owner}");
+            assert_eq!(perm.get_account(), "nerve-run");
+            assert!(
+                perm.get_built_in().contains("/var/lib/nerve-run"),
+                "{owner}"
+            );
+            let errors = perm.get_grant_errors();
+            assert!(errors.contains("work/closed"), "{errors}");
+            assert!(!errors.contains("/elsewhere"), "{errors}");
+            assert!(!errors.contains("/removed"), "{errors}");
+            let stale = perm.get_stale();
+            assert!(stale.contains("/removed/folder/sub"), "{stale}");
+            assert!(stale.contains("acl.json: expected value"), "{stale}");
+            assert!(!stale.contains("work/closed"), "{stale}");
+            assert!(!perm.get_landlock());
+            assert!(perm.get_home_warning().contains("mode 755"));
+        } else {
+            assert!(!perm.get_separate());
+            assert_eq!(perm.get_built_in(), "");
+        }
+    }
+    ctl.refresh_status();
+    until(&ctl, "the node's own status", || {
+        perm.get_landlock() && perm.get_home_warning() == "" && perm.get_stale() == ""
+    });
     perm.invoke_folder_remove(path);
     assert!(config(&paths).centers[0].policy.folders.is_empty());
 
@@ -701,23 +771,8 @@ fn the_app_drives_the_cli_end_to_end() {
     prefs.set_raw_value("fs:~/private/*".into());
     prefs.invoke_raw_add();
     assert_eq!(prefs.get_raw_error(), "");
-    // The account commands run as: none here, and choosing one is the
-    // installed node's (setup --create-user), which the CLI says.
+    // The account commands run as: Windows's alone, none here.
     assert_eq!(prefs.get_account(), "");
-    prefs.set_account_new("nerve-work".into());
-    prefs.invoke_account_use();
-    // On Windows the account is install's, which the CLI says instead.
-    let why = if cfg!(windows) {
-        "nerve-node install"
-    } else {
-        "installed as a service"
-    };
-    assert!(
-        prefs.get_account_error().contains(why),
-        "{}",
-        prefs.get_account_error()
-    );
-    assert!(!prefs.get_account_busy());
     let denied = |r: &str| {
         config(&paths).centers[0]
             .policy

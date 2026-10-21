@@ -129,7 +129,7 @@ would otherwise outlive it.
 - A command that runs as root can too: when root is the account commands
   run as, and every command on the [sudo list](sudo.md).
 - Commands of the installed service run as another account ([the account
-  commands run as](service.md#the-account-commands-run-as)) and cannot write
+  commands run as](service.md#the-accounts-commands-run-as)) and cannot write
   their cgroup. But any command, in every mode, can have work started
   outside its cgroup by a service manager of its account: `systemd-run
   --user`, `at`, cron. That work is not held to the limits and outlives the

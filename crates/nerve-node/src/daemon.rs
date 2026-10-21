@@ -48,6 +48,10 @@ pub struct NodeOptions {
     /// How commands can be confined, instead of asking the kernel. A test
     /// sets it, to stand for a kernel it does not run on.
     pub confinement: Option<Confinement>,
+    /// Whether this is the installed service, instead of asking where its
+    /// folders are (crate::service::is_service_node). A test sets it, to
+    /// stand for the installed node.
+    pub service: Option<bool>,
     /// Where commands are held to their limits, or why they are not,
     /// instead of looking for the process's cgroup (crate::cgroup), which
     /// moves the process. A test sets it.
@@ -59,6 +63,9 @@ pub struct NodeOptions {
     /// socket (crate::owner): the installed node's, unless a test gives
     /// one. Served only with `ctl`.
     pub owners: Option<crate::owner::Endpoint>,
+    /// Linux: the owner of the installed node, as its unit names it
+    /// (crate::owner::of_service): user mode runs commands as it, and sudo.
+    pub owner: Option<String>,
     /// Where work goes that runs while the node is stopped, after which it
     /// starts again: an owner's restore ([`Daemon::run_until`] sets it).
     /// Without it the node refuses such work.
@@ -80,6 +87,7 @@ impl NodeOptions {
     pub fn new(paths: NodePaths) -> NodeOptions {
         NodeOptions {
             owners: crate::owner::Endpoint::of_service(&paths),
+            owner: crate::owner::of_service(&paths),
             paths,
             exe: None,
             home: home_dir(),
@@ -87,6 +95,7 @@ impl NodeOptions {
             log: nerve_transport::log::global(),
             full_rights: None,
             confinement: None,
+            service: None,
             cgroups: None,
             resume_grace: resume::GRACE,
             aside: None,
@@ -445,6 +454,13 @@ fn confinement_for(detected: Confinement, service: bool) -> Confinement {
 /// How long a looked-up account is used before it is looked up again.
 const ACCOUNT_FRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How often a folder grant that failed is tried again, at most: by a
+/// command of `nerve-run` or a change of the config, and at once at the
+/// node's start. The owner may have fixed what stopped it (a closed folder
+/// opened) without changing the config.
+#[cfg(target_os = "linux")]
+const ACL_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(crate) struct Shared {
     pub paths: NodePaths,
     /// Whether this is the installed service (crate::service::is_service_node).
@@ -480,9 +496,10 @@ pub(crate) struct Shared {
     /// The account sudo's password was checked for (crate::sudo): the
     /// switch holds only for that account.
     pub sudo_for: Mutex<Option<String>>,
-    /// The last account looked up for `machine.user`, and when: every call
-    /// of a center needs it, and a lookup starts two programs.
-    pub account_cache: Mutex<Option<(String, std::time::Instant, Option<crate::service::Account>)>>,
+    /// The accounts looked up last (the owner, `nerve-run`), and when:
+    /// every call of a center needs one, and a lookup starts two programs.
+    pub account_cache:
+        Mutex<HashMap<String, (std::time::Instant, Option<crate::service::Account>)>>,
     /// Whether the log said that the keyring turned folder mode's commands
     /// off ([`Shared::tell_confinement`]).
     pub told_keyring: std::sync::atomic::AtomicBool,
@@ -495,9 +512,17 @@ pub(crate) struct Shared {
     pub aside: Option<tokio::sync::mpsc::UnboundedSender<Aside>>,
     /// The relay for other nodes (crate::relay), and who is connected.
     pub relay: crate::relay::Relays,
-    /// Linux: the folder of the owner socket and its token, when the node
-    /// serves one (crate::owner).
-    pub owner_dir: Option<PathBuf>,
+    /// Linux: the installed node's owner ([`NodeOptions::owner`]).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub owner: Option<String>,
+    /// Linux: what the last sync of the folders' ACLs for `nerve-run` left
+    /// (crate::acl); held while one runs, so that two never run at once.
+    #[cfg(target_os = "linux")]
+    pub acl: Mutex<crate::acl::Report>,
+    /// Linux: when a sync of the ACLs last ran, for trying a grant that
+    /// failed again ([`ACL_RETRY`]).
+    #[cfg(target_os = "linux")]
+    pub acl_tried: Mutex<Option<std::time::Instant>>,
 }
 
 impl Shared {
@@ -505,26 +530,153 @@ impl Shared {
         lock(&self.store).config().clone()
     }
 
-    /// The account a command and the sudo switch run as (crate::account);
-    /// `None` runs them as the node's own user.
+    /// The account the commands of a pairing with `policy` run as
+    /// (crate::account): `nerve-run` on the installed Linux node, or the
+    /// owner where the pairing runs as the owner now; `None` runs them as
+    /// the node's own user.
     pub fn command_account(
         &self,
         cfg: &NodeConfig,
+        policy: &nerve_policy::config::CenterPolicy,
     ) -> Result<Option<crate::service::Account>, String> {
-        let cached = |name: &str| {
-            if let Some((n, at, a)) = lock(&self.account_cache).as_ref()
-                && n == name
-                && at.elapsed() < ACCOUNT_FRESH
-            {
-                return Ok(a.clone());
-            }
-            let a = crate::account::lookup(name)?;
-            *lock(&self.account_cache) =
-                Some((name.to_string(), std::time::Instant::now(), a.clone()));
-            Ok(a)
+        self.account_as(cfg, policy.runs_as_owner(crate::now_ms()))
+    }
+
+    /// The owner's account, which sudo runs as and whose files the folders
+    /// and rules name; `None` on a node run by hand, whose own user it is.
+    pub fn owner_account(
+        &self,
+        cfg: &NodeConfig,
+    ) -> Result<Option<crate::service::Account>, String> {
+        self.account_as(cfg, true)
+    }
+
+    /// Whether the commands of a pairing with `policy` run as `nerve-run`
+    /// now: on the installed Linux node, in folder mode and in allowlist
+    /// mode unless the pairing runs as the owner. They are confined then,
+    /// in every mode.
+    pub fn separate(&self, policy: &nerve_policy::config::CenterPolicy) -> bool {
+        self.service && cfg!(target_os = "linux") && !policy.runs_as_owner(crate::now_ms())
+    }
+
+    /// The built-in folders of a pairing whose commands run as `nerve-run`
+    /// ([`crate::account::built_in`]) added to `entry`'s, for the gate and
+    /// the sandbox; the config keeps only those the owner gave.
+    pub fn with_built_in(
+        &self,
+        cfg: &NodeConfig,
+        mut entry: nerve_policy::CenterEntry,
+    ) -> nerve_policy::CenterEntry {
+        if self.separate(&entry.policy)
+            && let Ok(Some(a)) = self.command_account(cfg, &entry.policy)
+        {
+            entry
+                .policy
+                .folders
+                .extend(crate::account::built_in(&a.home));
+        }
+        entry
+    }
+
+    /// The accounts the folders' ACLs are for (crate::acl): `nerve-run` and
+    /// the owner, on the installed Linux node that has both; `None`
+    /// elsewhere, where no command runs as `nerve-run`.
+    #[cfg(target_os = "linux")]
+    fn acl_accounts(&self, cfg: &NodeConfig) -> Option<(crate::acl::Who, crate::service::Account)> {
+        if !self.service {
+            return None;
+        }
+        let run = self.account_as(cfg, false).ok().flatten()?;
+        let owner = self.owner_account(cfg).ok().flatten()?;
+        let who = crate::acl::Who {
+            run: run.uid,
+            owner: owner.uid,
         };
+        Some((who, owner))
+    }
+
+    /// Brings the folders' ACLs in line with `cfg` (crate::acl), when the
+    /// record is behind it, a grant failed and was not tried for
+    /// [`ACL_RETRY`], or `always`; blocks while it walks. What it left is
+    /// logged and kept for the commands and `status`.
+    #[cfg(target_os = "linux")]
+    pub fn sync_acls(&self, cfg: &NodeConfig, always: bool) {
+        let Some((who, owner)) = self.acl_accounts(cfg) else {
+            return;
+        };
+        let file = crate::acl::record_file(&self.paths);
+        // The folders are resolved as the owner sees them: the node's user
+        // may not look into the owner's home.
+        let want = match crate::account::FsAs::new(&owner) {
+            Ok(_as) => crate::acl::wanted(cfg, &self.paths, &owner.home, crate::now_ms()),
+            Err(e) => {
+                tracing::warn!("folder grants: cannot act as {}: {e}", owner.name);
+                return;
+            }
+        };
+        let mut last = lock(&self.acl);
+        let mut tried = lock(&self.acl_tried);
+        let retry = tried.is_none_or(|t| t.elapsed() >= ACL_RETRY);
+        if !always && !crate::acl::behind(&file, &want, who, retry) {
+            return;
+        }
+        *tried = Some(std::time::Instant::now());
+        let act_as = || {
+            crate::account::FsAs::new(&owner)
+                .map(Some)
+                .map_err(|e| format!("cannot act as {}: {e}", owner.name))
+        };
+        let report = crate::acl::sync(&file, &want, who, &act_as);
+        for e in &report.errors {
+            tracing::warn!("folder grants: {e}");
+        }
+        *last = report;
+    }
+
+    /// Why a command of `nerve-run` may not run now: the ACLs could not be
+    /// brought in line with `cfg`, and it may still reach a folder no longer
+    /// given ([`crate::acl::Report::refusal`]). Syncs first where they are
+    /// behind. Blocks.
+    #[cfg(target_os = "linux")]
+    pub fn acls_refusal(&self, cfg: &NodeConfig) -> Option<String> {
+        self.sync_acls(cfg, false);
+        lock(&self.acl).refusal()
+    }
+
+    /// The name of the installed node's owner: on Linux the account that
+    /// ran `install`, which the unit names ([`NodeOptions::owner`]); on
+    /// Windows the account commands run as (`machine.user`).
+    pub fn owner_name(&self, cfg: &NodeConfig) -> Option<String> {
+        #[cfg(windows)]
+        return cfg.machine.user.clone();
+        #[cfg(not(windows))]
+        {
+            let _ = cfg;
+            self.owner.clone()
+        }
+    }
+
+    /// The account `name`, looked up at most every [`ACCOUNT_FRESH`].
+    fn account_named(&self, name: &str) -> Result<Option<crate::service::Account>, String> {
+        if let Some((at, a)) = lock(&self.account_cache).get(name)
+            && at.elapsed() < ACCOUNT_FRESH
+        {
+            return Ok(a.clone());
+        }
+        let a = crate::account::lookup(name)?;
+        lock(&self.account_cache).insert(name.to_string(), (std::time::Instant::now(), a.clone()));
+        Ok(a)
+    }
+
+    fn account_as(
+        &self,
+        cfg: &NodeConfig,
+        as_owner: bool,
+    ) -> Result<Option<crate::service::Account>, String> {
+        let cached = |name: &str| self.account_named(name);
         crate::account::for_commands(
-            cfg.machine.user.as_deref(),
+            as_owner,
+            self.owner_name(cfg).as_deref(),
             crate::account::own_uid(),
             self.service,
             crate::account::can_switch(),
@@ -532,10 +684,10 @@ impl Shared {
         )
     }
 
-    /// The `~` of the rules and the protected list: the home of the account
-    /// the commands run as, else the node's own.
+    /// The `~` of the folders, the rules and the protected list: the
+    /// owner's home, whose files they name, else the node's own.
     pub fn rules_home(&self, cfg: &NodeConfig) -> PathBuf {
-        match self.command_account(cfg) {
+        match self.owner_account(cfg) {
             Ok(Some(a)) => a.home,
             _ => self.home.clone(),
         }
@@ -565,7 +717,9 @@ impl Shared {
             return Err(format!("no center named {center}"));
         }
         let given = nerve_policy::paths::normal_folder(path)?;
-        let account = self.command_account(&cfg).unwrap_or(None);
+        // The folder is the owner's: judged as the owner sees it, before
+        // any grant lets `nerve-run` see it at all.
+        let account = self.owner_account(&cfg).unwrap_or(None);
         let home = account
             .as_ref()
             .map_or_else(|| self.home.clone(), |a| a.home.clone());
@@ -591,10 +745,15 @@ impl Shared {
             })
             .map_err(|e| e.to_string())?;
         self.bump();
+        let counts = self.config().center(center).is_some_and(|c| {
+            c.policy.mode_at(crate::now_ms()) == nerve_policy::Mode::Folder
+                || self.separate(&c.policy)
+        });
         Ok(AddedFolder {
             stored,
             recorded,
             mode: applied.expect("applied when update succeeds").mode,
+            counts,
         })
     }
 
@@ -640,24 +799,11 @@ impl Shared {
         own
     }
 
-    /// The folders a confined command neither reads nor gets as a folder of
-    /// its own: [`Shared::own`], and the folder of the owner socket with its
-    /// token ([`Shared::owner_dir`]), which lies in `/run`, a system folder
-    /// every command reads otherwise. Not the folders a command's account
-    /// must not enter at all (crate::account::out_of_reach): every account
-    /// may enter that one, to reach the socket.
-    pub fn sealed(&self, cfg: &NodeConfig) -> Vec<PathBuf> {
-        let mut out = self.own(cfg);
-        out.extend(self.owner_dir.clone());
-        out
-    }
-
     /// Whether commands of `folder` mode may run: confined (Landlock or an
-    /// AppContainer, and the shim's host), and kept from the node's keys. With the keys in the
-    /// keyring a command reaches them over the session bus, a socket file:
-    /// Landlock keeps a command from connecting to one only from ABI 9 on
-    /// (Linux 7.1), and before that only an account other than root and the
-    /// node's own cannot reach that bus.
+    /// AppContainer, and the shim's host), and kept from the node's keys.
+    /// With the keys in the keyring a command reaches them over the session
+    /// bus of the node's user, which only another account than root and the
+    /// node's own cannot reach: `nerve-run` on the installed node.
     pub fn confined(&self, cfg: &NodeConfig) -> bool {
         self.unconfined(cfg).is_none()
     }
@@ -665,7 +811,7 @@ impl Shared {
     /// Why commands of `folder` mode may not run, or `None` when they may
     /// ([`Shared::confined`]).
     pub fn unconfined(&self, cfg: &NodeConfig) -> Option<&'static str> {
-        self.unconfined_as(cfg, || self.command_account(cfg).ok().flatten())
+        self.unconfined_as(cfg, || self.account_as(cfg, false).ok().flatten())
     }
 
     /// [`Shared::unconfined`] for commands that run as `account`, the
@@ -677,15 +823,62 @@ impl Shared {
         cfg: &NodeConfig,
         account: impl FnOnce() -> Option<crate::service::Account>,
     ) -> Option<&'static str> {
-        if !self.confinement.available() || self.exe.is_none() {
-            return Some(NOT_CONFINED);
-        }
-        let kept = keys_kept_from_commands(
+        folder_refusal(
+            self.confinement.available() && self.exe.is_some(),
+            self.service,
             cfg.machine.secret_storage,
-            self.confinement.keeps_sockets(),
             account,
-        );
-        (!kept).then_some(KEYRING_NOT_CONFINED)
+        )
+    }
+
+    /// Whether the commands of a pairing with `policy` run under Landlock
+    /// now: in folder mode, and as `nerve-run`, where the kernel has it.
+    pub fn landlock_for(&self, policy: &nerve_policy::config::CenterPolicy) -> bool {
+        self.confinement.landlock_abi.is_some()
+            && self.exe.is_some()
+            && (policy.mode_at(crate::now_ms()) == nerve_policy::Mode::Folder
+                || self.separate(policy))
+    }
+
+    /// What `nerve-run` may read of the owner's home beyond its folders on
+    /// the installed Linux node without Landlock
+    /// (crate::account::home_warning): the home, its mode when others may
+    /// look into it, the folders given in it, and what the node says. Null
+    /// with Landlock, which holds it to its folders, and where neither lets
+    /// it into the home.
+    pub fn home_warning(&self, cfg: &NodeConfig) -> Value {
+        #[cfg(target_os = "linux")]
+        {
+            if !self.service || self.confinement.landlock_abi.is_some() {
+                return Value::Null;
+            }
+            let Some(name) = self.owner_name(cfg) else {
+                return Value::Null;
+            };
+            let Ok(Some(owner)) = self.account_named(&name) else {
+                return Value::Null;
+            };
+            let open = crate::account::home_open(&owner.home);
+            // The folders are resolved as the owner sees them, as a sync
+            // does: the node's user may not look into the owner's home. A
+            // node that cannot act as the owner resolves them as itself.
+            let _as = crate::account::FsAs::new(&owner).ok();
+            let below = given_in_home(cfg, &owner.home);
+            match crate::account::home_warning(&owner.home, open, &below) {
+                Some(warning) => json!({
+                    "home": owner.home,
+                    "mode": open.map(|m| format!("{m:o}")),
+                    "below": below,
+                    "warning": warning,
+                }),
+                None => Value::Null,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cfg;
+            Value::Null
+        }
     }
 
     /// Counts a `folder` mode command whose Landlock domain has no connect
@@ -798,8 +991,28 @@ impl Shared {
         }
     }
 
+    /// What the last sync of the folders' ACLs left, on the installed Linux
+    /// node (crate::acl): `status`'s `folder_grants`.
+    pub fn folder_grants(&self) -> Value {
+        #[cfg(target_os = "linux")]
+        {
+            let r = lock(&self.acl);
+            json!({
+                "errors": r.errors,
+                "stale": r.stale,
+                "failed": r.failed,
+                "skipped": r.skipped,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Value::Null
+    }
+
     pub fn status(&self) -> Value {
         let cfg = self.config();
+        // What the last sync of the folders' ACLs left, on the installed
+        // Linux node (crate::acl).
+        let grants = self.folder_grants();
         let now = crate::now_ms();
         let centers: Vec<Value> = cfg
             .centers
@@ -816,6 +1029,13 @@ impl Shared {
                     "status": status,
                     "mode": c.policy.mode_at(now).as_str(),
                     "until": c.policy.until,
+                    "as_owner": c.policy.as_owner,
+                    // The account its commands run as now; none on a node
+                    // run by hand, which runs them as itself.
+                    "account": self.command_account(&cfg, &c.policy).ok().flatten().map(|a| a.name),
+                    // Whether Landlock holds its commands now; `nerve-run`
+                    // runs without it where the kernel has none.
+                    "landlock": self.landlock_for(&c.policy),
                     "settings": c.settings,
                     "paused": c.paused,
                     "revoked": c.revoked,
@@ -826,9 +1046,8 @@ impl Shared {
         json!({
             "version": cfg.version,
             "locked": cfg.locked,
-            // The account commands run as (the desktop app warns when it is
-            // its own user's: crate::owner).
-            "account": cfg.machine.user,
+            // The installed node's owner (crate::owner).
+            "owner": self.owner_name(&cfg),
             "confinement": self.confinement.describe(),
             "running": self.running.load(Ordering::Relaxed),
             "sudo": if self.sudo_on() { "on" } else { "off" },
@@ -841,6 +1060,9 @@ impl Shared {
             "folder_commands_off": self.unconfined(&cfg),
             "command_limits": crate::cgroup::status(&cfg.limits.command, &self.cgroups),
             "providers": self.providers.status(),
+            "folder_grants": grants,
+            // What nerve-run may read of the owner's home without Landlock.
+            "home_warning": self.home_warning(&cfg),
             "centers": centers,
             "relay": self.relay.status(&cfg),
         })
@@ -865,9 +1087,9 @@ pub const KEYS_MOVED: &str = "the node's keys moved into the system keyring whil
 pub const NOT_CONFINED: &str = "commands cannot be confined on this machine";
 
 /// Why `folder` mode runs no command with the keys in the keyring where
-/// [`keys_kept_from_commands`] does not hold.
+/// [`keys_kept_from_commands`] does not hold: a node run by hand.
 #[cfg(not(windows))]
-pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this machine while the node's keys are in the system keyring: Landlock here (below ABI 9, Linux 7.1) cannot keep a command off the session bus the keyring answers on, so folder mode runs no command unless commands run as another account than root; `nerve-node config set machine.secret_storage file` brings them back";
+pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this machine while the node's keys are in the system keyring: this node runs its commands as its own user, who reaches the keyring over the session bus, so folder mode runs no command; installed as a service (`sudo nerve-node install`) it runs them as nerve-run, which does not, or `nerve-node config set machine.secret_storage file` brings them back";
 
 /// The text of [`KEYRING_NOT_CONFINED`] on Windows, where commands run in an
 /// AppContainer and the keys are in the Credential Manager: neither Landlock
@@ -875,31 +1097,56 @@ pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this mach
 #[cfg(windows)]
 pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this machine while the node's keys are in the system keyring: the AppContainer here is not known to keep a command from the Credential Manager the keys are in, so folder mode runs no command; `nerve-node config set machine.secret_storage file` brings them back";
 
+/// Why commands of `folder` mode may not run ([`Shared::unconfined_as`]),
+/// or `None`: `sandbox` says whether the machine confines them, `service`
+/// whether this is the installed node, `account` the account they run as.
+/// Where Landlock is missing, `nerve-run` is held to its folders by its own
+/// account and the ACLs alone, and the installed Linux node runs its
+/// commands without it (docs/user/modes.md). `account` is asked only when
+/// the answer depends on it.
+pub fn folder_refusal(
+    sandbox: bool,
+    service: bool,
+    storage: SecretStorage,
+    account: impl FnOnce() -> Option<crate::service::Account>,
+) -> Option<&'static str> {
+    if sandbox && storage == SecretStorage::File {
+        return None;
+    }
+    let account = account();
+    let held = service
+        && cfg!(target_os = "linux")
+        && account
+            .as_ref()
+            .is_some_and(|a| a.name == crate::account::RUN_USER);
+    if !sandbox && !held {
+        return Some(NOT_CONFINED);
+    }
+    let kept = keys_kept_from_commands(storage, || account);
+    (!kept).then_some(KEYRING_NOT_CONFINED)
+}
+
 /// Whether a confined command of `account` (`None`: the node's own user)
 /// cannot reach the node's keys where `storage` keeps them. Files are out of
-/// its sandbox. The keyring answers on the session bus of the node's user:
-/// Landlock keeps a command off it where it `keeps_sockets`; elsewhere only
-/// another account than root is kept out, by the bus folder's owner-only
-/// mode. `account` is asked only in that last case.
+/// its sandbox. The keyring answers on the session bus of the node's user,
+/// whose folder is open to that user (and root) alone. `account` is asked
+/// only for the keyring.
 pub fn keys_kept_from_commands(
     storage: SecretStorage,
-    keeps_sockets: bool,
     account: impl FnOnce() -> Option<crate::service::Account>,
 ) -> bool {
-    storage == SecretStorage::File || keeps_sockets || account().is_some_and(|a| a.uid != 0)
+    storage == SecretStorage::File || account().is_some_and(|a| a.uid != 0)
 }
 
 /// Whether a command confined by `landlock` and run as `account` could
 /// reach the keys over the session bus once they are in the keyring
-/// ([`Shared::open_to_bus`]): a domain without a connect rule leaves the bus
-/// open for the command's whole life, and only another account than root is
-/// kept off it then. `account` is asked only for such a domain.
+/// ([`Shared::open_to_bus`]): only the node's own user (or root) does.
+/// `account` is asked only for a confined command.
 pub fn reaches_bus(
     landlock: Option<&nerve_sandbox::LandlockSpec>,
     account: impl FnOnce() -> Option<crate::service::Account>,
 ) -> bool {
-    landlock.is_some_and(|s| s.connect.is_none())
-        && !keys_kept_from_commands(SecretStorage::Keyring, false, account)
+    landlock.is_some() && !keys_kept_from_commands(SecretStorage::Keyring, account)
 }
 
 /// A running node daemon.
@@ -947,16 +1194,13 @@ impl Daemon {
         // Where the keys may not be in the keyring, a node.toml that keeps
         // them there is refused: the installed node on Windows would look
         // in the Credential Manager of its own account, which holds none of
-        // them, and an old Landlock leaves folder mode without programs.
+        // them.
         if crate::secrets::stated_storage(&paths) == SecretStorage::Keyring
             && let Some(n) = crate::secrets::no_keyring(&paths)
         {
             let then = match n {
                 crate::secrets::NoKeyring::WindowsService => {
                     "`Restart-Service nerve-node` starts it"
-                }
-                crate::secrets::NoKeyring::OldLandlock(_) => {
-                    "start the node again (`sudo systemctl restart nerve-node` for the installed node)"
                 }
             };
             return Err(crate::secrets::keyring_refused(
@@ -1017,7 +1261,9 @@ impl Daemon {
         }
         let (changed, _) = watch::channel(0);
         let (stop, _) = watch::channel(false);
-        let service = crate::service::is_service_node(&paths);
+        let service = opts
+            .service
+            .unwrap_or_else(|| crate::service::is_service_node(&paths));
         #[cfg(unix)]
         if service && nerve_transport::net::euid() != 0 && !crate::account::can_switch() {
             tracing::warn!(
@@ -1038,11 +1284,6 @@ impl Daemon {
         let cgroups = opts
             .cgroups
             .unwrap_or_else(|| crate::cgroup::Cgroups::find().map(Arc::new));
-        let owner_dir = opts
-            .owners
-            .as_ref()
-            .filter(|_| opts.ctl && cfg!(unix))
-            .and_then(|e| e.at.parent().map(std::path::Path::to_path_buf));
         let shared = Arc::new(Shared {
             paths: paths.clone(),
             service,
@@ -1071,7 +1312,11 @@ impl Daemon {
             providers: Default::default(),
             relay: Default::default(),
             aside: opts.aside,
-            owner_dir,
+            owner: opts.owner,
+            #[cfg(target_os = "linux")]
+            acl: Mutex::default(),
+            #[cfg(target_os = "linux")]
+            acl_tried: Mutex::default(),
         });
         shared.tell_confinement(&cfg);
         // A file that says on starts off: on Linux the password lives in
@@ -1197,10 +1442,7 @@ impl Daemon {
         if let Some((task, _at)) = self.owner {
             task.abort();
             #[cfg(unix)]
-            {
-                let _ = std::fs::remove_file(crate::owner::token_file(&_at));
-                let _ = std::fs::remove_file(_at);
-            }
+            let _ = std::fs::remove_file(_at);
         }
         tracing::info!("node daemon stopped");
     }
@@ -1292,6 +1534,8 @@ async fn supervise(shared: Arc<Shared>) {
     let mut stop = shared.stop.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut granted: Option<u64> = None;
+    #[cfg(target_os = "linux")]
+    let mut acl_synced: Option<u64> = None;
     loop {
         shared.settle_sudo();
         let cfg = shared.config();
@@ -1308,6 +1552,15 @@ async fn supervise(shared: Arc<Shared>) {
                     tracing::warn!("folder grants: {e}");
                 }
             });
+        }
+        // On the installed Linux node the folders' ACLs follow it so
+        // (crate::acl); a command of `nerve-run` syncs them as well before
+        // it runs.
+        #[cfg(target_os = "linux")]
+        if shared.service && acl_synced != Some(cfg.version) {
+            acl_synced = Some(cfg.version);
+            let (s, c) = (shared.clone(), cfg.clone());
+            tokio::task::spawn_blocking(move || s.sync_acls(&c, false));
         }
         // The level follows the config, whoever changed it and however.
         if let Some(log) = &shared.log {
@@ -1406,9 +1659,11 @@ pub struct AddedFolder {
     pub stored: String,
     /// Whether it is recorded at its real place (`CenterPolicy::places`).
     pub recorded: bool,
-    /// The center's mode, for the CLI's note on folders counting in folder
-    /// mode only.
+    /// The center's mode, for the CLI's note on folders that do not count.
     pub mode: nerve_policy::Mode,
+    /// Whether the center's folders hold its commands now: in folder mode,
+    /// and in every mode whose commands run as `nerve-run`.
+    pub counts: bool,
 }
 
 /// The message of a refused `folder add`, for the CLI and the node alike.
@@ -1560,6 +1815,25 @@ async fn answer(
             }
             rotate_key(shared, &req.params).await
         }
+        // The folders' ACLs brought in line with the config now, also a
+        // grant that failed before, and what that left: the CLI tells the
+        // owner after a change of the folders (crate::acl).
+        "folder.grants" => {
+            if shared.below_command(peer.pid) {
+                return nerve_transport::ctl::Reply::Err(FROM_A_COMMAND.into());
+            }
+            let s = shared.clone();
+            let r = tokio::task::spawn_blocking(move || {
+                #[cfg(target_os = "linux")]
+                s.sync_acls(&s.config(), true);
+                s.folder_grants()
+            })
+            .await;
+            match r {
+                Ok(v) => nerve_transport::ctl::Reply::Ok(v),
+                Err(e) => nerve_transport::ctl::Reply::Err(e.to_string()),
+            }
+        }
         // A capability provider attaches; its connection stays
         // (crate::provider).
         "hello" => {
@@ -1673,6 +1947,7 @@ pub(crate) fn control(
                     "stored": a.stored,
                     "recorded": a.recorded,
                     "mode": a.mode.as_str(),
+                    "counts": a.counts,
                 })),
                 Err(e) => Reply::Err(e),
             }
@@ -1806,6 +2081,43 @@ fn describe_change(by: &str, version: u64, changes: &[Change]) -> String {
     )
 }
 
+/// The folders in `home` that the pairings whose commands run as
+/// `nerve-run` give it, as the owner named them (resolved, `~` the owner's
+/// home), not as they are split around the protected entries: `home` itself
+/// where it is given whole, also by a folder around it. The home is
+/// resolved too, as the folders are: where its path runs through a link,
+/// the entries go on the real one (crate::acl), and a folder in it is told
+/// under the home as the account database names it.
+#[cfg(target_os = "linux")]
+fn given_in_home(cfg: &NodeConfig, home: &std::path::Path) -> Vec<PathBuf> {
+    use nerve_policy::paths::within;
+    let now = crate::now_ms();
+    let real = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let mut out: Vec<PathBuf> = Vec::new();
+    for c in cfg.centers.iter().filter(|c| !c.policy.runs_as_owner(now)) {
+        for f in &c.policy.folders {
+            let Some(p) = nerve_policy::protected::expand(home, &f.path) else {
+                continue;
+            };
+            // One that does not resolve (gone, or closed to the owner) is
+            // compared as it is named.
+            let p = std::fs::canonicalize(&p).unwrap_or(p);
+            let p = if within(&real, &p) || within(home, &p) {
+                home.to_path_buf()
+            } else if let Ok(inside) = p.strip_prefix(&real).or_else(|_| p.strip_prefix(home)) {
+                home.join(inside)
+            } else {
+                continue;
+            };
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1825,22 +2137,20 @@ mod tests {
         };
         let (other, root) = (account(4242), account(0));
         use SecretStorage::{File, Keyring};
-        let kept = |storage, keeps_sockets, a: Option<&crate::service::Account>| {
-            keys_kept_from_commands(storage, keeps_sockets, || a.cloned())
+        let kept = |storage, a: Option<&crate::service::Account>| {
+            keys_kept_from_commands(storage, || a.cloned())
         };
-        assert!(kept(File, false, None));
-        assert!(kept(File, false, Some(&root)));
-        assert!(!kept(Keyring, false, None));
-        assert!(!kept(Keyring, false, Some(&root)));
-        assert!(kept(Keyring, false, Some(&other)));
-        assert!(kept(Keyring, true, None));
-        assert!(kept(Keyring, true, Some(&root)));
+        assert!(kept(File, None));
+        assert!(kept(File, Some(&root)));
+        assert!(!kept(Keyring, None));
+        assert!(!kept(Keyring, Some(&root)));
+        assert!(kept(Keyring, Some(&other)));
     }
 
-    /// A command reaches the session bus for good when its domain has no
-    /// connect rule, unless it runs as another account than root.
+    /// A confined command reaches the session bus for good unless it runs
+    /// as another account than root.
     #[test]
-    fn a_domain_without_a_connect_rule_reaches_the_bus() {
+    fn a_confined_command_of_the_nodes_own_user_reaches_the_bus() {
         let account = |uid| crate::service::Account {
             name: "a".into(),
             uid,
@@ -1850,10 +2160,6 @@ mod tests {
             groups: vec![uid],
         };
         let open = nerve_sandbox::LandlockSpec::default();
-        let barred = nerve_sandbox::LandlockSpec {
-            connect: Some(vec!["/run/user/1000".into()]),
-            ..Default::default()
-        };
         assert!(reaches_bus(Some(&open), || None));
         assert!(reaches_bus(Some(&open), || Some(account(0))));
         assert!(!reaches_bus(Some(&open), || Some(account(4242))));
@@ -1862,9 +2168,8 @@ mod tests {
             asked.set(true);
             None
         };
-        assert!(!reaches_bus(Some(&barred), ask));
-        // Without Landlock (allowlist, user and sudo commands) the move
-        // changes nothing a command reaches.
+        // Without Landlock (user and sudo commands) the move changes nothing
+        // a command reaches.
         assert!(!reaches_bus(None, ask));
         assert!(!asked.get());
     }
@@ -1921,8 +2226,7 @@ mod tests {
     }
 
     /// The account is looked up only where the answer depends on it: with the
-    /// keys in files, or Landlock off the bus, a link's 5 s tick starts no
-    /// program.
+    /// keys in files a link's 5 s tick starts no program.
     #[test]
     fn the_account_is_asked_only_where_it_decides() {
         use SecretStorage::{File, Keyring};
@@ -1931,10 +2235,9 @@ mod tests {
             asked.set(asked.get() + 1);
             None
         };
-        assert!(keys_kept_from_commands(File, false, ask));
-        assert!(keys_kept_from_commands(Keyring, true, ask));
+        assert!(keys_kept_from_commands(File, ask));
         assert_eq!(asked.get(), 0);
-        assert!(!keys_kept_from_commands(Keyring, false, ask));
+        assert!(!keys_kept_from_commands(Keyring, ask));
         assert_eq!(asked.get(), 1);
     }
 
@@ -1982,78 +2285,6 @@ mod tests {
         daemon.stop().await;
     }
 
-    /// The owner socket's folder, with the owner token, is out of every rule
-    /// of a confined command and no folder of one, even with the whole home
-    /// it lies in among its folders; the account of a command may still
-    /// enter it, for the socket. In `/run`, a system folder, the rest of
-    /// `/run` stays readable.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn the_owner_sockets_folder_is_sealed_from_commands() {
-        let d = tempfile::tempdir().unwrap();
-        let home = std::fs::canonicalize(d.path()).unwrap();
-        let run = home.join("run");
-        std::fs::create_dir(&run).unwrap();
-        let paths = NodePaths::new(home.join("config"), home.join("state"));
-        let mut opts = NodeOptions::new(paths);
-        opts.home = home.clone();
-        opts.owners = Some(crate::owner::Endpoint {
-            at: run.join(crate::owner::SOCKET_NAME),
-            owners: crate::owner::Owners::Uids(Vec::new()),
-            program: "/bin/false".into(),
-        });
-        let daemon = Daemon::start(opts).await.unwrap();
-        let cfg = daemon.config();
-        let token = crate::owner::token_file(&run.join(crate::owner::SOCKET_NAME));
-        assert!(token.exists());
-        let sealed = daemon.shared.sealed(&cfg);
-        assert!(sealed.contains(&run), "{sealed:?}");
-        assert!(!daemon.shared.own(&cfg).contains(&run));
-        let policy = nerve_policy::CenterPolicy {
-            folders: vec![nerve_policy::config::Folder {
-                path: home.display().to_string(),
-                access: nerve_policy::config::Access::ALL,
-            }],
-            ..Default::default()
-        };
-        let spec = crate::exec::landlock_spec(&policy, &home, &sealed, &[]);
-        for set in [&spec.read, &spec.write, &spec.exec] {
-            assert!(!set.iter().any(|r| token.starts_with(r)), "{set:?}");
-        }
-        // The rest of the home is the command's.
-        std::fs::write(home.join("note.txt"), "x").unwrap();
-        let spec = crate::exec::landlock_spec(&policy, &home, &sealed, &[]);
-        assert!(
-            spec.read.contains(&home.join("note.txt")),
-            "{:?}",
-            spec.read
-        );
-        daemon.stop().await;
-        assert!(!token.exists());
-
-        // The installed node's, in /run.
-        let own = [PathBuf::from(crate::owner::RUNTIME_DIR)];
-        let spec = crate::exec::landlock_spec(&Default::default(), &home, &own, &[]);
-        let token = crate::owner::token_file(&crate::owner::socket());
-        assert!(
-            !spec.read.iter().any(|r| token.starts_with(r)),
-            "{:?}",
-            spec.read
-        );
-        for other in std::fs::read_dir("/run").unwrap().flatten() {
-            let p = other.path();
-            if p != std::path::Path::new(crate::owner::RUNTIME_DIR)
-                && !other.file_type().unwrap().is_symlink()
-            {
-                assert!(
-                    spec.read.iter().any(|r| p.starts_with(r)),
-                    "{p:?}: {:?}",
-                    spec.read
-                );
-            }
-        }
-    }
-
     async fn daemon() -> (tempfile::TempDir, Daemon) {
         let d = tempfile::tempdir().unwrap();
         let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
@@ -2096,24 +2327,6 @@ mod tests {
         assert!(e.contains("Credential Manager"), "{e}");
         assert!(e.contains("config set machine.secret_storage file`"), "{e}");
         assert!(e.contains("Restart-Service nerve-node"), "{e}");
-    }
-
-    /// Nor does a node on a kernel below Landlock ABI 9.
-    #[tokio::test]
-    async fn a_node_below_landlock_9_refuses_keys_in_the_keyring() {
-        let d = tempfile::tempdir().unwrap();
-        let log = Log::new(Level::Info);
-        let opts = options(&d, &log);
-        let paths = opts.paths.clone();
-        keys_in_the_keyring(&paths);
-        crate::secrets::for_tests::pretend_landlock(&paths, crate::secrets::Landlock::Abi(7));
-        let Err(e) = Daemon::start(opts).await else {
-            panic!("the node started");
-        };
-        assert!(e.contains("the node does not start"), "{e}");
-        assert!(e.contains("Landlock ABI 7, below 9"), "{e}");
-        assert!(e.contains("config set machine.secret_storage file`"), "{e}");
-        assert!(e.contains("systemctl restart nerve-node"), "{e}");
     }
 
     fn options(d: &tempfile::TempDir, log: &Arc<Log>) -> NodeOptions {
@@ -2248,6 +2461,203 @@ mod tests {
         write(&storage(SecretStorage::Keyring));
         assert_eq!(told(), 2);
         daemon.stop().await;
+    }
+
+    /// The status says of each pairing whether Landlock holds its commands,
+    /// and on the installed Linux node without Landlock what nerve-run may
+    /// read of the owner's home beyond its folders: with the home open to
+    /// others, or a folder given in it. Nothing of the home with Landlock,
+    /// nor on a node run by hand (#142).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_status_tells_landlock_and_what_the_home_leaves_open() {
+        use nerve_policy::config::{CenterPolicy, Folder, Mode};
+        use std::os::unix::fs::PermissionsExt;
+        for (service, landlock) in [(true, false), (true, true), (false, false)] {
+            let log = Log::new(Level::Info);
+            let d = tempfile::tempdir().unwrap();
+            let home = std::fs::canonicalize(d.path()).unwrap().join("alice");
+            std::fs::create_dir_all(home.join("proj")).unwrap();
+            let chmod =
+                |m| std::fs::set_permissions(&home, std::fs::Permissions::from_mode(m)).unwrap();
+            chmod(0o750);
+            let mut o = options(&d, &log);
+            o.full_rights = Some(false);
+            o.exe = Some("/bin/true".into());
+            o.service = Some(service);
+            o.owner = Some("alice".into());
+            o.confinement = Some(Confinement {
+                landlock_abi: landlock.then_some(6),
+                appcontainer: false,
+            });
+            let daemon = Daemon::start(o).await.unwrap();
+            let s = daemon.shared.clone();
+            // The owner as the account database has her.
+            lock(&s.account_cache).insert(
+                "alice".into(),
+                (
+                    std::time::Instant::now(),
+                    Some(crate::service::Account {
+                        name: "alice".into(),
+                        uid: 4242,
+                        gid: 4242,
+                        comment: String::new(),
+                        home: home.clone(),
+                        groups: vec![4242],
+                    }),
+                ),
+            );
+            // The folders of the folder pairing, then of the user pairing.
+            let pairings_each = |f: Vec<Folder>, u: Vec<Folder>| {
+                let mut cfg = s.config();
+                cfg.centers = [("f", Mode::Folder, f), ("u", Mode::User, u)]
+                    .into_iter()
+                    .map(|(name, mode, folders)| nerve_policy::CenterEntry {
+                        name: name.into(),
+                        url: "https://center.example".into(),
+                        pin: None,
+                        center_id: "c".into(),
+                        node_id: name.into(),
+                        settings: Default::default(),
+                        paused: false,
+                        revoked: false,
+                        unknown: false,
+                        public_key: None,
+                        key_rotations: 0,
+                        pin_rotations: 0,
+                        old_pin: None,
+                        policy: CenterPolicy {
+                            mode,
+                            folders,
+                            ..Default::default()
+                        },
+                    })
+                    .collect();
+                let r = control(
+                    &s,
+                    "config.write",
+                    json!({"config": cfg.to_toml(), "if_version": cfg.version}),
+                    None,
+                );
+                assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
+            };
+            let pairings = |folders: Vec<Folder>| pairings_each(folders.clone(), folders);
+            let folder = |p: &std::path::Path, access: &str| Folder {
+                path: p.display().to_string(),
+                access: nerve_policy::config::Access::parse(access).unwrap(),
+            };
+            pairings(Vec::new());
+            let st = daemon.status();
+            let what = format!("service {service}, landlock {landlock}");
+            assert_eq!(st["centers"][0]["landlock"], landlock, "{what}");
+            assert_eq!(st["centers"][1]["landlock"], false, "{what}: user mode");
+            // Closed, and no folder in it: nothing to say.
+            assert_eq!(st["home_warning"], Value::Null, "{what}");
+            chmod(0o755);
+            let st = daemon.status();
+            let told = service && !landlock;
+            assert_eq!(st["home_warning"]["mode"] == "755", told, "{what}: {st}");
+            chmod(0o750);
+            pairings(vec![Folder {
+                path: home.join("proj").display().to_string(),
+                access: nerve_policy::config::Access::parse("rw").unwrap(),
+            }]);
+            let st = daemon.status();
+            assert_eq!(
+                st["home_warning"]["below"] == json!([home.join("proj")]),
+                told,
+                "{what}: {st}"
+            );
+            if told {
+                assert_eq!(st["home_warning"]["mode"], Value::Null);
+                let w = st["home_warning"]["warning"].as_str().unwrap();
+                assert!(w.contains("passes through your home"), "{w}");
+                assert!(w.contains("This warning stays while"), "{w}");
+            }
+            // The home given whole, which the sandbox splits around its
+            // protected entries: told as the home, not as the folders it
+            // was split into.
+            std::fs::create_dir_all(home.join(".ssh")).unwrap();
+            std::fs::create_dir_all(home.join("docs")).unwrap();
+            pairings(vec![Folder {
+                path: home.display().to_string(),
+                access: nerve_policy::config::Access::parse("r").unwrap(),
+            }]);
+            let st = daemon.status();
+            assert_eq!(
+                st["home_warning"]["below"] == json!([home]),
+                told,
+                "{what}: {st}"
+            );
+            if told {
+                let w = st["home_warning"]["warning"].as_str().unwrap();
+                assert!(w.contains("as you give it your home itself."), "{w}");
+                assert!(!w.contains("more folders"), "{w}");
+            }
+            // A folder around the home gives the home whole too.
+            let around = home.parent().unwrap();
+            pairings_each(vec![folder(around, "r")], Vec::new());
+            let st = daemon.status();
+            assert_eq!(
+                st["home_warning"]["below"] == json!([home]),
+                told,
+                "{what}: {st}"
+            );
+            // Only the pairings whose commands run as nerve-run count: a
+            // folder in the home that only the user pairing has leaves
+            // nothing to say of the closed home.
+            let elsewhere = around.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            pairings_each(
+                vec![folder(&elsewhere, "rw")],
+                vec![folder(&home.join("proj"), "rw")],
+            );
+            let st = daemon.status();
+            assert_eq!(st["home_warning"], Value::Null, "{what}: {st}");
+            // A home whose path runs through a link: the folders resolve to
+            // the real home, and are told under the home as named.
+            let data = around.join("data");
+            std::fs::create_dir_all(data.join("alice/proj")).unwrap();
+            std::fs::set_permissions(data.join("alice"), std::fs::Permissions::from_mode(0o750))
+                .unwrap();
+            std::os::unix::fs::symlink(&data, around.join("linked")).unwrap();
+            let linked = around.join("linked/alice");
+            lock(&s.account_cache).insert(
+                "alice".into(),
+                (
+                    std::time::Instant::now(),
+                    Some(crate::service::Account {
+                        name: "alice".into(),
+                        uid: 4242,
+                        gid: 4242,
+                        comment: String::new(),
+                        home: linked.clone(),
+                        groups: vec![4242],
+                    }),
+                ),
+            );
+            pairings(vec![folder(&linked.join("proj"), "rw")]);
+            let st = daemon.status();
+            assert_eq!(
+                st["home_warning"]["below"] == json!([linked.join("proj")]),
+                told,
+                "{what}: {st}"
+            );
+            if told {
+                assert_eq!(st["home_warning"]["home"], json!(linked), "{st}");
+            }
+            // A folder around the real home, given by a name that is not
+            // around the home as named (`linked` resolves to `data`), is
+            // the home too.
+            pairings(vec![folder(&around.join("linked"), "r")]);
+            let st = daemon.status();
+            assert_eq!(
+                st["home_warning"]["below"] == json!([linked]),
+                told,
+                "{what}: {st}"
+            );
+            daemon.stop().await;
+        }
     }
 
     /// A job of a command, as the pipe asks it: the processes it holds.
@@ -2978,8 +3388,9 @@ mod confinement_tests {
     use super::*;
 
     /// The refusal for keys in the keyring names what applies on the platform:
-    /// Landlock and the session bus on Linux, the AppContainer and the
-    /// Credential Manager on Windows, and not the other's.
+    /// the session bus and the installed node's nerve-run on Linux, the
+    /// AppContainer and the Credential Manager on Windows, and not the
+    /// other's.
     #[test]
     fn the_keyring_refusal_names_the_platform_it_is_for() {
         let text = KEYRING_NOT_CONFINED;
@@ -2990,7 +3401,48 @@ mod confinement_tests {
             assert!(!text.contains("Landlock") && !text.contains("session bus"));
         }
         #[cfg(not(windows))]
-        assert!(text.contains("Landlock") && text.contains("session bus"));
+        assert!(text.contains("session bus") && text.contains("nerve-run"));
+    }
+
+    /// Without Landlock, the installed Linux node runs folder mode as
+    /// `nerve-run`, which its account and the ACLs hold to its folders; a
+    /// node run by hand, and any other account, still runs none (#142).
+    #[test]
+    fn without_landlock_only_nerve_run_runs_folder_mode() {
+        let account = |name: &str, uid: u32| crate::service::Account {
+            name: name.into(),
+            uid,
+            gid: uid,
+            comment: String::new(),
+            home: "/home/x".into(),
+            groups: vec![uid],
+        };
+        let run = || Some(account(crate::account::RUN_USER, 990));
+        let file = SecretStorage::File;
+        let held = if cfg!(target_os = "linux") {
+            None
+        } else {
+            Some(NOT_CONFINED)
+        };
+        assert_eq!(folder_refusal(false, true, file, run), held);
+        assert_eq!(folder_refusal(false, false, file, run), Some(NOT_CONFINED));
+        assert_eq!(
+            folder_refusal(false, true, file, || Some(account("alice", 1000))),
+            Some(NOT_CONFINED)
+        );
+        assert_eq!(
+            folder_refusal(false, true, file, || None),
+            Some(NOT_CONFINED)
+        );
+        assert_eq!(folder_refusal(true, false, file, || None), None);
+        // The keys in the keyring: nerve-run does not reach it, the node's
+        // own user does.
+        let ring = SecretStorage::Keyring;
+        assert_eq!(folder_refusal(false, true, ring, run), held);
+        assert_eq!(
+            folder_refusal(true, false, ring, || None),
+            Some(KEYRING_NOT_CONFINED)
+        );
     }
 
     /// The installed Windows service runs commands as another account, for

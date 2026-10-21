@@ -162,7 +162,7 @@ fn where_the_keys_go_says_whether_the_keyring_can_hold_them() {
     assert_eq!(v["value"], "file", "{v}");
     assert_eq!(v["keyring"]["usable"], false, "{v}");
     let reason = v["keyring"]["reason"].as_str().unwrap();
-    assert!(["no-answer", "old-landlock"].contains(&reason), "{v}");
+    assert_eq!(reason, "no-answer", "{v}");
     assert!(!v["keyring"]["why"].as_str().unwrap().is_empty());
 }
 

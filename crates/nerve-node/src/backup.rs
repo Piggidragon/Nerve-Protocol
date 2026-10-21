@@ -915,13 +915,7 @@ fn write_keys<'a>(
             secrets::store::get(account.account()).ok().flatten()
         } else {
             secrets::store::get(account.account()).map_err(|e| {
-                // Where the kernel is below Landlock ABI 9 `setup` does not
-                // offer to install a keyring, so it is not named there.
-                let how = if secrets::no_keyring(paths).is_some() {
-                    "start or unlock the keyring by hand (`nerve-node setup` installs none on this kernel)"
-                } else {
-                    "start or unlock the keyring (on a Linux without a desktop, `nerve-node setup` can install one if you answer `keyring` where it asks where the keys go)"
-                };
+                let how = "start or unlock the keyring (on a Linux without a desktop, `nerve-node setup` can install one if you answer `keyring` where it asks where the keys go)";
                 format!(
                     "cannot read the proxy's header values in the system keyring (entry {account}) to check whose they are: {e}. Restore with --without-proxy and set the proxy again on this machine; or {how}; or take the proxy's header values off the node you back up (`nerve-node proxy rm` there, then back it up again)"
                 )
@@ -1430,7 +1424,7 @@ mod tests {
         paired(&from, SecretStorage::Keyring, &["home"]);
         let (_f, parsed, _) = roundtrip(&from, true);
         let (_b, to) = node();
-        secrets::for_tests::pretend_landlock(&to, secrets::Landlock::Abi(7));
+        secrets::for_tests::pretend_windows_service(&to);
         let err = restore(&to, &parsed, &RestoreOpts::default())
             .err()
             .unwrap();
@@ -2477,19 +2471,6 @@ mod tests {
         assert!(err.contains("nothing was restored"), "{err}");
         assert!(!err.contains("Basic"), "{err}");
         assert_eq!(std::fs::read(n.config_file()).unwrap(), before);
-        // Below Landlock ABI 9 setup installs no keyring, and the message does
-        // not send the owner to it.
-        secrets::for_tests::pretend_landlock(&n, secrets::Landlock::Abi(5));
-        secrets::store::set_unreachable(true);
-        let err = restore(&n, &parsed, &RestoreOpts::default());
-        secrets::store::set_unreachable(false);
-        let err = err.err().unwrap();
-        assert!(
-            err.contains("installs none on this kernel")
-                && !err.contains("can install one")
-                && err.contains("--without-proxy"),
-            "{err}"
-        );
         // A backup made with --include-keyring is no way round it: its values
         // are written into the same keyring, which does not answer either.
         let (_g, with, report) = roundtrip(&n, true);

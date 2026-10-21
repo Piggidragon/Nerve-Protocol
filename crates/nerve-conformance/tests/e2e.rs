@@ -128,6 +128,9 @@ fn nerve_center_and_nerve_node_work_together() {
     let out = node.ok(&["center", "add", &link, "--yes"]);
     assert!(out.contains("e2e-center"), "{out}");
     assert!(node.ok(&["center", "ls"]).contains("e2e-center"));
+    // A new pairing is in folder mode; the steps below start from allowlist.
+    assert!(node.ok(&["center", "ls"]).contains("folder"));
+    node.ok(&["mode", "set", "allowlist"]);
     node.use_fake_sudo(SUDO_PW);
     node.start();
     let ov = mcp.wait_overview("the node comes online", |v| {

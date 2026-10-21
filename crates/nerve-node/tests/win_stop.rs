@@ -61,7 +61,9 @@ fn opts() -> RunOptions {
         timeouts: Default::default(),
         sudo: None,
         account: None,
+        separate: false,
         own: Vec::new(),
+        root: None,
         limits: None,
     }
 }

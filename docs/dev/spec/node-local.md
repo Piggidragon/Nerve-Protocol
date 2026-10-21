@@ -21,28 +21,38 @@ A node that `nerve-node install` put on a Linux machine
 command root runs on them runs as their owner, so that what it writes stays
 the node's.
 
-On that node `nerve` only holds the config, keys and state: every command
-of a center, in every mode, runs as the account `machine.user` names (§2),
-with that account's ids and groups, `HOME`, `USER` and `LOGNAME` set to it,
-and its home as the working directory when the call names none. `folder`
-mode differs from `user` mode only by its confinement: the same account,
-held by Landlock to its folders (§Modes), with the account's home as the
-`~` of those rules. The sudo switch uses the account too (§4). `install`
-sets it to the account that ran `sudo` (root when there was none), unless
-one is set; `setup` chooses another and can make one (`useradd`, a group
-and a home of its own, no login shell). The account must exist and must not
-be `nerve`; with none set, or one that cannot be used, no command runs
-(`unavailable`), after its call was decided and audited. Before a command
-starts, in the child, the node checks with `access()` that the account can
-neither list nor enter the config and state folders, and refuses to run it
-if it can. Root is allowed: `install` and `setup` warn that commands of a
-center then run as root, keys included, and that the owner is responsible;
-root's command runs without `no_new_privs`, so it has root's rights (in
-`folder` mode the shim still sets it with Landlock).
+On that node `nerve` only holds the config, keys and state; no command runs
+as it. A command of `folder` mode, and of `allowlist` mode unless the
+pairing's `as_owner` is set, runs as `nerve-run`; one of `user` mode, or of
+`allowlist` mode with `as_owner`, runs as the owner, and so does a sudo
+command of such a pairing. An allowed sudo command of a pairing whose
+commands run as `nerve-run` runs as root, started by the node (§4).
+`install` makes `nerve-run` (a system account with its own group and
+no other, no login shell, home `/var/lib/nerve-run`, comment
+`Nerve commands`) and takes the account that ran it (`SUDO_USER`,
+`PKEXEC_UID`) as the owner, which it writes into the unit
+(`Environment=NERVE_NODE_OWNER=<name>`); the node reads it from there. No
+other account can be chosen. A command gets its account's ids and groups,
+`HOME`, `USER` and `LOGNAME` set to it, and its home as the working
+directory when the call names none; one of `nerve-run` also gets
+`XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME`
+below its home, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` removed, and
+git's `safe.directory = *` as command-line configuration (`GIT_CONFIG_COUNT`).
+The `~` of folders, rules and the protected list is the owner's home. A
+command of `nerve-run` is confined by Landlock in `allowlist` mode as well
+(where the kernel has it), to its folders and the built-in `/tmp`,
+`/var/tmp` and its home (§Modes), and gets its pairing's folders as POSIX
+ACLs (§Folder ACLs). An account that is missing, `nerve-run` not made by
+`install` (another comment), root or `nerve` runs no command
+(`unavailable`), after its call was decided and audited; without an owner,
+no command that would run as the owner runs. Before a command starts, in
+the child, the node checks with `access()` that the account can neither list
+nor enter the config and state folders, and refuses to run it if it can.
 
 For this the service keeps one privilege: `CAP_SETUID` and `CAP_SETGID`
-(`AmbientCapabilities=` in the unit), and nothing else. The owner chose it,
-so that commands run as a real account that cannot read the node's keys.
+(`AmbientCapabilities=` in the unit), and nothing else. It lets the
+node run commands as `nerve-run` and the owner, accounts that cannot read
+the node's keys, and give `nerve-run` its folders as the owner.
 Every command the node starts drops every capability, ambient and
 inheritable ones included, before exec; the bounding set is not narrowed,
 since an allowed sudo command needs root's. The node signals a command of
@@ -52,22 +62,17 @@ processes cannot signal it, and the node waits for it two seconds at most.
 The `fs` actions of a center, and the path checks of every call (resolving
 paths, the protected list, the folders), are done by the node itself, on
 the calling thread under the account's file-system uid and gid and its
-groups (`setfsuid`, `setfsgid`, and `setgroups` as a plain system call, all
+groups (the pairing's account; the protected list's entries are resolved as
+the owner) (`setfsuid`, `setfsgid`, and `setgroups` as a plain system call, all
 per thread on Linux); the audit entry is written as `nerve` again. So a
-file the node makes for a center belongs to the account, and `~` in rules
-and in the protected list is the account's home. With root as the account
-the file-system ids are root's without root's capabilities
-(`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`, `CAP_FOWNER`), so these checks
-and the `fs` actions reach only what root owns or what the permission bits
-open to others; a command itself is really root. The CLI, which
+file the node makes for a center belongs to the account. The CLI, which
 runs as `nerve` on the installed node, cannot judge a folder it may not look
-into: with a node running, `folder add` is done by the node as the account
+into: with a node running, `folder add` is done by the node as the owner
 (`folder.add`, §5); with none, the folder is kept in its normal form,
-unresolved, and not recorded. A node not installed as a
-service runs commands as its own user and refuses a `machine.user` it
-cannot switch to. The installed node is known by its folders or its user,
-not by its capabilities: started without them (by hand, as `nerve`), it
-runs no command at all, and none as itself while no account is chosen.
+unresolved, and not recorded. A node not installed as a service runs every
+command as its own user. The installed node is known by its folders or its
+user, not by its capabilities: started without them (by hand, as `nerve`),
+it runs no command at all.
 
 `install`, `update` and `uninstall` run as root and write into folders
 that belong to `nerve`: they write there as the folder's owner (the
@@ -85,7 +90,8 @@ written to, and the command says so.
 refuses to run as root, or in an elevated token on Windows, unless
 `machine.allow_root = true`; when it runs that way, it logs a warning at
 start (stderr and the node's log file, not the center) that commands then run
-with full rights (on Unix unless `machine.user` names another account; an
+with full rights (on Unix unless it is the installed node, which runs them
+as `nerve-run` or the owner; an
 elevated administrator on Windows cannot start a command as another account,
 so its commands keep the node's token), and the owner is responsible.
 
@@ -287,57 +293,38 @@ So with `keyring` on Linux the node's own folders, which no policy opens
 and Landlock's rules leave out, also take in the places that reach the
 keys: the node's `XDG_RUNTIME_DIR`, `/run/user/<uid>`, a socket that a
 `unix:path=` `DBUS_SESSION_BUS_ADDRESS` names, and `keyrings` in
-`XDG_DATA_HOME` and in `~/.local/share`. A `folder` mode command then also
-gets a Landlock rule for connecting to socket files
-(`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9, Linux 7.1): everywhere but the
-own folders. Where the kernel has a Landlock ABI below 9 the keys do not go
-into the keyring at all ([where the keys are](#where-the-keys-are)).
+`XDG_DATA_HOME` and in `~/.local/share`. On the installed node that is
+`nerve`'s session, and no command runs as `nerve`: the bus folder is
+`nerve`'s alone (0700), so neither `nerve-run` nor the owner reaches it, on
+any kernel, in any mode. The keys may go into the keyring wherever one
+answers ([where the keys are](#where-the-keys-are)).
 
-The code keeps a gate as a second line, which an owner cannot reach while
-that refusal holds: with the keys in the keyring and no ABI 9, `folder`
-mode would offer no `exec`, as on a machine without Landlock, unless
-commands run as an account other than root and the node's own (the bus
-folder is the user's alone, 0700); the node would log it, its status would
-say it (`folder_commands_off`), and a refused command would name the
-keyring. The gate and the command's Landlock rules go by one answer per
-call, from the same config and account.
+A node a person runs runs its commands as that person, who reaches the bus.
+There `folder` mode offers no `exec` while the keys are in the keyring, as
+on a machine without Landlock: the node logs it, its status says it
+(`folder_commands_off`), and a refused command names the keyring. The gate
+and the command's Landlock rules go by one answer per call, from the same
+config and account. A Landlock domain does not change while its command
+runs, so a `folder` mode command of such a node that started while the keys
+were in files keeps a way to the session bus for its whole life. The running
+node counts these commands, and a move of the keys into the keyring is
+refused while one runs: nothing moves, and the refusal says how many run.
+The command is counted first and looks at the keys' place then, under the
+store lock that a move holds, so a command whose config was taken before a
+move that finished first does not start either. A reload (SIGHUP, `reload`)
+of a file that another writer saved with `keyring` is refused the same way
+while one runs, and the config in force stays. A process that a command
+takes out of its process group (`setsid`) outlives its call where the node
+has no cgroup for commands (Commands), and is not counted. Commands of
+another account than root are not counted: they cannot reach the bus.
 
-A Landlock domain does not change while its command runs, so a `folder`
-mode command that started while the keys were in files keeps a way to the
-session bus for its whole life, unless it runs as an account other than
-root. The running node counts these commands, and a move of the keys into
-the keyring is refused while one runs: nothing moves, and the refusal says
-how many run. The command is counted first and looks at the keys' place
-then, under the store lock that a move holds, so a command whose config was
-taken before a move that finished first does not start either. A reload
-(SIGHUP, `reload`) of a file that another writer saved with `keyring` is
-refused the same way while one runs, and the config in force stays. A process
-that a command takes out of its process group (`setsid`) outlives its call
-where the node has no cgroup for commands (Commands), and is not counted.
-
-`allowlist` and `user` mode commands get no Landlock rules, so an allowed
-command that talks to the Secret Service (`secret-tool`, `busctl --user`,
-`gdbus`, `dbus-send`) reads the node's keys with `keyring`; it names no
-path the protected list could refuse. This is an accepted limit (decided in
-#57), not a gap waiting for a rule:
-
-- An allow rule names a program the owner lets run as themselves, and the
-  mode that runs it is not a sandbox (`rules.md`: a deny rule is not one
-  either). A connect rule for these commands would keep one kind of program
-  off one socket, while an allowed interpreter or build tool still reads the
-  rest of what the user's account reads, with paths it builds at run time (§3, step 0).
-  It would not make any rule safe that names a program that does more.
-- Landlock on an `allowlist` command would be a second sandbox next to
-  `folder` mode's, for the one mode that runs commands as the user on
-  purpose. It would also stop the programs a rule is there to run when they
-  need the session (`ssh` with the agent in `/run/user/<uid>`, `git` with a
-  credential helper), and every `allowlist` command would need the count of
-  running commands that `folder` mode has (a domain does not change while a
-  command runs), so that the keys do not move into the keyring under one that
-  started before.
-- So the owner's rule is: no allow rule for a program that asks the keyring
-  (`secret-tool`, `busctl`, `gdbus`, `dbus-send`, `kwallet-query` and the
-  like), or the keys stay in files. `nerve-node rule ls allow` shows them.
+On a node a person runs, `allowlist` and `user` mode commands run as that
+person without Landlock, so an allowed command that talks to the Secret
+Service (`secret-tool`, `busctl --user`, `gdbus`, `dbus-send`) reads the
+node's keys with `keyring`; it names no path the protected list could
+refuse. That is an accepted limit there: the owner's rule is no allow rule
+for a program that asks the keyring, or the keys stay in files. On the
+installed node it does not arise.
 
 #### A keyring on a Linux without a desktop
 
@@ -346,13 +333,21 @@ be in the keyring (the config says so, or the owner chooses it in `setup`)
 and none answers for the node's user, `setup` asks whether to install one.
 `install` asks the same when it runs in a terminal and the config of an
 earlier install says `keyring`; without a terminal it refuses before it
-starts the service. No is the default and keeps the refusal. Yes runs, as
-root:
+starts the service. The question is asked only at a terminal: `setup` run
+by the owner without sudo goes through the owner socket, whose client tells
+the node whether its input is a terminal's (`terminal` in the request,
+`NERVE_OWNER_TERMINAL=1` for the command), and piped answers get the
+refusal. No is the default, and so is the end of the input; both keep the
+refusal. Yes runs, as root, each program by the absolute path found in
+`/usr/sbin`, `/usr/bin`, `/sbin` or `/bin`, with only `PATH` (those
+folders), `HOME=/root`, `LC_ALL=C` and `DEBIAN_FRONTEND=noninteractive` in
+its environment, in `/` and with no input:
 
-- the package manager: `apt-get update` and `apt-get install -y
-  gnome-keyring dbus-user-session` (Debian, Ubuntu), `dnf install -y
-  gnome-keyring` (Fedora, RHEL) or `pacman -S --needed --noconfirm
-  gnome-keyring` (Arch);
+- the package manager, for GNOME Keyring and what it needs, nothing it only
+  recommends: `apt-get update` and `apt-get install -y
+  --no-install-recommends gnome-keyring dbus-user-session` (Debian, Ubuntu),
+  `dnf install -y --setopt=install_weak_deps=False gnome-keyring` (Fedora,
+  RHEL) or `pacman -S --needed --noconfirm gnome-keyring` (Arch);
 - `loginctl enable-linger <user>`: the user keeps a session with its own
   D-Bus from boot on, and D-Bus starts GNOME Keyring there when the node
   asks;
@@ -373,8 +368,10 @@ would become the default for every program of that desktop.
 The keyring crate connects once per process and keeps a failure for the
 process's life. A running node reports one in its status
 (`keyring_failed`); once a keyring answers setup, installed by setup or
-not, it restarts the installed node (`systemctl restart`, then waits for
-it), and stops with a message on a node run by hand.
+not, setup run as root restarts the installed node (`systemctl restart`,
+then waits for it); run for the owner inside the node, and on a node run by
+hand, it stops with a message that asks for the restart
+(`nerve-node service restart`) and for setup again.
 
 The kernel keyring (keyutils) needs no daemon, but its keys are gone after a
 reboot, and the node's with them, so it is not used. A keyring that opens
@@ -459,7 +456,8 @@ old_pin = { pin = "<pin>", until_ms = 1790000000000 }  # after the center rotate
                             # key (protocol §4.10): its old pin, taken until then
 
 [center.policy]
-mode = "allowlist"          # allowlist | folder | user (the default is allowlist)
+mode = "folder"             # allowlist | folder | user (a new pairing: folder; a file without it: allowlist)
+as_owner = false            # allowlist only: its commands run as the owner, not as nerve-run
 until = 1790000000000  # optional, folder and user: ms since the epoch; then allowlist
 folders = [{ path = "/home/u/proj", access = "rwx" }]  # folder mode; r w x in any mix, "" for none
 places = ["/home/u/proj"]  # folders `folder add` recorded at their real place; the owner's, a center's write keeps it
@@ -799,9 +797,13 @@ change, the commands that take something away say what ends now.
 
 ### Modes
 
-- **allowlist** (the default after pairing): default deny. A call runs only
-  when an `allow` rule lets it through. `folders` do not count.
-- **folder**: full access inside the `folders` (and everything below them),
+- **allowlist**: default deny. A call runs only when an `allow` rule lets it
+  through. `folders` do not decide; on the installed Linux node, where its
+  commands run as `nerve-run` (unless `as_owner`), they and the built-in
+  `/tmp`, `/var/tmp` and the account's home are its Landlock sandbox.
+- **folder** (the mode a new pairing starts in): full access inside the
+  `folders` and, on the installed Linux node, the built-in `/tmp`,
+  `/var/tmp` and `nerve-run`'s home (and everything below them),
   by their flags. `access` is three independent flags, any combination
   (`"r"`, `"w"`, `"x"`, `"rw"`, `"rx"`, `"wx"`, `"rwx"`, `""` for none; the
   letters in any order, each once). `r` allows the read actions of `fs`
@@ -809,9 +811,11 @@ change, the commands that take something away say what ends now.
   it. The flags do not imply each other: a write needs `w` and no `r`, a read
   `r` and no `w`, a command `x` and no `r`. Where folders nest, the deepest
   one that holds a path decides for it. Commands are confined where the
-  platform can confine them; where it cannot (Linux without Landlock),
-  folder mode refuses every command and offers no `exec` action (unless the
-  sudo allow list has an entry). On Windows a command runs in an AppContainer
+  platform can confine them; where it cannot (Linux without Landlock), a
+  node run by hand refuses every command of folder mode and offers no `exec`
+  action (unless the sudo allow list has an entry), while the installed
+  Linux node runs them as `nerve-run` without Landlock, held back by that
+  account alone, and offers `exec` (`daemon::folder_refusal`). On Windows a command runs in an AppContainer
   of its pairing (named from the state folder and the pairing's `node_id`,
   so a later pairing, also of the same center or under the same name, runs
   in another one and finds none of its entries), which reaches the system folders Windows opens to every
@@ -1036,10 +1040,26 @@ The switch is never on without a working password. Turning it on takes the
 password from a client: `nerve-node sudo on` (it asks on the terminal) or a
 center with the settings grant `write` (protocol §7.4.1, sealed end to end so
 the center cannot read it). The node checks it with `sudo -S -k -v` (output
-discarded), run as the account the commands run as (§1, `machine.user` on
-the installed node, else the node's own user), so the password is that
-account's and refuses a wrong one with `invalid_args`; the switch then stays
-as it was. Turning it off drops the password. On Linux the password is kept
+discarded), run as the owner (§1: on the installed Linux node the account
+the unit names, on Windows `machine.user`, else the node's own user), so the
+password is the owner's, and refuses a wrong one with `invalid_args`; the
+switch then stays as it was. An allowed sudo command of a pairing whose
+commands run as the owner runs through sudo as the owner, with that
+password; one of a pairing whose commands run as `nerve-run` runs as root,
+started by the node itself (`/bin/sh -c '<the command>'`, the allowed line
+and nothing around it, root's group only, no Landlock), without the password
+or the sudo program. The line takes no option of sudo: a leading `-n` and
+`--` are dropped, and one that starts with any other option (`-E`, `-u`, …)
+is refused with `invalid_args` and the reason. Its environment is fixed: `PATH`
+`/usr/sbin:/usr/bin:/sbin:/bin`, and `HOME`, `USER` and `LOGNAME` of root;
+nothing of the node's. Its paths are looked at as the owner's, and its
+default folder is the owner's home, resolved as the owner like a given one. The node opens the working folder as
+the owner, a part at a time without following a link, so a link put there
+after the check fails the call; the child enters that open folder with the
+owner's file system ids (`fchdir`) and only then becomes root: it holds
+CAP_SETUID and CAP_SETGID only, so as root it has no right past a folder's
+mode until root's program runs. The folder's name never reaches the shell.
+Turning it off drops the password. On Linux the password is kept
 in memory only, whatever `secret_storage` says, so a restarted node, or
 a `node.toml` that says `on` without a password held, has the switch off. It
 never reaches a center: the node replaces every copy in an outgoing frame and
@@ -1075,9 +1095,9 @@ JSON object per line: the client sends
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
 or root may talk to it. That does not keep out a command the node runs as
-that very user (a node a person runs, with no `machine.user`) or as root:
-Landlock stops a process connecting to a socket file only from ABI 9 on, and
-`setsid` takes a process out of the tree below its command. So the node makes
+that very user (a node a person runs) or as root: Landlock does not stop a
+process connecting to a socket file, and `setsid` takes a process out of the
+tree below its command. So the node makes
 a token at each start,
 `<state>/run/ctl.token` (0600), and answers a request only if it carries it.
 The CLI reads the file and sends it. The
@@ -1095,34 +1115,12 @@ command's own processes only. Any program of the commands' account that runs
 things for whoever asks it runs them outside the sandbox, as the account's
 own process, which reads the token (and, as the node's own user, `node.toml`
 and the keys) as the CLI does; the account's session service manager and a
-terminal multiplexer are such programs, and there are more. The connect rule
-(`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`) is set only while the keys are in the
-keyring and leaves out only the node's own folders (`exec::connect_rule`), so
-it does not change that. While the commands run as the node's own user or as
-an owner, `folder` mode is therefore no boundary against that account's
-other programs: that is the owner's choice and responsibility, and the
-desktop app's account card says "Nerve's settings too" in every mode. A
-separate account for `folder` mode by default is planned (issue #142). The
-boundary is `machine.user`: the commands run as another
-account that only the node uses and that gets root in no way without a
-password: not root, not in `docker`, `lxd`, `incus-admin`, `libvirt` or
-`disk`, no `NOPASSWD` sudo, and nobody works as it and uses `sudo` or `su`
-from it (user docs, service.md "The account commands run as"). Root passes
-the socket's uid check, and an account that becomes root is root.
-`no_new_privs` and Landlock hold the command's own process tree only: a
-program the account's user manager or a tmux or screen server starts for it
-has neither, and the command can type into the tmux or screen panes of a
-person who works as the account, where sudo has a live ticket, and change
-what their shell runs. So for such an account every command is root, not
-only the sudo commands. `install` takes the account that ran `sudo`, the one
-its owner logs in as, so that default is no boundary whatever its sudo asks
-for; `setup --create-user` makes an account for the node. The node's own sudo
-calls pass `-k` and leave no ticket, so a node-only account may be a sudoer
-with a password for the sudo switch. Where `machine.user` is such an account,
-the boundary keeps out every command but a sudo command: that one runs as
-root whatever account `machine.user` names (no `no_new_privs`, and the unit
-keeps the capabilities it needs), so it reads the token, passes the uid check
-and can leave the tree.
+terminal multiplexer are such programs, and there are more. On a node a
+person runs, `folder` mode is therefore no boundary against that person's
+other programs: that is the owner's choice and responsibility. The installed
+Linux node runs no command as `nerve`, which owns the socket, the token and
+the keys: `nerve-run` and the owner pass neither the socket's uid check nor
+reach the token (§1). A sudo command is root and does.
 
 A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one
@@ -1150,7 +1148,9 @@ Methods:
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `config.accept` | | takes `node.toml` as it is after it was refused, and signs it (§1) |
-| `folder.add` | `center`, `path`, `access` | `folder add`, done by the node so that it is judged as the account commands run as (`exec::settle`): the path is followed a link at a time and must resolve to itself, the folder is stored at that place with `access` (replacing the entry there) and recorded in `policy.places`; `{stored, recorded, mode}`. An error, with nothing changed, when the path crosses a link inside a `w` folder of any center, leads nowhere, or changed while it was looked at. Where the node cannot tell either (a folder it may not look into, or a `w` folder it cannot resolve) the folder is stored as given, `recorded` is false, and a record it had stays. The CLI uses it whenever a node runs |
+| `folder.add` | `center`, `path`, `access` | `folder add`, done by the node so that it is judged as the account commands run as (`exec::settle`): the path is followed a link at a time and must resolve to itself, the folder is stored at that place with `access` (replacing the entry there) and recorded in `policy.places`; `{stored, recorded, mode, counts}` (`counts`: whether the
+center's folders hold its commands, in folder mode or as `nerve-run`). An error, with nothing changed, when the path crosses a link inside a `w` folder of any center, leads nowhere, or changed while it was looked at. Where the node cannot tell either (a folder it may not look into, or a `w` folder it cannot resolve) the folder is stored as given, `recorded` is false, and a record it had stays. The CLI uses it whenever a node runs |
+| `folder.grants` | | the installed Linux node brings the folder ACLs in line at once (§Folder ACLs) and answers what that left: `{errors, stale, failed, skipped}`; `null` elsewhere. `folder add`, `set` and `rm` ask it |
 | `reload` | | rereads `node.toml`; only a file the node signed is applied (§1) |
 | `sudo.status` | | `{sudo: "on"|"off"}` |
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
@@ -1165,9 +1165,9 @@ started for a center, the reading ones (`status`, `config.read`,
 processes that stay below the command, in any mode. A `folder` mode command
 is kept out by the token as well, including a process it left behind, as far
 as the sandbox holds (above). A command without a sandbox (`allowlist` and
-`user` mode) can read the token file as it can read `node.toml`, and a sudo
-command is root and reads it and passes the uid check, whatever account
-`machine.user` names. Both can leave the tree at once (`( … & )`,
+`user` mode) of a node a person runs can read the token file as it can read
+`node.toml`, and a sudo command is root and reads it and passes the uid
+check. Both can leave the tree at once (`( … & )`,
 `setsid -f`, a daemon fork), while the command still runs. For such a command
 the socket is no boundary at any time, as the node's files are none; the
 refusal stops what stays below it.
@@ -1241,30 +1241,29 @@ the node as a service.
 
 ### The owner endpoint
 
-The installed node also takes commands from its owners, who are no root: on
-Linux the members of the group `nerve-admin`, looked up by name at each
-request; on Windows the SIDs in the service's registry value
-`Parameters\Owners`. It serves them `/run/nerve-node/owner.sock` (0666 in the
-unit's runtime folder) or the pipe `\\.\pipe\nerve-node-owner` (DACL: SYSTEM, the
-administrators, the owners; first instance; no remote clients), with the same
-lines and two methods. On Linux a `cli` request carries `"token"`: the
-content of `owner.token` beside the socket, a new random token at each start,
-0640 for the node's user and the group `nerve-admin`, which no `folder` mode
-command can read (its folder is out of every Landlock rule of a command).
-The pipe has no token: its DACL names no package, so no AppContainer opens
-it.
+The installed node also takes commands from its owner, who is no root: on
+Linux the account the unit names (`NERVE_NODE_OWNER`, which `install` writes:
+the account that ran it), looked up by name at each request, and root; on
+Windows the SIDs in the service's registry value `Parameters\Owners`. It
+serves them `/run/nerve-node/owner.sock` (0666 in the unit's runtime folder)
+or the pipe `\\.\pipe\nerve-node-owner` (DACL: SYSTEM, the administrators, the
+owners; first instance; no remote clients), with the same lines and two
+methods. Who may run a command is decided by the account the kernel names
+for the caller (`SO_PEERCRED`); `nerve-run` is not the owner. The pipe's DACL
+names no package, so no AppContainer opens it.
 
 | Method | Params | |
 |---|---|---|
 | `status` | | `{"running": true}`, to anyone |
 | `cli` | `args`, `cwd` | runs `nerve-node --config-dir … --state-dir … <args>` as the node's user, with `NERVE_OWNER=<owner>`; then `{"ok": {}}`, the program's output as `{"out"}` and `{"err"}` lines and `{"exit": code}`; the caller sends `{"in": text}` and `{"eof": true}` |
 
-`cli` is refused to a caller who is no owner, without the token (Linux), below
-a command the node runs, with `no_new_privs` (Linux), in a command's job
-(Windows), with `--config-dir` or `--state-dir`, and for `run`, `install`,
-`update`, `uninstall`, `service`, `setup` and `sudo on`. The checks of the
-caller's process read the process that connected, which may have ended by
-the time the request comes: they are a second layer behind the token.
+`cli` is refused to a caller who is not the owner, below a command the node
+runs, with `no_new_privs` (Linux), in a command's job (Windows), with
+`--config-dir` or `--state-dir`, and for `run`, `install`, `update`,
+`uninstall`, `service` and `sudo on`, and on Windows `setup`. The checks of the caller's
+process read the process that connected, which may have ended by the time
+the request comes: they catch mistakes of a command that runs as the owner,
+no more.
 
 `backup` and `restore` take the file the caller opened itself: on Linux its
 descriptor, sent with the request line (SCM_RIGHTS), which the program gets
@@ -1285,12 +1284,61 @@ settings entries (`"user"`). Starting and stopping the service is the service
 manager's: on Linux the service helper (`/usr/local/lib/nerve-node/service-control`,
 `start|stop|restart` of the unit and nothing else) through `pkexec`, with its
 own action `org.nerve-protocol.node.service-control`, which a polkit rule
-(or on polkit 0.105 a `.pkla` file) gives `nerve-admin` in a local active
-session; the rule also gives them systemd's `manage-units` for that unit and
-those verbs (never a `.pkla` file for it, which could not name the unit).
-On Windows the service's DACL. Where `machine.user` is an owner, a command
-without a sandbox (`user`, `allowlist`) reads the token and is that owner, as
-is one that gets a process outside the node's tree and sandbox (as above).
+(or on polkit 0.105 a `.pkla` file) gives the owner (`subject.user`,
+`unix-user:`) in a local active session; the rule also gives the owner
+systemd's `manage-units` for that unit and those verbs (never a `.pkla` file
+for it, which could not name the unit). On Windows the service's DACL. A
+command that runs as the owner (`user` mode, `allowlist` with `as_owner`) is
+that owner, as is one that gets a process outside the node's tree (as
+above); one of `nerve-run` is not.
+
+### Folder ACLs
+
+On the installed Linux node `nerve-run` gets the folders of every pairing
+whose commands run as it (`acl::wanted`: not user mode, not allowlist mode
+with `as_owner`; their `exec::container_grants`, the node's own folders and the protected
+entries split out as for Landlock, joined over the pairings) as POSIX ACL
+entries (`crate::acl`): `user:nerve-run` with the folder's rights (a folder
+`r` → `r-x`, `w` → `-wx`, `x` → `--x`; a file `r`, `w`, and `x` only for a
+file someone may run already) on the folder and everything below it, and on
+each folder below the default entries `user:nerve-run` and `user:<owner>:rwx`
+(a default entry the owner had for itself is left as it is).
+The mask grows to let the entry through and is never narrowed; it goes with
+the last named entry, which gives the file its mode back. A folder of the
+owner's above a grant that others may not enter gets `user:nerve-run:--x`; a
+folder of another account's there that `nerve-run` cannot enter makes the
+grant fail. With Landlock the pass-through entry gives nothing more; without
+it, `nerve-run` reaches through it whatever below is open to others, and
+`status`'s `home_warning` says so for the owner's home (with a grant below
+it, or the home open to others). A default ACL without an entry of
+`nerve-run` is never removed; one the owner had before the grant keeps its
+plain entries and the owner's own named entry when the node's come off
+(`defaults` and `own_entries` in the record, and a folder made below one
+later), one the node made goes, also on a folder that was there below such
+a folder without one (`made_defaults`). The node writes the attributes itself
+(`system.posix_acl_access`, `system.posix_acl_default`), on its thread with
+the owner's file system ids, so only the owner's files change: links, files
+of other accounts, files with more than one name and other file systems
+below a grant are left alone. `acl.json` in the state folder records the
+uid, the owner's uid, the grants, the pass-through folders, the grants that
+failed and what of the default ACLs is the owner's (`defaults`,
+`own_entries`, `made_defaults`); a sync walks the
+grants that are new, changed, failed last time or gone (and everything when
+the uid or the owner changed). A grant that went inside one still given,
+whose path a link now crosses, is taken off by a walk of the outer grant,
+if that walk saw all of it: one that skipped a folder on another file system
+or one the owner may not list leaves the inner grant `stale`, until its own
+walk goes through.
+A sync runs at the start (also for failed grants), on each config version,
+on `folder.grants`, and before a call of `nerve-run` (`exec.run`, `fs`),
+where a failed grant is tried again at most once a minute (`ACL_RETRY`).
+The call is refused while an entry that should have come off is left
+(`stale`), for every pairing of `nerve-run`. `uninstall` takes every
+recorded entry off as root before it removes `nerve-run`, outer grants
+first (an outer walk counts for the grants inside only as above), gives what `nerve-run` owns below the grants to the owner (to root
+when the owner's account is gone) but for what is no folder and has more
+than one name (it may lie outside every grant, and ownership goes with the
+file; counted, and `uninstall` says how many), and stops if an entry stays.
 
 ## 6. Audit log
 

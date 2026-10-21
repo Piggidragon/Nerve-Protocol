@@ -65,8 +65,9 @@ not backed up) and without its MAC line. The MAC key
 so the node that restores makes its own and signs the restored config with it.
 
 A backup is trusted as far as its passphrase: it carries every setting of
-`node.toml`, `providers.allowed`, `machine.sudo_path` and `machine.user`
-among them. The user page tells the owner to restore only a file they made;
+`node.toml`, `providers.allowed`, `machine.sudo_path` and (Windows)
+`machine.user` among them. The Linux node's owner is the unit's, not in the
+file. The user page tells the owner to restore only a file they made;
 the program cannot tell it from one that someone else made with a passphrase
 they know.
 
@@ -149,8 +150,7 @@ does not vouch for the header values, a keyring that cannot be asked stops the
 restore ("cannot read the proxy's header values ... to check whose they are"),
 with nothing written. The remedies are `--without-proxy`, a keyring that
 answers (`nerve-node setup` installs one only if the owner answers `keyring`
-where it asks where the keys go, and none below Landlock ABI 9; the message
-says which case it is, by `secrets::no_keyring`) or a backup of a node whose
+where it asks where the keys go) or a backup of a node whose
 proxy has no header values. A backup made with `--include-keyring` is no
 remedy: writing the values into the keyring asks the same keyring.
 

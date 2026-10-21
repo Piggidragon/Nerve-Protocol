@@ -8,6 +8,8 @@
 //! process with [`daemon::Daemon::start`] and pair with [`pair::pair`].
 
 pub mod account;
+#[cfg(target_os = "linux")]
+pub mod acl;
 pub mod backup;
 mod caller_file;
 pub mod cgroup;

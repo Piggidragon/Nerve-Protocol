@@ -350,6 +350,8 @@ async fn an_owner_change_through_the_local_interface_is_applied_and_signed() {
     nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
         .await
         .unwrap();
+    // From allowlist, as the change below is to folder mode.
+    cli(&o.paths, &["mode", "set", "allowlist"]).await.unwrap();
     let node = Daemon::start(o.clone()).await.unwrap();
     let file = o.paths.config_file();
     let work = o.home.join("work");

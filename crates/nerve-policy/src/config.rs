@@ -123,9 +123,11 @@ pub struct Machine {
     pub sudo_path: Option<String>,
     #[serde(default)]
     pub secret_storage: SecretStorage,
-    /// The account `user` mode runs commands as, on a node that can switch
-    /// accounts (the installed service). Unset, they run as the node's own
-    /// user; the installed service then runs none.
+    /// Windows: the account the installed node runs commands as, which
+    /// `install` takes with its password. Unset, they run as the node's own
+    /// user; the installed service then runs none. Linux does not read it:
+    /// there commands run as `nerve-run` or as the owner, the account that
+    /// ran `install`, and `nerve-node config set` refuses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
@@ -686,12 +688,13 @@ impl CenterEntry {
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Default deny: a call runs only when an allow rule lets it through.
-    /// What a new center starts in.
+    /// What a pairing whose file names no mode is in, and where `folder` and
+    /// `user` fall back to when their time runs out.
     #[default]
     Allowlist,
     /// Full access inside the folders, by their flags: reading where `r` is
     /// set, writing where `w` is, commands where `x` is, in the folders and
-    /// everything below them.
+    /// everything below them. What a new pairing starts in.
     Folder,
     /// Full access as the user, protected paths aside.
     User,
@@ -893,12 +896,11 @@ pub struct CenterPolicy {
     /// is followed wherever its path leads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub places: Vec<String>,
-    /// The `sockets` list of a pre-release of the desktop app (socket files a
-    /// `folder` mode command could reach outside its folders), which is gone:
-    /// read and dropped, so a file or a center's document that has it still
-    /// loads, and never written back.
-    #[serde(default, rename = "sockets", skip_serializing)]
-    pub dropped_sockets: serde::de::IgnoredAny,
+    /// `allowlist` mode only: its commands run as the owner's account
+    /// instead of the installed node's account `nerve-run`, without the
+    /// folders' sandbox ([`CenterPolicy::runs_as_owner`]).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub as_owner: bool,
     /// `cap` or `cap.action` → setting; `cap.action` wins over `cap`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub caps: BTreeMap<String, CapSetting>,
@@ -976,6 +978,18 @@ impl CenterPolicy {
         match self.mode {
             Mode::Folder | Mode::User if self.until.is_some_and(|u| u <= now_ms) => Mode::Allowlist,
             m => m,
+        }
+    }
+
+    /// Whether the commands of this pairing run as the owner's account at
+    /// `now_ms` on the installed node: in `user` mode, and in `allowlist`
+    /// mode with `as_owner`. Every other command runs as `nerve-run`, in
+    /// the folders' sandbox.
+    pub fn runs_as_owner(&self, now_ms: u64) -> bool {
+        match self.mode_at(now_ms) {
+            Mode::User => true,
+            Mode::Allowlist => self.as_owner,
+            Mode::Folder => false,
         }
     }
 
@@ -1887,7 +1901,7 @@ sudo_allow = ["sudo apt update"]
     }
 
     #[test]
-    fn the_account_of_user_mode_is_an_account_name() {
+    fn the_account_of_the_commands_on_windows_is_an_account_name() {
         let c = NodeConfig::parse("[machine]\nuser = \"alice.b\"\n").unwrap();
         assert_eq!(c.machine.user.as_deref(), Some("alice.b"));
         assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
@@ -1908,18 +1922,27 @@ sudo_allow = ["sudo apt update"]
         assert_eq!(NodeConfig::parse(&on.to_toml()).unwrap(), on);
     }
 
-    /// A pairing's `sockets` of a pre-release still loads, and is gone once
-    /// the file is written again.
+    /// `as_owner` is written only where it is set, and only allowlist mode
+    /// runs as the owner by it; user mode always does, folder mode never.
     #[test]
-    fn a_file_with_the_dropped_sockets_list_loads_without_it() {
-        let c = NodeConfig::parse(&center(
-            "mode = \"folder\"\nsockets = [\"/run/docker.sock\"]",
-        ))
-        .unwrap();
+    fn a_pairing_runs_as_the_owner_in_user_mode_and_by_choice_in_allowlist() {
+        let c = NodeConfig::parse(&center("mode = \"allowlist\"\nas_owner = true")).unwrap();
         let p = &c.centers[0].policy;
-        assert_eq!(p.mode, Mode::Folder);
-        assert!(!c.to_toml().contains("sockets"), "{}", c.to_toml());
+        assert!(p.as_owner && p.runs_as_owner(0));
         assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
+        let mut p = CenterPolicy::default();
+        assert!(!c.to_toml().contains("as_owner = false"));
+        assert!(!p.runs_as_owner(0));
+        p.mode = Mode::User;
+        assert!(p.runs_as_owner(0));
+        p.mode = Mode::Folder;
+        p.as_owner = true;
+        assert!(!p.runs_as_owner(0), "folder mode always runs as nerve-run");
+        // A user mode whose time ran out is allowlist again.
+        p.mode = Mode::User;
+        p.as_owner = false;
+        p.until = Some(5);
+        assert!(p.runs_as_owner(4) && !p.runs_as_owner(5));
     }
 
     #[test]

@@ -170,14 +170,12 @@ pub(super) async fn command(
 }
 
 /// Whether the node's keys could go into the system keyring here: where
-/// `setup` would not offer it (`reason` `windows-service` or
-/// `old-landlock`), and whether a keyring answers for the account the node
+/// `setup` would not offer it (`reason` `windows-service`), and whether a keyring answers for the account the node
 /// runs as (`no-answer`); `why` says it in words.
 fn keyring_here(paths: &NodePaths) -> Value {
     if let Some(n) = crate::secrets::no_keyring(paths) {
         let reason = match n {
             crate::secrets::NoKeyring::WindowsService => "windows-service",
-            crate::secrets::NoKeyring::OldLandlock(_) => "old-landlock",
         };
         return json!({ "usable": false, "reason": reason, "why": n.why() });
     }
@@ -229,7 +227,7 @@ async fn status(paths: &NodePaths) -> Result<Value, String> {
         "daemon": "not running",
         "version": cfg.version,
         "locked": cfg.locked,
-        "account": cfg.machine.user,
+        "owner": crate::service::owner_of(paths),
         "sudo": if sudo_is_on(paths).await? { "on" } else { "off" },
         "command_limits": crate::cgroup::status(
             &cfg.limits.command,
@@ -246,6 +244,7 @@ fn center(paths: &NodePaths, c: &nerve_policy::CenterEntry, now: u64) -> Value {
         "url": c.url,
         "mode": c.policy.mode_at(now).as_str(),
         "until": c.policy.until,
+        "as_owner": c.policy.as_owner,
         "settings": c.settings,
         "paused": c.paused,
         "revoked": c.revoked,

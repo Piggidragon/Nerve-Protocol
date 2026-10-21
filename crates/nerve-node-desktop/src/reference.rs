@@ -52,7 +52,7 @@ const COMMANDS: &[(&str, &str, Place)] = &[
     ),
     (
         "setup",
-        "sudo nerve-node setup",
+        "nerve-node setup",
         (
             Some(Page::Overview),
             -1,

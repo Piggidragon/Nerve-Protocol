@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use serde_json::Value;
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use super::{Choose, Ctl, now_ms};
 use crate::{Load, Perm, Tone, view};
@@ -61,10 +61,85 @@ impl Ctl {
             .find(|c| c["name"] == center.as_str())
             .cloned()
             .unwrap_or(Value::Null);
+        // The installed Linux node runs folder and allowlist mode as
+        // nerve-run (nerve_node::account): it names its owner, and a
+        // pairing's account, also when `install` found no owner.
+        let run = nerve_node::account::RUN_USER;
+        let account = c["account"].as_str().unwrap_or_default().to_string();
+        let separate = cfg!(target_os = "linux")
+            && (st["owner"].is_string()
+                || st["centers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|c| c["account"] == run));
+        let built_in = if cfg!(target_os = "linux") && account == run {
+            format!(
+                "/tmp, /var/tmp and its home {}",
+                nerve_node::account::RUN_HOME
+            )
+        } else {
+            String::new()
+        };
+        // Access nerve-run keeps although it should have lost it, which
+        // stops every command of it, goes on every center that runs as it;
+        // the failed grants of this center's folders on this one alone: the
+        // node's lists are for all of them.
+        let texts = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        };
+        let errors = texts(&st["folder_grants"]["errors"]);
+        let stale = texts(&st["folder_grants"]["stale"]);
+        let (stale, errors) = view::stale_grants(&stale, &errors);
+        let folders: Vec<String> = self
+            .with_perm(|p| p.get_folders().iter().map(|f| f.path.to_string()).collect())
+            .unwrap_or_default();
+        let (stale, errors) = if account == run {
+            (
+                stale,
+                view::grant_errors_for(&errors, &folders, &nerve_node::paths::home_dir()),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         self.with_perm(|p| {
             p.set_mode(c["mode"].as_str().unwrap_or_default().into());
             p.set_mode_until(view::mode_until(&c, now_ms()).into());
+            p.set_separate(separate);
+            p.set_account(account.as_str().into());
+            p.set_as_owner(c["as_owner"] == true);
+            p.set_built_in(built_in.as_str().into());
+            p.set_grant_errors(errors.join("\n").into());
+            p.set_stale(stale.join("\n").into());
+            // A pairing of the installed Linux node that runs as nerve-run
+            // says whether Landlock holds it; any other shows nothing.
+            p.set_landlock(c["landlock"] != false);
+            p.set_home_warning(
+                st["home_warning"]["warning"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+            );
         });
+    }
+
+    /// Allowlist mode as the owner (`mode set allowlist --as-owner`), or as
+    /// nerve-run again.
+    fn as_owner_set(self: &Rc<Self>, on: bool) {
+        let center = self.perm_center();
+        let mut args = vec!["mode".into(), "set".into(), "allowlist".into()];
+        let said = if on {
+            args.push("--as-owner".into());
+            format!("{center}'s allowed commands run as you.")
+        } else {
+            format!("{center}'s allowed commands run as nerve-run.")
+        };
+        self.perm_change(args, None, said, |_| {}, |c, e| c.toast(e, Tone::Danger));
     }
 
     pub(super) fn perm_load(self: &Rc<Self>) {
@@ -128,6 +203,8 @@ impl Ctl {
                     p.set_load(Load::Ready);
                     p.set_error(SharedString::new());
                 });
+                // Its failed grants follow its folders.
+                self.perm_mode();
             }
             Err(e) => {
                 self.with_perm(|p| {
@@ -169,6 +246,11 @@ impl Ctl {
 
     fn mode_pick(self: &Rc<Self>, mode: &str) {
         if mode == "allowlist" {
+            // The tile of the mode it is in: nothing to change, and setting
+            // it again would turn "Run them as you" off.
+            if self.with_perm(|p| p.get_mode() == "allowlist") == Some(true) {
+                return;
+            }
             let center = self.perm_center();
             self.perm_change(
                 vec!["mode".into(), "set".into(), "allowlist".into()],
@@ -521,6 +603,8 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     p.on_mode_pick(move |m| c.mode_pick(&m));
     let c = ctl.clone();
     p.on_mode_apply(move || c.mode_apply());
+    let c = ctl.clone();
+    p.on_as_owner_set(move |on| c.as_owner_set(on));
     let c = ctl.clone();
     p.on_folder_choose(move || c.folder_choose());
     let c = ctl.clone();

@@ -59,7 +59,7 @@ pub enum Cmd {
     /// Choose the folders a center may use and what it may do in each.
     #[command(subcommand)]
     Folder(FolderCmd),
-    /// Choose how much a center may do: only what allow rules name, what each folder allows, or all you can do.
+    /// Choose how much a center may do: only what allow rules name, what each folder allows (as nerve-run, an account of its own), or all you can do (as you).
     #[command(subcommand)]
     Mode(ModeCmd),
     /// Keep the lists of commands that are allowed, forbidden or run with sudo.
@@ -118,17 +118,10 @@ pub enum Cmd {
     Panic,
     /// Let the node work again after `panic`.
     Unlock,
-    /// Install the node as a service that starts with the machine and runs under a user of its own (Linux as root, Windows as administrator).
+    /// Install the node as a service that starts with the machine and runs under a user of its own, make the account nerve-run for its commands and take you as the owner (Linux with sudo from your own account, Windows as administrator).
     Install,
-    /// Name the node, choose the account commands run as (installed node), choose where the node keeps its keys, pair the first center and choose its mode, one question at a time.
-    Setup {
-        /// Run commands as this account instead of asking, and make it if it is not there: a group and a home (/home/NAME) of its own, no login (installed node).
-        #[arg(long, value_name = "NAME")]
-        create_user: Option<String>,
-        /// With --create-user: only choose (and make) that account, and ask nothing else.
-        #[arg(long, requires = "create_user")]
-        account_only: bool,
-    },
+    /// Name the node, choose where it keeps its keys, pair the first center and choose its mode and folder, one question at a time.
+    Setup,
     /// Replace the installed program with the latest release and restart the service; config, keys and audit log stay.
     Update {
         /// Take the new program from this file instead of downloading the latest release.
@@ -138,7 +131,7 @@ pub enum Cmd {
     /// Start, stop or restart the installed service, or show its state.
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// Stop and remove the service, its user and the program; the config and state folders stay.
+    /// Stop and remove the service, nerve-run and its entries on your folders, the node's user and the program; the config and state folders stay.
     Uninstall {
         /// Delete the config and state folders too: the keys, the pairings and the audit log.
         #[arg(long)]
@@ -221,14 +214,19 @@ pub enum CenterCmd {
 pub enum ModeCmd {
     /// Pick allowlist, folder or user mode.
     Set {
-        /// `allowlist` (only what an allow rule names), `folder` (what each
-        /// folder's rights allow) or `user` (anything you could do yourself,
-        /// protected files aside).
+        /// `allowlist` (only what an allow rule names, as nerve-run), `folder`
+        /// (what each folder's rights allow, as nerve-run, the default) or
+        /// `user` (anything you could do yourself, as you, protected files
+        /// aside).
         mode: String,
         /// Go back to allowlist after this many hours (folder and user mode
         /// otherwise stay until you change them).
         #[arg(long = "for", value_name = "HOURS")]
         for_hours: Option<u64>,
+        /// With allowlist: run the allowed commands as you instead of as
+        /// nerve-run, outside the folders' sandbox (installed node, Linux).
+        #[arg(long)]
+        as_owner: bool,
         #[command(flatten)]
         center: CenterArg,
     },
@@ -321,7 +319,7 @@ pub enum CapCmd {
 
 #[derive(Debug, Subcommand, Clone, Copy)]
 pub enum ServiceCmd {
-    /// Start the installed service; an owner of the node needs no root or administrator for it.
+    /// Start the installed service; the owner needs no root or administrator for it.
     Start,
     /// Stop it: the node ends its links and runs nothing until it starts again, at the latest with the machine.
     Stop,
@@ -1451,7 +1449,7 @@ impl Cmd {
 /// installed node's belong to `nerve`, runs as that user
 /// ([`crate::service::become_owner`]), so that what it writes stays the
 /// node's. install, update and uninstall keep root; setup keeps it as its
-/// saved id, to make the account of the commands when the owner asks.
+/// saved id, to restart the node once a keyring it installed answers.
 pub fn settle_user(cli: &Cli) -> Result<(), String> {
     #[cfg(unix)]
     STARTED_AS.get_or_init(own_real_uid);
@@ -1474,7 +1472,7 @@ pub fn settle_user(cli: &Cli) -> Result<(), String> {
             _ => {}
         }
     }
-    crate::service::become_owner(&paths, matches!(cli.cmd, Cmd::Setup { .. }))
+    crate::service::become_owner(&paths, matches!(cli.cmd, Cmd::Setup))
 }
 
 /// Set by the desktop app's broker on Windows for the commands it runs: the
@@ -1872,62 +1870,8 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Status => {
             // On Windows the node answers over its control pipe.
             if let Some(v) = live_status(&paths).await? {
-                w(
-                    out,
-                    format!(
-                        "daemon: running (confinement {})",
-                        v["confinement"].as_str().unwrap_or("?")
-                    ),
-                );
-                if let Some(why) = v["folder_commands_off"].as_str() {
-                    w(out, format!("folder mode runs no command: {why}"));
-                }
-                for line in limits_lines(&v["command_limits"]) {
+                for line in status_lines(&v) {
                     w(out, line);
-                }
-                if v["locked"] == true {
-                    w(
-                        out,
-                        "LOCKED (panic): nothing runs until `nerve-node unlock`".into(),
-                    );
-                }
-                for c in v["centers"].as_array().into_iter().flatten() {
-                    w(
-                        out,
-                        format!(
-                            "{}  {}  mode {}",
-                            c["name"].as_str().unwrap_or_default(),
-                            c["status"].as_str().unwrap_or_default(),
-                            c["mode"].as_str().unwrap_or_default(),
-                        ),
-                    );
-                }
-                for p in v["providers"].as_array().into_iter().flatten() {
-                    let caps: Vec<&str> = p["capabilities"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect();
-                    w(
-                        out,
-                        format!(
-                            "provider {} attached: {}",
-                            p["name"].as_str().unwrap_or_default(),
-                            caps.join(", ")
-                        ),
-                    );
-                }
-                let relay = &v["relay"];
-                if relay["listen"].is_string() {
-                    let tunnels = relay["tunnels"].as_array().map_or(0, Vec::len);
-                    w(
-                        out,
-                        format!(
-                            "relay: {}, {tunnels} tunnels open (`nerve-node relay ls` names them)",
-                            relay["status"].as_str().unwrap_or_default()
-                        ),
-                    );
                 }
                 return Ok(());
             }
@@ -1955,8 +1899,9 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Mode(ModeCmd::Set {
             mode,
             for_hours,
+            as_owner,
             center,
-        }) => set_mode(&paths, &mode, for_hours, &center, out).await,
+        }) => set_mode(&paths, &mode, for_hours, as_owner, &center, out).await,
         Cmd::Folder(FolderCmd::Add {
             path,
             rights,
@@ -1986,6 +1931,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                         .into(),
                 );
             }
+            tell_grants(&paths, out).await;
             Ok(())
         }
         Cmd::Folder(FolderCmd::Rm { path, center }) => {
@@ -1995,6 +1941,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             })
             .await?;
             w(out, format!("{}: removed {}", a.center, a.path));
+            tell_grants(&paths, out).await;
             Ok(())
         }
         Cmd::Folder(FolderCmd::Ls { center }) => {
@@ -2196,18 +2143,8 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 )
             }
         }
-        Cmd::Setup {
-            create_user,
-            account_only,
-        } => {
+        Cmd::Setup => {
             owner_check(&[&paths]).await?;
-            // Windows takes the account of the commands, and its password,
-            // at install.
-            if cfg!(windows) && create_user.is_some() {
-                return Err(
-                    "on Windows the account commands run as is the one that runs `nerve-node install`, which asks for its password; --create-user does not go with it".into(),
-                );
-            }
             let mut input = std::io::BufReader::new(std::io::stdin());
             let layout = Layout::system();
             let machine = (!cfg!(windows) && layout.installed() && paths == layout.paths)
@@ -2220,19 +2157,11 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 },
                 None => crate::keyring_setup::HostKeyring::this_program(),
             };
-            let ask = |name| Setup {
-                create_user: name,
-                account_only,
-            };
-            setup(
-                &paths,
-                machine,
-                ask(create_user.as_deref()),
-                &keyring,
-                &mut input,
-                out,
-            )
-            .await
+            // Asked whether to install a keyring as root only at a
+            // terminal: the owner's own, for a setup the node runs for its
+            // owner (crate::owner).
+            let terminal = crate::owner::at_terminal();
+            setup(&paths, machine, &keyring, &mut input, terminal, out).await
         }
         Cmd::Update { from } => {
             let layout = Layout::system();
@@ -2241,7 +2170,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             return crate::winsvc::update(&layout, &crate::win_host::WinHost, from.as_deref(), out)
                 .await;
             #[cfg(not(windows))]
-            crate::service::update(&layout, &Host, from.as_deref(), &invoker(), out).await
+            crate::service::update(&layout, &Host, from.as_deref(), out).await
         }
         Cmd::Service(ServiceCmd::Status) => {
             let v = service_status(&Layout::system())?;
@@ -2315,35 +2244,139 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
     }
 }
 
-/// `setup`: the first-run steps in the terminal: the node's name, where it
-/// keeps its keys, its first center and that center's mode. Each answer is
-/// saved when it is given,
-/// through the same owner path as the other commands (the running node, or
-/// the signed `node.toml`), so setup can stop anywhere and run again; Enter
-/// keeps what is there. The steps done are audited. `machine` is there on
-/// the installed node, where setup also chooses the account of the
-/// commands: `create_user` names it (and makes it) instead of asking. Keys
-/// in the system keyring need one that answers; `keyring` checks it, and
-/// installs one when the owner says so ([`crate::keyring_setup`]).
-/// What `setup` was told on its command line.
-#[derive(Clone, Copy, Default)]
-pub struct Setup<'a> {
-    /// The account commands run as, made if it is not there.
-    pub create_user: Option<&'a str>,
-    /// Choose that account and end, asking nothing.
-    pub account_only: bool,
+/// What `status` says of a running node, from its `status` answer `v`, a
+/// line each.
+fn status_lines(v: &Value) -> Vec<String> {
+    let mut lines = vec![format!(
+        "daemon: running (confinement {})",
+        v["confinement"].as_str().unwrap_or("?")
+    )];
+    if let Some(why) = v["folder_commands_off"].as_str() {
+        lines.push(format!("folder mode runs no command: {why}"));
+    }
+    lines.extend(limits_lines(&v["command_limits"]));
+    if v["locked"] == true {
+        lines.push("LOCKED (panic): nothing runs until `nerve-node unlock`".into());
+    }
+    if let Some(o) = v["owner"].as_str() {
+        lines.push(format!("owner: {o}"));
+    }
+    if let Some(h) = v["home_warning"]["warning"].as_str() {
+        lines.push(format!("warning: {h}"));
+    }
+    lines.extend(
+        grant_lines(&v["folder_grants"])
+            .into_iter()
+            .map(|l| format!("warning: {l}")),
+    );
+    for c in v["centers"].as_array().into_iter().flatten() {
+        // The installed node says as whom its commands run. Where Landlock
+        // is missing nerve-run runs without it.
+        let whom = match c["account"].as_str() {
+            Some(a) if a == crate::account::RUN_USER && c["landlock"] == false => {
+                format!(", as {a}, without Landlock")
+            }
+            Some(a) => format!(", as {a}"),
+            None => String::new(),
+        };
+        lines.push(format!(
+            "{}  {}  mode {}{whom}",
+            c["name"].as_str().unwrap_or_default(),
+            c["status"].as_str().unwrap_or_default(),
+            c["mode"].as_str().unwrap_or_default(),
+        ));
+    }
+    for p in v["providers"].as_array().into_iter().flatten() {
+        let caps: Vec<&str> = p["capabilities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        lines.push(format!(
+            "provider {} attached: {}",
+            p["name"].as_str().unwrap_or_default(),
+            caps.join(", ")
+        ));
+    }
+    let relay = &v["relay"];
+    if relay["listen"].is_string() {
+        let tunnels = relay["tunnels"].as_array().map_or(0, Vec::len);
+        lines.push(format!(
+            "relay: {}, {tunnels} tunnels open (`nerve-node relay ls` names them)",
+            relay["status"].as_str().unwrap_or_default()
+        ));
+    }
+    lines
 }
 
+/// The texts of `v`, a list of strings.
+fn texts(v: &Value) -> Vec<&str> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+/// Whether the error `e` of a folder grant (`<path>: <why>`) is about
+/// `path` or something below it.
+fn error_about(e: &str, path: &str) -> bool {
+    e.strip_prefix(path)
+        .is_some_and(|rest| rest.starts_with(':') || rest.starts_with('/'))
+}
+
+/// What the node's folder grants (`status`'s `folder_grants`, the answer of
+/// `folder.grants`) say, a line each. Access `nerve-run` keeps although it
+/// should have lost it (`stale`) comes first, as no command of it runs
+/// until it is off; then the grants it did not get whole.
+fn grant_lines(g: &Value) -> Vec<String> {
+    let stale = texts(&g["stale"]);
+    let errors = texts(&g["errors"]);
+    let mut lines = Vec::new();
+    for p in &stale {
+        let why: Vec<&str> = errors
+            .iter()
+            .copied()
+            .filter(|e| error_about(e, p))
+            .collect();
+        lines.push(format!(
+            "nerve-run keeps its access to {p}, which it should have lost; no command of nerve-run runs until it is taken off{}",
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", why.join("; "))
+            }
+        ));
+    }
+    for e in errors
+        .iter()
+        .filter(|e| !stale.iter().any(|p| error_about(e, p)))
+    {
+        lines.push(format!("nerve-run did not get every folder: {e}"));
+    }
+    lines
+}
+
+/// `setup`: the first-run steps in the terminal: the node's name, where it
+/// keeps its keys, its first center, that center's mode and a folder. Each
+/// answer is saved when it is given, through the same owner path as the
+/// other commands (the running node, or the signed `node.toml`), so setup
+/// can stop anywhere and run again; Enter keeps what is there. The steps
+/// done are audited. `machine` is there on the installed node, which setup
+/// restarts once a keyring it installed answers. Keys in the system keyring
+/// need one that answers; `keyring` checks it, and installs one when the
+/// owner says yes to it at a terminal (`terminal`, [`crate::keyring_setup`]).
 pub async fn setup(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
-    told: Setup<'_>,
     keyring: &dyn crate::keyring_setup::Keyring,
     input: &mut dyn BufRead,
+    terminal: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let mut steps = Vec::new();
-    let r = setup_steps(paths, machine, told, keyring, input, out, &mut steps).await;
+    let r = setup_steps(paths, machine, keyring, input, terminal, out, &mut steps).await;
     let log = AuditLog::new(paths.audit_log());
     if let Err(e) = log.node("setup", &steps, r.as_ref().err().map(String::as_str)) {
         let _ = writeln!(out, "the audit log cannot be written: {e}");
@@ -2363,7 +2396,10 @@ async fn after_keyring_answers(
 ) -> Result<(), String> {
     #[cfg(unix)]
     match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
-        Ok(status) => return restart_for_keyring(&status, paths, machine, out),
+        Ok(status) => {
+            let for_owner = crate::owner::owner_running().is_some();
+            return restart_for_keyring(&status, paths, machine, for_owner, out);
+        }
         Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
         Err(e) => {
             let _ = writeln!(
@@ -2378,16 +2414,23 @@ async fn after_keyring_answers(
     Ok(())
 }
 
-/// What [`after_keyring_answers`] does with the running node's `status`.
+/// What [`after_keyring_answers`] does with the running node's `status`;
+/// `for_owner`: setup runs in the node, for its owner (crate::owner).
 #[cfg_attr(not(unix), allow(dead_code))]
 fn restart_for_keyring(
     status: &Value,
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
+    for_owner: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     if status["keyring_failed"] != true {
         return Ok(());
+    }
+    // Run by the node for its owner, setup would end with the node it runs
+    // in.
+    if for_owner {
+        return Err("the system keyring answers now, but the node found none when it started and does not look again until it is restarted; `nerve-node service restart`, then run `nerve-node setup` again".into());
     }
     let Some(sys) = machine else {
         return Err("the system keyring answers now, but the node that runs for this folder found none before and does not look again until it is restarted; restart it, then run `nerve-node setup` again".into());
@@ -2401,67 +2444,28 @@ fn restart_for_keyring(
     Ok(())
 }
 
-/// Saves the account setup chose for the commands, if it chose one.
-async fn account_chosen(
-    paths: &NodePaths,
-    chosen: Option<crate::service::Chosen>,
-    out: &mut dyn Write,
-    steps: &mut Vec<String>,
-) -> Result<(), String> {
-    let Some(c) = chosen else {
-        return Ok(());
-    };
-    if c.made {
-        steps.push(format!("made the account {}", c.name));
-    }
-    edit(paths, |cfg| {
-        cfg.machine.user = Some(c.name.clone());
-        Ok(())
-    })
-    .await?;
-    let _ = writeln!(out, "commands run as {}", c.name);
-    steps.push(format!("commands run as {}", c.name));
-    Ok(())
-}
-
 async fn setup_steps(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
-    told: Setup<'_>,
     keyring: &dyn crate::keyring_setup::Keyring,
     input: &mut dyn BufRead,
+    terminal: bool,
     out: &mut dyn Write,
     steps: &mut Vec<String>,
 ) -> Result<(), String> {
-    let create_user = told.create_user;
-    if create_user.is_some() && machine.is_none() {
-        return Err(
-            "--create-user chooses the account commands run as on a node installed as a service (`sudo nerve-node install`); this node runs them as its own user".into(),
-        );
-    }
     // Keys in a keyring that does not answer: nothing can be read, so that
     // comes first, also where the keys may not stay there, so that they can go
     // into files below. The installed node on Windows asks none: the keyring
     // setup reaches is not the service's.
     let no_keyring = crate::secrets::no_keyring(paths);
-    if !told.account_only
-        && crate::secrets::stated_storage(paths) == SecretStorage::Keyring
+    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring
         && no_keyring != Some(crate::secrets::NoKeyring::WindowsService)
     {
         let me = crate::keyring_setup::me()?;
-        crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
+        crate::keyring_setup::ensure(keyring, &me, terminal.then_some(&mut *input), out)?;
         after_keyring_answers(paths, machine, out).await?;
     }
     let (cfg, _) = read_config(paths).await?;
-    if let (Some(sys), Some(name)) = (machine, create_user) {
-        let c = crate::service::create_account(sys, paths, name, &invoker(), out)?;
-        let chosen = (c.made || cfg.machine.user.as_deref() != Some(name)).then_some(c);
-        account_chosen(paths, chosen, out, steps).await?;
-        // A program that sets the account alone, such as the desktop app.
-        if told.account_only {
-            return Ok(());
-        }
-    }
     let _ = writeln!(out, "Set up this node. Enter keeps what is in [brackets].");
     let current = crate::descriptor::node_name(&cfg);
     let name = ask(
@@ -2483,36 +2487,14 @@ async fn setup_steps(
         steps.push(format!("named the node {name}"));
     }
 
-    // The account of the commands, where the node can switch to one: the
-    // installed service. Named on the command line, it was chosen first.
-    if let Some(sys) = machine
-        && create_user.is_none()
-    {
-        let who = invoker();
-        let suggested = Some(who.as_str()).filter(|u| *u != "root");
-        let chosen = crate::service::choose_account(
-            sys,
-            paths,
-            cfg.machine.user.as_deref(),
-            suggested,
-            &who,
-            input,
-            out,
-        )?;
-        account_chosen(paths, chosen, out, steps).await?;
-    }
-
     // Where the keys go, before pairing makes one. Where they may not be in
-    // the keyring (the installed node on Windows, an old Landlock), setup
-    // does not ask; it says why.
+    // the keyring (the installed node on Windows), setup does not ask; it
+    // says why.
     let now = read_config(paths).await?.0.machine.secret_storage;
     let storage = if let Some(n) = no_keyring {
         let _ = writeln!(out, "Warning: {}.", n.why());
         SecretStorage::File
     } else {
-        if crate::secrets::landlock(paths) == crate::secrets::Landlock::Unknown {
-            let _ = writeln!(out, "{LANDLOCK_UNKNOWN}");
-        }
         let answer = ask(
             input,
             out,
@@ -2529,7 +2511,7 @@ async fn setup_steps(
     if storage != now {
         if storage == SecretStorage::Keyring {
             let me = crate::keyring_setup::me()?;
-            crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
+            crate::keyring_setup::ensure(keyring, &me, terminal.then_some(&mut *input), out)?;
             after_keyring_answers(paths, machine, out).await?;
         }
         let cfg = edit(paths, |c| {
@@ -2593,7 +2575,7 @@ async fn setup_steps(
         input,
         out,
         &format!(
-            "Mode for {center}: allowlist (only what allow rules name), folder (the folders you give it) or user (all you may do) [{now}]: "
+            "Mode for {center}: folder (the folders you give it, as nerve-run), allowlist (only what allow rules name) or user (all you may do, as you) [{now}]: "
         ),
     )?;
     let mode = if mode.is_empty() { now.clone() } else { mode };
@@ -2601,7 +2583,7 @@ async fn setup_steps(
         center: Some(center.clone()),
     };
     if mode != now {
-        set_mode(paths, &mode, None, &which, out).await?;
+        set_mode(paths, &mode, None, false, &which, out).await?;
         steps.push(format!("{center}: mode {mode}"));
     }
     if mode == "folder" {
@@ -2614,10 +2596,12 @@ async fn setup_steps(
             let rights = ask(
                 input,
                 out,
-                "What it may do there: +r reads, +w writes, +x runs commands, as in `+r +x` [+r]: ",
+                "What it may do there: +r reads, +w writes, +x runs commands, as in `+r +x` [+rwx]: ",
             )?;
+            // Folder mode runs a command only where it may run one, so
+            // Enter gives a folder commands can work in.
             let rights: Vec<String> = if rights.is_empty() {
-                vec!["+r".into()]
+                vec!["+rwx".into()]
             } else {
                 rights.split_whitespace().map(str::to_string).collect()
             };
@@ -2627,15 +2611,10 @@ async fn setup_steps(
     }
     let _ = writeln!(
         out,
-        "Done. `nerve-node rule add allow '<command>'` allows one command; `nerve-node --help` lists the rest."
+        "Done. `nerve-node folder add <folder> +rwx` gives a folder, `nerve-node rule add allow '<command>'` allows a command in allowlist mode; `nerve-node --help` lists the rest."
     );
     Ok(())
 }
-
-/// Setup's warning where the kernel's Landlock ABI cannot be read: below
-/// ABI 9 the keys would not be allowed in the keyring
-/// (crate::secrets::keyring_old_landlock), and here nobody can tell.
-const LANDLOCK_UNKNOWN: &str = "Warning: the Landlock ABI of this kernel cannot be read (Landlock is missing or off), so setup cannot tell whether the node's keys may be in the system keyring. On a kernel below Landlock ABI 9 a folder mode command cannot run programs from its folders while the keys are in the keyring: the sandbox cannot grant the keyring's access and execute together. Unless you know this kernel has ABI 9 or later, keep the keys in files (file).";
 
 /// How setup names where the keys are.
 fn storage_place(s: SecretStorage) -> &'static str {
@@ -2667,6 +2646,7 @@ async fn set_mode(
     paths: &NodePaths,
     mode: &str,
     for_hours: Option<u64>,
+    as_owner: bool,
     center: &CenterArg,
     out: &mut dyn Write,
 ) -> Result<(), String> {
@@ -2684,6 +2664,11 @@ async fn set_mode(
     if for_hours.is_some() && m == Mode::Allowlist {
         return Err("--for only goes with folder or user".into());
     }
+    if as_owner && m != Mode::Allowlist {
+        return Err(
+            "--as-owner only goes with allowlist: folder mode always runs as nerve-run, user mode always as you".into(),
+        );
+    }
     // No --for: no limit, and an old one is cleared. The end is a
     // millisecond count that the config file (a TOML integer) holds.
     let until = for_hours
@@ -2700,10 +2685,12 @@ async fn set_mode(
     let name = edit_center(paths, center, |e| {
         e.policy.mode = m;
         e.policy.until = until;
+        e.policy.as_owner = as_owner;
         Ok(())
     })
     .await?;
-    w(out, format!("{name}: mode {}", m.as_str()));
+    let whom = if as_owner { ", as you" } else { "" };
+    w(out, format!("{name}: mode {}{whom}", m.as_str()));
     Ok(())
 }
 
@@ -2743,14 +2730,15 @@ async fn add_folder(
                 v["stored"].as_str().unwrap_or(&given).to_string(),
                 v["recorded"] == true,
                 v["mode"].as_str().map(str::to_string),
+                v["counts"].as_bool(),
             )),
             Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
             Err(e) => return Err(e),
         }
     };
     #[cfg(not(unix))]
-    let asked: Option<(String, bool, Option<String>)> = None;
-    let (stored, recorded, mode) = match asked {
+    let asked: Option<(String, bool, Option<String>, Option<bool>)> = None;
+    let (stored, recorded, mode, counts) = match asked {
         Some(a) => a,
         None => {
             // No node to ask (on Windows the node's pipe takes the change but
@@ -2769,7 +2757,7 @@ async fn add_folder(
                 recorded,
             };
             let a = change_folder(paths, center, &change).await?;
-            (stored, recorded, Some(a.mode.as_str().to_string()))
+            (stored, recorded, Some(a.mode.as_str().to_string()), None)
         }
     };
     w(
@@ -2789,15 +2777,51 @@ async fn add_folder(
             format!("note: {given} leads to {stored}; the folder is stored there"),
         );
     }
-    if let Some(mode) = mode.filter(|m| m != Mode::Folder.as_str()) {
+    // The running node says whether the folders hold the center's commands
+    // (also allowlist mode as nerve-run); without one, folder mode alone is
+    // sure to.
+    let counts = counts.unwrap_or_else(|| mode.as_deref() == Some(Mode::Folder.as_str()));
+    if let Some(mode) = mode.filter(|_| !counts) {
         w(
             out,
             format!(
-                "note: folders count in folder mode; {name} is in {mode} mode (`nerve-node mode set folder`)"
+                "note: folders do not count here: {name} is in {mode} mode, whose commands are not held to them (`nerve-node mode set folder`)"
             ),
         );
     }
+    tell_grants(paths, out).await;
     Ok(())
+}
+
+/// Tells what the running installed Linux node did not manage after a
+/// change of the folders: a grant `nerve-run` did not get, or an entry that
+/// did not come off (crate::acl). The node brings them in line before it
+/// answers. Nothing without such a node.
+async fn tell_grants(paths: &NodePaths, out: &mut dyn Write) {
+    #[cfg(target_os = "linux")]
+    if let Ok(v) = nerve_transport::ctl::call(&paths.ctl_socket(), "folder.grants", json!({})).await
+    {
+        tell_grants_of(&v, out);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (paths, out);
+}
+
+/// What [`tell_grants`] says of the node's answer `v`, and adds to `--json`:
+/// `grant_errors` and `grant_stale`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn tell_grants_of(v: &Value, out: &mut dyn Write) {
+    for line in grant_lines(v) {
+        let _ = writeln!(out, "warning: {line}");
+    }
+    let errors = texts(&v["errors"]);
+    if !errors.is_empty() {
+        json::also("grant_errors", json!(errors));
+    }
+    let stale = texts(&v["stale"]);
+    if !stale.is_empty() {
+        json::also("grant_stale", json!(stale));
+    }
 }
 
 /// Whether two folder paths name one place.
@@ -3422,6 +3446,9 @@ fn line_ts(line: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Why `config set machine.user` is refused on Linux.
+pub const NO_ACCOUNT_TO_CHOOSE: &str = "machine.user is Windows's: on Linux commands run as nerve-run, or in user mode as the owner, the account that ran `install`";
+
 /// `config get|set|unset|add|remove` on dotted keys. `center.<name>` picks
 /// a `[[center]]` entry by its name.
 async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Result<(), String> {
@@ -3437,6 +3464,17 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
             .ok_or_else(|| format!("{key} is not set"))?;
         let _ = writeln!(out, "{}", show(&v));
         return Ok(());
+    }
+    // Linux chooses no account for the commands: they run as nerve-run or
+    // as the owner, the account that ran `install`.
+    if !cfg!(windows)
+        && let ConfigCmd::Set { key, .. }
+        | ConfigCmd::Unset { key }
+        | ConfigCmd::Add { key, .. }
+        | ConfigCmd::Remove { key, .. } = &c
+        && key == "machine.user"
+    {
+        return Err(NO_ACCOUNT_TO_CHOOSE.into());
     }
     let before = std::cell::Cell::new(SecretStorage::File);
     let cfg = edit(paths, |cfg| {
@@ -3540,8 +3578,16 @@ fn node_command_account(paths: &NodePaths, cfg: &NodeConfig) -> Option<crate::se
             .map_or(me, |a| a.uid),
         false => me,
     };
+    // Folder mode's account; the owner is the unit's on Linux, the
+    // config's on Windows.
+    let owner = if cfg!(windows) {
+        cfg.machine.user.clone()
+    } else {
+        crate::service::owner_of(paths)
+    };
     crate::account::for_commands(
-        cfg.machine.user.as_deref(),
+        false,
+        owner.as_deref(),
         own,
         service,
         service || crate::account::can_switch(),
@@ -3559,19 +3605,14 @@ fn folder_commands_off() -> String {
 }
 
 /// Whether, with the keys in the keyring, `c` leaves folder mode's commands
-/// a way to the session bus: Landlock without ABI 9, for commands that run
-/// as the node's own user or root (crate::daemon::keys_kept_from_commands).
-/// `account` is asked only on such a kernel.
+/// a way to the session bus: for commands that run as the node's own user or
+/// root (crate::daemon::keys_kept_from_commands). `account` is asked only
+/// where commands are confined at all.
 fn keyring_turns_commands_off(
     c: nerve_sandbox::Confinement,
     account: impl FnOnce() -> Option<crate::service::Account>,
 ) -> bool {
-    c.available()
-        && !crate::daemon::keys_kept_from_commands(
-            SecretStorage::Keyring,
-            c.keeps_sockets(),
-            account,
-        )
+    c.available() && !crate::daemon::keys_kept_from_commands(SecretStorage::Keyring, account)
 }
 
 /// `proxy set|rm|ls`. The header values, and a user name and password given
@@ -4677,7 +4718,7 @@ mod tests {
         assert!(e.contains("--center"), "{e}");
         run(&paths, &["mode", "set", "user", "--center", "b"]).unwrap();
         assert_eq!(load(&paths).center("b").unwrap().policy.mode, Mode::User);
-        // A new center is in default deny.
+        // A center whose file names no mode is in default deny.
         assert_eq!(
             load(&paths).center("a").unwrap().policy.mode,
             Mode::Allowlist
@@ -4693,6 +4734,24 @@ mod tests {
         assert!(e.contains("unknown mode"), "{e}");
         let e = run(&paths, &["cap", "set", "fs", "ask", "--center", "a"]).unwrap_err();
         assert!(e.contains("unknown setting"), "{e}");
+    }
+
+    /// Allowlist mode runs as the owner only when asked for, and setting a
+    /// mode again without the flag takes it back; the other modes refuse it.
+    #[test]
+    fn allowlist_mode_runs_as_the_owner_when_asked_for() {
+        let (_d, paths) = setup(&["home"]);
+        let policy = || load(&paths).centers[0].policy.clone();
+        let out = run(&paths, &["mode", "set", "allowlist", "--as-owner"]).unwrap();
+        assert!(out.contains("mode allowlist, as you"), "{out}");
+        assert!(policy().as_owner && policy().runs_as_owner(crate::now_ms()));
+        run(&paths, &["mode", "set", "allowlist"]).unwrap();
+        assert!(!policy().as_owner);
+        for mode in ["folder", "user"] {
+            let e = run(&paths, &["mode", "set", mode, "--as-owner"]).unwrap_err();
+            assert!(e.contains("--as-owner only goes with allowlist"), "{e}");
+        }
+        assert!(!policy().as_owner);
     }
 
     #[test]
@@ -4772,7 +4831,7 @@ mod tests {
             &["folder", "add", folder.to_str().unwrap(), "+rw", "+x"],
         )
         .unwrap();
-        assert!(note.contains("folders count in folder mode"), "{note}");
+        assert!(note.contains("folders do not count here"), "{note}");
         run(&paths, &["cap", "set", "exec.run", "off"]).unwrap();
         run(&paths, &["center", "grant", "settings", "write"]).unwrap();
         run(
@@ -5461,6 +5520,23 @@ mod tests {
         assert_eq!(load(&paths).limits.max_running, 16);
     }
 
+    /// No account for the commands is chosen on Linux: `config` refuses
+    /// `machine.user` in every verb, and nothing changes.
+    #[cfg(not(windows))]
+    #[test]
+    fn config_chooses_no_account_on_linux() {
+        let (_d, paths) = setup(&["home"]);
+        for cmd in [
+            &["config", "set", "machine.user", "bob"][..],
+            &["config", "unset", "machine.user"],
+            &["config", "add", "machine.user", "bob"],
+        ] {
+            let e = run(&paths, cmd).unwrap_err();
+            assert_eq!(e, NO_ACCOUNT_TO_CHOOSE, "{cmd:?}");
+        }
+        assert_eq!(load(&paths).machine.user, None);
+    }
+
     /// The owner sets the run-time limits by name; a limit of 0 is refused
     /// and changes nothing, and unsetting one gives the default back.
     #[test]
@@ -5508,29 +5584,26 @@ mod tests {
     }
 
     fn setup_with(paths: &NodePaths, answers: &str) -> (Result<(), String>, String) {
-        setup_on(paths, None, None, answers)
-    }
-
-    fn setup_on(
-        paths: &NodePaths,
-        machine: Option<&dyn crate::service::System>,
-        create_user: Option<&str>,
-        answers: &str,
-    ) -> (Result<(), String>, String) {
-        let told = Setup {
-            create_user,
-            account_only: false,
-        };
         let keyring = crate::keyring_setup::tests::FakeKeyring::new(true);
-        setup_keyring(paths, machine, told, &keyring, answers)
+        setup_keyring(paths, None, &keyring, answers)
     }
 
     fn setup_keyring(
         paths: &NodePaths,
         machine: Option<&dyn crate::service::System>,
-        told: Setup<'_>,
         keyring: &dyn crate::keyring_setup::Keyring,
         answers: &str,
+    ) -> (Result<(), String>, String) {
+        setup_at(paths, machine, keyring, answers, true)
+    }
+
+    /// Setup with `answers`, at a terminal (`terminal`) or not.
+    fn setup_at(
+        paths: &NodePaths,
+        machine: Option<&dyn crate::service::System>,
+        keyring: &dyn crate::keyring_setup::Keyring,
+        answers: &str,
+        terminal: bool,
     ) -> (Result<(), String>, String) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5539,103 +5612,155 @@ mod tests {
         let mut out = Vec::new();
         let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
         let r = rt.block_on(super::setup(
-            paths, machine, told, keyring, &mut input, &mut out,
+            paths, machine, keyring, &mut input, terminal, &mut out,
         ));
         (r, String::from_utf8(out).unwrap())
     }
 
-    /// `setup --create-user NAME` makes the account and runs commands as it
-    /// without the question, and asks the other questions as before.
-    #[cfg(target_os = "linux")]
+    /// `status` of a running node: as whom each pairing runs and whether
+    /// without Landlock, what nerve-run may read of the owner's home, and
+    /// the folder grants, access nerve-run should have lost worded as such
+    /// (#142).
     #[test]
-    fn setup_creates_the_account_of_the_commands_when_asked() {
-        use crate::service::System;
-        let cli = Cli::try_parse_from(["nerve-node", "setup", "--create-user", "bob"]).unwrap();
-        assert!(matches!(cli.cmd, Cmd::Setup { create_user: Some(ref n), .. } if n == "bob"));
-        assert!(Cli::try_parse_from(["nerve-node", "setup", "--create-user"]).is_err());
-        assert!(Cli::try_parse_from(["nerve-node", "setup", "--account-only"]).is_err());
-        let (_d, paths) = setup(&["home"]);
-        let sys = crate::service::tests::Fake::new();
-        // Name, the keys stay in files, no link, user mode for the one
-        // center: no account question.
-        let (r, out) = setup_on(&paths, Some(&sys), Some("bob"), "lab-pc\n\n\nuser\n");
-        r.unwrap();
-        assert!(!out.contains("Account that commands"), "{out}");
-        assert!(out.contains("commands run as bob"), "{out}");
-        assert!(sys.calls().contains(&"useradd bob /home/bob".to_string()));
-        assert_eq!(
-            sys.account("bob").unwrap().unwrap().home,
-            Path::new("/home/bob")
+    fn the_status_says_landlock_the_home_and_the_grants() {
+        let v = json!({
+            "confinement": "landlock abi 6",
+            "owner": "alice",
+            "home_warning": {"warning": "Without Landlock, nerve-run can read every file in your home /home/alice"},
+            "folder_grants": {
+                "stale": ["/home/alice/gone", "/var/lib/nerve/state/acl.json"],
+                "errors": [
+                    "/home/alice/gone/x: Permission denied (os error 13)",
+                    "/var/lib/nerve/state/acl.json: expected value at line 1",
+                    "/home/alice/usb: its file system does not support POSIX ACLs",
+                ],
+            },
+            "centers": [
+                {"name": "a", "status": "connected", "mode": "folder", "account": "nerve-run", "landlock": false},
+                {"name": "b", "status": "connected", "mode": "folder", "account": "nerve-run", "landlock": true},
+                {"name": "c", "status": "connected", "mode": "user", "account": "alice", "landlock": false},
+                {"name": "d", "status": "connected", "mode": "folder"},
+            ],
+        });
+        let lines = status_lines(&v);
+        let has = |l: &str| lines.iter().any(|x| x == l);
+        assert!(has("owner: alice"), "{lines:#?}");
+        assert!(
+            has(
+                "warning: Without Landlock, nerve-run can read every file in your home /home/alice"
+            ),
+            "{lines:#?}"
         );
-        let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key()).unwrap();
-        assert_eq!(cfg.machine.user.as_deref(), Some("bob"));
-        assert_eq!(cfg.node.name.as_deref(), Some("lab-pc"));
-        assert_eq!(cfg.center("home").unwrap().policy.mode, Mode::User);
-        let steps = node_audit(&paths)[0]["steps"].to_string();
-        assert!(steps.contains("made the account bob"), "{steps}");
-        // Refused before any question: nerve, a bad name, and a node not
-        // installed as a service.
-        for (machine, name, why) in [
-            (Some(&sys as &dyn System), "nerve", "node's own user"),
-            (Some(&sys), "Bob!", "not a name setup makes"),
-            (None, "carol", "installed as a service"),
-        ] {
-            let (r, out) = setup_on(&paths, machine, Some(name), "");
-            let e = r.unwrap_err();
-            assert!(e.contains(why), "{name}: {e}");
-            assert!(!out.contains("Account that commands"), "{out}");
-        }
+        assert!(
+            has("a  connected  mode folder, as nerve-run, without Landlock"),
+            "{lines:#?}"
+        );
+        assert!(has("b  connected  mode folder, as nerve-run"), "{lines:#?}");
+        assert!(has("c  connected  mode user, as alice"), "{lines:#?}");
+        assert!(has("d  connected  mode folder"), "{lines:#?}");
+        assert!(
+            has(
+                "warning: nerve-run keeps its access to /home/alice/gone, which it should have lost; no command of nerve-run runs until it is taken off: /home/alice/gone/x: Permission denied (os error 13)"
+            ),
+            "{lines:#?}"
+        );
+        assert!(
+            has(
+                "warning: nerve-run keeps its access to /var/lib/nerve/state/acl.json, which it should have lost; no command of nerve-run runs until it is taken off: /var/lib/nerve/state/acl.json: expected value at line 1"
+            ),
+            "{lines:#?}"
+        );
+        assert!(
+            has(
+                "warning: nerve-run did not get every folder: /home/alice/usb: its file system does not support POSIX ACLs"
+            ),
+            "{lines:#?}"
+        );
         assert_eq!(
-            SettingsStore::peek(&paths.config_file(), &paths.config_key())
-                .unwrap()
-                .machine
-                .user
-                .as_deref(),
-            Some("bob")
+            lines.iter().filter(|l| l.contains("did not get")).count(),
+            1,
+            "{lines:#?}"
+        );
+        // Nothing of the kind on a node that has none of it.
+        let plain = status_lines(&json!({"confinement": "landlock abi 6"})).join("\n");
+        assert!(
+            !plain.contains("warning") && !plain.contains("Landlock,"),
+            "{plain}"
         );
     }
 
-    /// `setup --create-user NAME --account-only`, the desktop app's way to
-    /// the account: the account and nothing else, asking nothing. With the
-    /// keys in a keyring that does not answer it changes nothing, since the
-    /// config cannot be read or signed then, and neither offers a keyring
-    /// nor makes the account.
-    #[cfg(target_os = "linux")]
+    /// After a change of the folders the CLI says what the node's sync
+    /// left: access that should have gone as such, a grant not given whole
+    /// as that (#142).
     #[test]
-    fn setup_chooses_only_the_account_when_told() {
-        let (_d, paths) = setup(&["home"]);
-        let sys = crate::service::tests::Fake::new();
-        let told = Setup {
-            create_user: Some("carol"),
-            account_only: true,
-        };
-        let keyring = crate::keyring_setup::tests::FakeKeyring::new(false);
-        run(
-            &paths,
-            &["config", "set", "machine.secret_storage", "keyring"],
-        )
-        .unwrap();
-        crate::secrets::store::set_unreachable(true);
-        let (r, out) = setup_keyring(&paths, Some(&sys), told, &keyring, "");
-        crate::secrets::store::set_unreachable(false);
-        let e = r.unwrap_err();
-        assert!(e.contains("cannot be reached"), "{e}");
-        assert!(!out.contains("Install it now"), "{out}");
-        assert!(keyring.installed.borrow().is_empty());
-        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
-        run(&paths, &["config", "set", "machine.secret_storage", "file"]).unwrap();
-
-        let (r, out) = setup_keyring(&paths, Some(&sys), told, &keyring, "");
-        r.unwrap();
-        assert!(out.contains("commands run as carol"), "{out}");
-        assert!(!out.contains("Name of this node"), "{out}");
-        assert!(
-            sys.calls()
-                .contains(&"useradd carol /home/carol".to_string())
+    fn a_folder_change_tells_what_the_grants_left() {
+        let mut out = Vec::new();
+        tell_grants_of(
+            &json!({
+                "stale": ["/home/alice/old"],
+                "errors": [
+                    "/home/alice/old: Permission denied (os error 13)",
+                    "/home/alice/older: not this one",
+                    "/home/alice/new: Operation not supported",
+                ],
+            }),
+            &mut out,
         );
-        let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key()).unwrap();
-        assert_eq!(cfg.machine.user.as_deref(), Some("carol"));
-        assert!(cfg.node.name.is_none());
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out,
+            "warning: nerve-run keeps its access to /home/alice/old, which it should have lost; no command of nerve-run runs until it is taken off: /home/alice/old: Permission denied (os error 13)\n\
+             warning: nerve-run did not get every folder: /home/alice/older: not this one\n\
+             warning: nerve-run did not get every folder: /home/alice/new: Operation not supported\n"
+        );
+        let mut out = Vec::new();
+        tell_grants_of(&json!({"stale": [], "errors": []}), &mut out);
+        assert!(out.is_empty());
+    }
+
+    /// Setup's folder step gives a folder commands can work in where the
+    /// owner presses Enter: `+rwx`, as folder mode runs a command only where
+    /// it may run one.
+    #[test]
+    fn setup_gives_a_folder_every_right_on_enter() {
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let (r, out) = setup_with(&paths, &format!("\n\n\nfolder\n{}\n\n", work.display()));
+        r.unwrap();
+        assert!(out.contains("[+rwx]: "), "{out}");
+        let folders = &load(&paths).centers[0].policy.folders;
+        assert_eq!(folders.len(), 1, "{folders:?}");
+        assert_eq!(folders[0].access, Access::parse("rwx").unwrap());
+    }
+
+    /// Only at a terminal is the owner asked whether to install a keyring
+    /// as root: piped answers, or a setup without a terminal, get the
+    /// refusal and install nothing, whatever they say.
+    #[test]
+    fn setup_offers_a_keyring_only_at_a_terminal() {
+        let (_d, paths) = setup(&[]);
+        crate::secrets::store::set_unreachable(true);
+        let k = crate::keyring_setup::tests::FakeKeyring::new(false);
+        let (r, out) = setup_at(&paths, None, &k, "\nkeyring\ny\n\n", false);
+        let e = r.unwrap_err();
+        assert!(e.contains("run in a terminal"), "{e}");
+        assert!(!out.contains("Install it now?"), "{out}");
+        assert!(k.installed.borrow().is_empty());
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
+        crate::secrets::store::set_unreachable(false);
+    }
+
+    /// Setup chooses no account: it has no flags, and asks for none.
+    #[test]
+    fn setup_chooses_no_account() {
+        for flag in ["--create-user", "--account-only"] {
+            assert!(Cli::try_parse_from(["nerve-node", "setup", flag, "bob"]).is_err());
+        }
+        let (_d, paths) = setup(&["home"]);
+        let (r, out) = setup_with(&paths, "lab-pc\n\n\nuser\n");
+        r.unwrap();
+        assert!(!out.contains("Account that commands"), "{out}");
     }
 
     fn node_audit(paths: &NodePaths) -> Vec<Value> {
@@ -5695,11 +5820,11 @@ mod tests {
         );
     }
 
-    /// Folder mode's commands are told off where Landlock cannot keep a
-    /// command off the session bus, and `status` prints why the node says
-    /// they are.
+    /// Folder mode's commands are told off where they run as the node's own
+    /// user or root, whatever the kernel, and `status` prints why the node
+    /// says they are.
     #[test]
-    fn the_keyring_turns_folder_commands_off_below_abi_9() {
+    fn the_keyring_turns_folder_commands_of_the_nodes_own_user_off() {
         use nerve_sandbox::Confinement;
         let abi = |v| Confinement {
             landlock_abi: v,
@@ -5717,13 +5842,16 @@ mod tests {
         assert!(keyring_turns_commands_off(abi(Some(6)), || None));
         assert!(keyring_turns_commands_off(abi(Some(6)), || Some(root)));
         // Another account than root cannot reach the bus: its commands run.
-        assert!(!keyring_turns_commands_off(abi(Some(6)), || Some(alice)));
+        assert!(!keyring_turns_commands_off(abi(Some(6)), || Some(
+            alice.clone()
+        )));
         let asked = std::cell::Cell::new(false);
         let ask = || {
             asked.set(true);
             None
         };
-        assert!(!keyring_turns_commands_off(abi(Some(9)), ask));
+        assert!(keyring_turns_commands_off(abi(Some(9)), || None));
+        assert!(!keyring_turns_commands_off(abi(Some(9)), || Some(alice)));
         assert!(!keyring_turns_commands_off(abi(None), ask));
         assert!(!asked.get());
         assert!(folder_commands_off().contains("machine.secret_storage file"));
@@ -5864,80 +5992,6 @@ mod tests {
         assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
     }
 
-    /// Below Landlock ABI 9 the keys stay in files: setup warns and does
-    /// not ask, taking keys left in the keyring into files; `config set`
-    /// refuses the keyring; `config accept` refuses a file that keeps them
-    /// there. Where the ABI cannot be read, setup warns and still asks.
-    #[test]
-    fn below_landlock_9_the_keys_stay_in_files() {
-        use crate::secrets::{Landlock, for_tests::pretend_landlock};
-        let (_d, paths) = setup(&["home"]);
-        let key = nerve_transport::keys::NodeKey::generate().unwrap();
-        crate::secrets::store_center_key(&paths, SecretStorage::File, "home", &key).unwrap();
-        let set = |to: &str| run(&paths, &["config", "set", "machine.secret_storage", to]);
-        // The ABI cannot be read: a warning, the question, and the keyring
-        // if asked for.
-        pretend_landlock(&paths, Landlock::Unknown);
-        let (r, out) = setup_with(&paths, "\nkeyring\n\n\n");
-        r.unwrap();
-        assert!(
-            out.contains("the Landlock ABI of this kernel cannot be read"),
-            "{out}"
-        );
-        assert!(out.contains("keep the keys in files (file)"), "{out}");
-        assert!(out.contains("Where the node keeps its keys"), "{out}");
-        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
-        // A file changed by hand that keeps them there is not taken.
-        pretend_landlock(&paths, Landlock::Abi(5));
-        let text = std::fs::read_to_string(paths.config_file()).unwrap();
-        std::fs::write(paths.config_file(), format!("{text}# edited\n")).unwrap();
-        let e = run(&paths, &["config", "accept"]).unwrap_err();
-        assert!(e.contains("was not accepted"), "{e}");
-        assert!(e.contains("Landlock ABI 5, below 9"), "{e}");
-        std::fs::write(paths.config_file(), &text).unwrap();
-        // Setup warns, asks nothing about the keys, and moves them out.
-        let (r, out) = setup_with(&paths, "\n\n\n");
-        r.unwrap();
-        assert!(!out.contains("Where the node keeps its keys"), "{out}");
-        assert!(out.contains("Warning: on this kernel (Landlock ABI 5, below 9) a folder mode command cannot run programs from its folders while the node's keys are in the system keyring: the sandbox cannot grant the keyring's access and execute together"), "{out}");
-        assert!(out.contains("the node's keys are in files now"), "{out}");
-        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
-        assert_eq!(config_key_at(&paths), (true, false));
-        assert!(paths.key_file("home").exists());
-        let e = set("keyring").unwrap_err();
-        assert!(e.contains("Landlock ABI 5, below 9"), "{e}");
-        assert!(e.contains("nothing was changed"), "{e}");
-        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
-        // ABI 9 lets them go there again.
-        pretend_landlock(&paths, Landlock::Abi(9));
-        set("keyring").unwrap();
-        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
-    }
-
-    /// Below Landlock ABI 9 with the keys in a keyring that does not
-    /// answer, setup still offers to install one, so that it can take the
-    /// keys into files.
-    #[test]
-    fn below_landlock_9_setup_reaches_the_keyring_to_empty_it() {
-        use crate::secrets::{Landlock, for_tests::pretend_landlock};
-        let (_d, paths) = setup(&[]);
-        run(
-            &paths,
-            &["config", "set", "machine.secret_storage", "keyring"],
-        )
-        .unwrap();
-        pretend_landlock(&paths, Landlock::Abi(5));
-        crate::secrets::store::set_unreachable(true);
-        let k = crate::keyring_setup::tests::FakeKeyring::new(false);
-        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "y\n\n\n");
-        crate::secrets::store::set_unreachable(false);
-        r.unwrap();
-        assert!(out.contains("Install it now? [y/N]"), "{out}");
-        assert!(out.contains("the node's keys are in files now"), "{out}");
-        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
-        assert_eq!(config_key_at(&paths), (true, false));
-    }
-
     /// Where no keyring answers, setup offers to install one: no keeps the
     /// files, yes installs it and moves the keys.
     #[test]
@@ -5945,13 +5999,13 @@ mod tests {
         let (_d, paths) = setup(&[]);
         crate::secrets::store::set_unreachable(true);
         let k = crate::keyring_setup::tests::FakeKeyring::new(false);
-        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "\nkeyring\nn\n");
+        let (r, out) = setup_keyring(&paths, None, &k, "\nkeyring\nn\n");
         let e = r.unwrap_err();
         assert!(e.contains("no system keyring answers"), "{e}");
         assert!(out.contains("Install it now? [y/N]"), "{out}");
         assert!(k.installed.borrow().is_empty());
         assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
-        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "\nkeyring\ny\n\n");
+        let (r, out) = setup_keyring(&paths, None, &k, "\nkeyring\ny\n\n");
         r.unwrap();
         assert_eq!(k.installed.borrow().len(), 1);
         assert!(out.contains("the system keyring answers"), "{out}");
@@ -5970,7 +6024,7 @@ mod tests {
         let failed = json!({"version": 1, "keyring_failed": true});
         let sys = crate::service::tests::Fake::new();
         let mut out = Vec::new();
-        restart_for_keyring(&failed, &paths, Some(&sys), &mut out).unwrap();
+        restart_for_keyring(&failed, &paths, Some(&sys), false, &mut out).unwrap();
         assert!(
             sys.calls()
                 .contains(&format!("systemctl restart {}", crate::service::UNIT_NAME)),
@@ -5978,16 +6032,25 @@ mod tests {
             sys.calls()
         );
         assert!(String::from_utf8_lossy(&out).contains("restarted the node"));
-        let e = restart_for_keyring(&failed, &paths, None, &mut out).unwrap_err();
+        let e = restart_for_keyring(&failed, &paths, None, false, &mut out).unwrap_err();
         assert!(
             e.contains("restart it, then run `nerve-node setup` again"),
             "{e}"
         );
         let sys = crate::service::tests::Fake::new();
         let fine = json!({"version": 1, "keyring_failed": false});
-        restart_for_keyring(&fine, &paths, Some(&sys), &mut out).unwrap();
-        restart_for_keyring(&fine, &paths, None, &mut out).unwrap();
+        restart_for_keyring(&fine, &paths, Some(&sys), false, &mut out).unwrap();
+        restart_for_keyring(&fine, &paths, None, false, &mut out).unwrap();
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        // Run by the node for its owner, setup does not restart the node it
+        // runs in: it says how, and to run it again.
+        let e = restart_for_keyring(&failed, &paths, Some(&sys), true, &mut out).unwrap_err();
+        assert!(
+            e.contains("`nerve-node service restart`, then run `nerve-node setup` again"),
+            "{e}"
+        );
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        restart_for_keyring(&fine, &paths, Some(&sys), true, &mut out).unwrap();
     }
 
     /// `status` shows the limits per command the owner set, and whether
@@ -6104,7 +6167,7 @@ mod tests {
         ready.recv().unwrap();
         // The keyring answers setup: nothing to install.
         let k = crate::keyring_setup::tests::FakeKeyring::new(true);
-        let (r, _) = setup_keyring(&paths, None, Setup::default(), &k, "\nkeyring\n");
+        let (r, _) = setup_keyring(&paths, None, &k, "\nkeyring\n");
         let e = r.unwrap_err();
         assert!(
             e.contains("restart it, then run `nerve-node setup` again"),
@@ -6112,8 +6175,8 @@ mod tests {
         );
         assert!(k.installed.borrow().is_empty());
         let sys = crate::service::tests::Fake::new();
-        // Name, the account question of the installed node, the keys.
-        let (r, out) = setup_keyring(&paths, Some(&sys), Setup::default(), &k, "\n\nkeyring\n");
+        // Name, the keys.
+        let (r, out) = setup_keyring(&paths, Some(&sys), &k, "\nkeyring\n");
         assert!(
             sys.calls()
                 .contains(&format!("systemctl restart {}", crate::service::UNIT_NAME)),
@@ -6157,11 +6220,11 @@ mod tests {
         .unwrap();
         crate::secrets::store::set_unreachable(true);
         let k = crate::keyring_setup::tests::FakeKeyring::new(false);
-        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "\n");
+        let (r, out) = setup_keyring(&paths, None, &k, "\n");
         assert!(r.unwrap_err().contains("no system keyring answers"));
         assert!(!out.contains("Name of this node"), "{out}");
         assert!(run(&paths, &["status"]).is_err());
-        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "y\n\n\n\n");
+        let (r, out) = setup_keyring(&paths, None, &k, "y\n\n\n\n");
         r.unwrap();
         assert!(out.contains("Name of this node"), "{out}");
         assert!(run(&paths, &["status"]).is_ok());

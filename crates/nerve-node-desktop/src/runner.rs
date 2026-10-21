@@ -2,14 +2,10 @@
 //! behaves as `nerve-node` (src/main.rs), with `--json`, and reads its
 //! answer (docs/user/commands.md). The app never parses text meant for
 //! people, and has the CLI's checks because it runs the CLI. On a node
-//! installed as a service the CLI of an owner has the running node run the
+//! installed as a service the CLI of the owner has the running node run the
 //! command (nerve_node::owner); a command that needs an administrator, or
-//! any for a user who is no owner, goes through the elevated broker
+//! any for a user who is not the owner, goes through the elevated broker
 //! (crate::broker) instead, which runs the same program the same way.
-//!
-//! On Linux the app reads the owner token for its runs ([`Tokens`]) and
-//! hands it to each on a pipe, so that a session without the owners' group
-//! yet switches to it once per token, not once per command.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -28,7 +24,6 @@ pub struct Runner {
     exe: PathBuf,
     dirs: Vec<String>,
     broker: Option<Arc<broker::Client>>,
-    tokens: Arc<Tokens>,
 }
 
 /// What a run of the program gave back.
@@ -82,15 +77,6 @@ impl Runner {
             exe,
             dirs,
             broker: None,
-            tokens: Tokens::installed(),
-        }
-    }
-
-    /// The same runner, handing its runs the token `tokens` read.
-    pub fn with_tokens(&self, tokens: Arc<Tokens>) -> Runner {
-        Runner {
-            tokens,
-            ..self.clone()
         }
     }
 
@@ -139,7 +125,7 @@ impl Runner {
         let args = self.args(args);
         let out = match &self.broker {
             Some(b) => b.run(args, input)?,
-            None => run_process(&self.exe, &args, &[], input, Some(&self.tokens))?,
+            None => run_process(&self.exe, &args, &[], input)?,
         };
         answer(out.ok, out.code, &out.stdout, &out.stderr)
     }
@@ -170,14 +156,7 @@ impl Runner {
         };
         match &self.broker {
             Some(b) => b.follow(args, Box::new(on_line), Box::new(on_end)),
-            None => follow_process(
-                &self.exe,
-                &args,
-                &[],
-                Some(&self.tokens),
-                Box::new(on_line),
-                Box::new(on_end),
-            ),
+            None => follow_process(&self.exe, &args, &[], Box::new(on_line), Box::new(on_end)),
         }
     }
 }
@@ -197,13 +176,12 @@ fn entry(line: &str) -> Option<Result<Value, String>> {
 pub type Env = [(String, String)];
 
 /// Runs `exe` with `args` and `env`, `input` as the first line of stdin,
-/// and the owner token of `tokens` handed, and waits.
+/// and waits.
 pub fn run_process(
     exe: &PathBuf,
     args: &[String],
     env: &Env,
     input: Option<&str>,
-    tokens: Option<&Tokens>,
 ) -> Result<Output, String> {
     let mut c = Command::new(exe);
     c.args(args)
@@ -215,7 +193,7 @@ pub fn run_process(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = spawn(c, exe, tokens)?;
+    let mut child = spawn(c, exe)?;
     if let Some(text) = input {
         let mut stdin = child.stdin.take().expect("piped");
         // A command that ends before it reads leaves its own answer.
@@ -232,15 +210,13 @@ pub fn run_process(
     })
 }
 
-/// Starts `exe` with `args` and `env`, and the owner token of `tokens`
-/// handed, and gives each line it prints to `on_line`, then how it ended to
-/// `on_end`, unless it was ended on purpose. The returned [`Follow`] ends
-/// it.
+/// Starts `exe` with `args` and `env`, and gives each line it prints to
+/// `on_line`, then how it ended to `on_end`, unless it was ended on purpose.
+/// The returned [`Follow`] ends it.
 pub fn follow_process(
     exe: &PathBuf,
     args: &[String],
     env: &Env,
-    tokens: Option<&Tokens>,
     mut on_line: Box<dyn FnMut(String) + Send>,
     on_end: Box<dyn FnOnce(Output) + Send>,
 ) -> Result<Follow, String> {
@@ -250,7 +226,7 @@ pub fn follow_process(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = spawn(c, exe, tokens)?;
+    let mut child = spawn(c, exe)?;
     let stdout = child.stdout.take().expect("piped");
     let mut stderr = child.stderr.take().expect("piped");
     let child = Arc::new(Mutex::new(child));
@@ -288,171 +264,10 @@ pub fn follow_process(
     })))
 }
 
-/// Starts `c`, the program `exe`, with the owner token of `tokens` handed
-/// on a pipe (Linux) whose descriptor [`nerve_node::owner::HANDED_VAR`]
-/// names: never in the environment or the arguments, which every process
-/// of the user could read.
-#[allow(unused_mut)]
-fn spawn(
-    mut c: Command,
-    exe: &std::path::Path,
-    tokens: Option<&Tokens>,
-) -> Result<std::process::Child, String> {
-    // No token file (the node is not up yet, or not at all): nothing is
-    // handed, and the run reads the token itself once it has connected, so
-    // a node that starts meanwhile is reached with its own token.
-    #[cfg(unix)]
-    let _pipe = match tokens.and_then(|t| t.get()) {
-        Some(token) => {
-            Some(hand(&mut c, token).map_err(|e| format!("cannot start {}: {e}", exe.display()))?)
-        }
-        None => None,
-    };
-    #[cfg(not(unix))]
-    let _ = tokens;
-    // The pipe's end here closes once the child has its own.
+/// Starts `c`, the program `exe`.
+fn spawn(mut c: Command, exe: &std::path::Path) -> Result<std::process::Child, String> {
     c.spawn()
         .map_err(|e| format!("cannot start {}: {e}", exe.display()))
-}
-
-/// Gives `c` a pipe that holds `token` (nothing for one that could not be
-/// read: the run then reads the file without switching to the group, as
-/// the app tried that already), its descriptor
-/// named by [`nerve_node::owner::HANDED_VAR`]; the read end, which the
-/// caller keeps until `c` has started.
-#[cfg(unix)]
-fn hand(c: &mut Command, token: Option<String>) -> std::io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::process::CommandExt;
-    let mut fds = [0; 2];
-    // SAFETY: two new descriptors, closed on exec, so that no other child
-    // this app starts meanwhile keeps either.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: the new descriptors, each owned once.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    // A token is far less than a pipe holds, so this does not wait, and
-    // the child reads to the end once this end is closed.
-    let mut write = std::fs::File::from(write);
-    if let Some(t) = token {
-        write.write_all(t.as_bytes())?;
-    }
-    drop(write);
-    // Not one of 0 to 2, which the child's own input and output take.
-    let read = if read.as_raw_fd() < 3 {
-        // SAFETY: a copy of an open descriptor, at 3 or above.
-        let fd = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-        if fd == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: the new copy, owned once.
-        unsafe { OwnedFd::from_raw_fd(fd) }
-    } else {
-        read
-    };
-    let fd = read.as_raw_fd();
-    c.env(nerve_node::owner::HANDED_VAR, fd.to_string());
-    // SAFETY: one plain system call between fork and exec: the child keeps
-    // the read end across its exec.
-    unsafe {
-        c.pre_exec(move || {
-            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    Ok(read)
-}
-
-/// The owner token the app hands its runs of the CLI, read once for each
-/// token the node writes. A session that began before `install` made its
-/// user an owner reads it through `sg`, which logs each switch to the
-/// group (on Debian and Ubuntu two lines in the auth log): once per start
-/// of the node, not once for every command of the status poll. A file
-/// that is not there (no node, or a stopped one) is not read, and nothing
-/// is handed for it.
-pub struct Tokens {
-    file: PathBuf,
-    read: Box<dyn Fn() -> Option<String> + Send + Sync>,
-    /// The file as it was when last read, and what was read from it then:
-    /// a failed read is not tried again before the node writes a new one.
-    last: Mutex<Option<(Stamp, Option<String>)>>,
-}
-
-/// Which file a token file is: a new token is a new file (`rename`).
-type Stamp = (u64, u64, i64, i64, i64, i64);
-
-impl Tokens {
-    /// The installed node's, shared by all the runners of this app.
-    pub fn installed() -> Arc<Tokens> {
-        static ONE: std::sync::OnceLock<Arc<Tokens>> = std::sync::OnceLock::new();
-        ONE.get_or_init(|| {
-            #[cfg(unix)]
-            {
-                let at = nerve_node::owner::socket_here();
-                let file = nerve_node::owner::token_file(&at);
-                Arc::new(Tokens::new(file, move || {
-                    nerve_node::owner::read_token(&at).ok()
-                }))
-            }
-            #[cfg(not(unix))]
-            {
-                Arc::new(Tokens::new(PathBuf::new(), || None))
-            }
-        })
-        .clone()
-    }
-
-    /// The token in `file`, as `read` reads it.
-    pub fn new(file: PathBuf, read: impl Fn() -> Option<String> + Send + Sync + 'static) -> Tokens {
-        Tokens {
-            file,
-            read: Box::new(read),
-            last: Mutex::new(None),
-        }
-    }
-
-    /// The token for a run now: the one read before while the file is the
-    /// same, else read now; `Some(None)` when the file is there and could
-    /// not be read, `None` when there is no file.
-    pub fn get(&self) -> Option<Option<String>> {
-        let stamp = stamp(&self.file)?;
-        // Held while reading, so that runs started together read once.
-        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((s, t)) = &*last
-            && *s == stamp
-        {
-            return Some(t.clone());
-        }
-        let token = (self.read)();
-        *last = Some((stamp, token.clone()));
-        Some(token)
-    }
-}
-
-/// Which file is at `file` now; `None` when none is. Everyone may look
-/// (the runtime folder is open), though only the owners may read it.
-fn stamp(file: &std::path::Path) -> Option<Stamp> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let m = std::fs::metadata(file).ok()?;
-        Some((
-            m.dev(),
-            m.ino(),
-            m.mtime(),
-            m.mtime_nsec(),
-            m.ctime(),
-            m.ctime_nsec(),
-        ))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        None
-    }
 }
 
 /// What a run of the CLI answered: its JSON, or its error. A run that gave
@@ -485,118 +300,6 @@ pub fn answer(ok: bool, code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The program at `path`, a script of `text`, written by a child so
-    /// that no thread of this test holds it open for writing when it runs
-    /// (ETXTBSY).
-    #[cfg(target_os = "linux")]
-    fn script(path: &std::path::Path, text: &str) {
-        let made = Command::new("sh")
-            .arg("-c")
-            .arg("cat > \"$1\" && chmod 755 \"$1\"")
-            .arg("sh")
-            .arg(path)
-            .stdin(Stdio::piped())
-            .spawn()
-            .and_then(|mut c| {
-                c.stdin.take().unwrap().write_all(text.as_bytes())?;
-                c.wait()
-            })
-            .unwrap();
-        assert!(made.success());
-    }
-
-    /// The app's runs of the CLI get the owner token on a pipe, not in
-    /// their environment or arguments, and the app reads it once for each
-    /// token the node writes: in a session without the owners' group each
-    /// read is a switch to it, which `sg` logs, so the status poll every
-    /// few seconds must not read it for every command.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_token_is_read_once_for_each_token_and_handed_on_a_pipe() {
-        use std::sync::atomic::AtomicUsize;
-        let d = tempfile::tempdir().unwrap();
-        let file = d.path().join("owner.token");
-        std::fs::write(&file, "tok-3f9a1\n").unwrap();
-        // What the CLI got: the handed token, whether the environment
-        // holds it, and the variable's descriptor.
-        let cli = d.path().join("cli");
-        script(
-            &cli,
-            "#!/bin/sh\n\
-             t=unhanded; fd=3\n\
-             if [ -n \"$NERVE_OWNER_TOKEN_FD\" ]; then fd=$NERVE_OWNER_TOKEN_FD; t=$(cat \"/proc/self/fd/$fd\"); fi\n\
-             n=0; [ -n \"$t\" ] && n=$(env | grep -c -F -- \"$t\")\n\
-             printf '{\"token\":\"%s\",\"env\":%s,\"fd\":%s,\"args\":\"%s\"}\\n' \"$t\" \"$n\" \"$fd\" \"$*\"\n",
-        );
-        let reads = Arc::new(AtomicUsize::new(0));
-        let tokens = {
-            let (file, reads) = (file.clone(), reads.clone());
-            Arc::new(Tokens::new(file.clone(), move || {
-                reads.fetch_add(1, Ordering::SeqCst);
-                std::fs::read_to_string(&file)
-                    .ok()
-                    .map(|t| t.trim().to_string())
-            }))
-        };
-        let runner = Runner::new(cli, None, None).with_tokens(tokens);
-        let got = |r: &Runner| {
-            let v = r.run(&["status"]).unwrap();
-            assert_eq!(v["env"], 0, "{v}");
-            assert!(v["fd"].as_i64().unwrap() > 2, "{v}");
-            assert!(!v["args"].as_str().unwrap().contains("tok-"), "{v}");
-            v["token"].as_str().unwrap().to_string()
-        };
-        // The status poll, a page's reads and a follow.
-        for _ in 0..6 {
-            assert_eq!(got(&runner), "tok-3f9a1");
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        let follow = runner
-            .follow(&["audit", "--follow"], move |v| {
-                let _ = tx.send(v);
-            })
-            .unwrap();
-        let v = rx
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .unwrap()
-            .unwrap();
-        assert_eq!(v["token"], "tok-3f9a1");
-        drop(follow);
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
-
-        // The node started again: a new file with a new token, read once.
-        let next = d.path().join(".owner.token.tmp");
-        std::fs::write(&next, "tok-77c0e\n").unwrap();
-        std::fs::rename(&next, &file).unwrap();
-        for _ in 0..4 {
-            assert_eq!(got(&runner), "tok-77c0e");
-        }
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-
-        // The node stopped: no file, nothing read, nothing handed, so the
-        // run reads the token after it connects, to a node that may have
-        // started meanwhile (review round 6, part A, finding 1).
-        std::fs::remove_file(&file).unwrap();
-        assert_eq!(got(&runner), "unhanded");
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-
-        // A read that fails is not tried again for the same file.
-        std::fs::write(&file, "tok-1b2c3\n").unwrap();
-        let failing = {
-            let reads = reads.clone();
-            Arc::new(Tokens::new(file.clone(), move || {
-                reads.fetch_add(1, Ordering::SeqCst);
-                None
-            }))
-        };
-        // An empty pipe: the run does not switch to the group again.
-        let runner = runner.with_tokens(failing);
-        for _ in 0..3 {
-            assert_eq!(got(&runner), "");
-        }
-        assert_eq!(reads.load(Ordering::SeqCst), 3);
-    }
 
     #[test]
     fn the_answer_is_the_json_on_stdout() {

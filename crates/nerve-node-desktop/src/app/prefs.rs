@@ -7,11 +7,7 @@ use serde_json::{Value, json};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use super::{Choose, Ctl, Pending};
-use crate::{Limit, Load, Page, Pick, Prefs, Store, Tone, view};
-
-/// The account the Overview offers for the commands, as the CLI's hint
-/// names it (nerve_node::account::CREATE_USER_HINT).
-const SEPARATE_ACCOUNT: &str = "nerve-work";
+use crate::{Limit, Load, Pick, Prefs, Tone, view};
 
 /// The words of `log.level`, as Settings' choice orders them.
 const LOG_LEVELS: [&str; 4] = ["error", "warn", "info", "debug"];
@@ -899,37 +895,6 @@ impl Ctl {
         });
     }
 
-    /// `setup --create-user NAME --account-only`: commands run as another
-    /// account, made when it is not there. What the CLI warns about such an
-    /// account is shown until the owner closes it.
-    fn account_use(self: &Rc<Self>) {
-        let Some(name) = self.with_prefs(|p| p.get_account_new().trim().to_string()) else {
-            return;
-        };
-        if name.is_empty() {
-            return;
-        }
-        let args = vec![
-            "setup".into(),
-            format!("--create-user={name}"),
-            "--account-only".into(),
-        ];
-        self.account_change(args, None, format!("Commands run as {name}"));
-    }
-
-    /// The Overview's offer when commands run as the app's user: on Linux
-    /// an account of their own at once (`setup --create-user`, which asks
-    /// for an administrator); on Windows, whose account needs a password,
-    /// the account card in Settings.
-    pub(super) fn separate_account(self: &Rc<Self>) {
-        if cfg!(windows) {
-            self.show(Page::Settings);
-            return;
-        }
-        self.with_prefs(|p| p.set_account_new(SEPARATE_ACCOUNT.into()));
-        self.account_use();
-    }
-
     /// `install` again with the account's new password on stdin: on
     /// Windows the service starts commands with it.
     fn account_password_save(self: &Rc<Self>) {
@@ -973,10 +938,8 @@ impl Ctl {
                     {
                         c.with_prefs(|p| p.set_account_error(no.as_str().into()));
                     } else if warnings.is_empty() {
-                        c.with_prefs(|p| p.set_account_new(SharedString::new()));
                         c.toast(format!("{title}."), Tone::Ok);
                     } else {
-                        c.with_prefs(|p| p.set_account_new(SharedString::new()));
                         c.show_once(&title, "", &warnings.join("\n"), "");
                     }
                 }
@@ -1315,12 +1278,6 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     p.on_raw_unset(move || c.raw_change("unset"));
     let c = ctl.clone();
     p.on_raw_add(move || c.raw_change("add"));
-    let c = ctl.clone();
-    p.on_account_use(move || c.account_use());
-    let c = ctl.clone();
-    window
-        .global::<Store>()
-        .on_separate_account(move || c.separate_account());
     let c = ctl.clone();
     p.on_account_password_save(move || c.account_password_save());
     let c = ctl.clone();

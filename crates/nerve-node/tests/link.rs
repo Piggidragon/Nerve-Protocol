@@ -41,17 +41,32 @@ async fn paired_node(root: &Path, center: &FakeCenter) -> Daemon {
 }
 
 /// Like [`paired_node`], with `policy` changed before the daemon starts.
+/// The tests start from allowlist mode, which their rules are written for;
+/// a new pairing is in folder mode, with no folder ([`pair_in_allowlist`]).
 async fn paired_node_with(
     root: &Path,
     center: &FakeCenter,
     policy: impl Fn(&mut nerve_policy::CenterPolicy),
 ) -> Daemon {
     let o = options(root);
-    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
-        .await
-        .expect("pair");
+    pair_in_allowlist(&o.paths, center).await;
     owner_edit(&o.paths, |c| policy(&mut c.centers[0].policy)).await;
     Daemon::start(o).await.expect("start")
+}
+
+/// Pairs the node at `paths` with `center` as `lab`, which starts the
+/// pairing in folder mode with no folder (issue #142), then puts it in
+/// allowlist mode.
+async fn pair_in_allowlist(paths: &NodePaths, center: &FakeCenter) {
+    let e = nerve_node::pair::pair(paths, &center.link(), Some("lab"))
+        .await
+        .expect("pair");
+    assert_eq!(e.policy.mode, nerve_policy::Mode::Folder);
+    assert!(e.policy.folders.is_empty());
+    owner_edit(paths, |c| {
+        c.centers[0].policy.mode = nerve_policy::Mode::Allowlist
+    })
+    .await;
 }
 
 /// Changes the config the way the owner does while no daemon runs: through
@@ -86,9 +101,8 @@ async fn handshake_describe_and_an_allowed_read() {
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let home = std::fs::canonicalize(&home).unwrap();
-    // A new center is in default deny: an allow rule lets the read through.
+    // In allowlist mode an allow rule lets the read through.
     let node = paired_node_with(dir.path(), &center, |p| {
-        assert_eq!(p.mode, nerve_policy::Mode::Allowlist);
         p.allow
             .push(format!("fs.read:{}/*", nerve_policy::paths::to_wire(&home)));
     })
@@ -395,9 +409,7 @@ async fn a_command_ends_at_the_default_and_at_the_owners_maximum() {
     let dir = tempdir();
     let mut center = FakeCenter::start(false).await.unwrap();
     let o = options(dir.path());
-    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
-        .await
-        .unwrap();
+    pair_in_allowlist(&o.paths, &center).await;
     owner_edit(&o.paths, |c| {
         c.limits.default_timeout_secs = 1;
         c.limits.max_timeout_secs = 3;
@@ -718,6 +730,7 @@ async fn run_in(conn: &mut Conn<TcpStream>, cwd: &Path, command: &str) -> Value 
 async fn a_new_pairing_refuses_commands_that_drive_the_node_itself() {
     let dir = tempdir();
     let mut center = FakeCenter::start(false).await.unwrap();
+
     let node = paired_node_with(dir.path(), &center, |p| {
         assert_eq!(p.deny, nerve_policy::rules::GUARD.to_vec());
         p.mode = nerve_policy::Mode::User;
@@ -1590,9 +1603,7 @@ async fn a_call_asks_for_limits_up_to_the_owners_most() {
     let mut center = FakeCenter::start(false).await.unwrap();
     let mut o = options(dir.path());
     o.cgroups = Some(Err("no cgroup for this test".into()));
-    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
-        .await
-        .expect("pair");
+    pair_in_allowlist(&o.paths, &center).await;
     owner_edit(&o.paths, |c| {
         c.centers[0].policy.allow.push("exec.run:echo *".into());
         c.limits.command.memory_mb = 512;

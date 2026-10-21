@@ -66,18 +66,6 @@ fn an_owner_is_asked_only_for_what_needs_an_administrator() {
         })
         .unwrap();
     assert!(made.success());
-    // Commands run as the app's user.
-    let me = nerve_node_desktop::app::app_user();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(nerve_node::cli::edit(&paths, |c| {
-        c.machine.user = Some(me.clone());
-        Ok(())
-    }))
-    .unwrap();
-
     let runner = Runner::new(
         wrapper.clone(),
         Some(paths.config_dir.clone()),
@@ -103,10 +91,6 @@ fn an_owner_is_asked_only_for_what_needs_an_administrator() {
     store.invoke_unlock();
     assert_eq!(brokers(&log), 0);
 
-    // The Overview warns that commands run as the app's user.
-    assert!(store.get_commands_as_you());
-    assert_eq!(store.get_commands_account(), me.as_str());
-
     // Sudo on needs an administrator: asked for that command alone.
     perm.set_sudo_password("not the password".into());
     perm.invoke_sudo_confirm();
@@ -114,10 +98,6 @@ fn an_owner_is_asked_only_for_what_needs_an_administrator() {
     store.invoke_panic();
     store.invoke_unlock();
     assert_eq!(brokers(&log), 1, "the rights outlived their command");
-
-    // The Overview's offer of an account of their own asks too.
-    store.invoke_separate_account();
-    assert_eq!(brokers(&log), 2);
 
     // Backup and restore go through the node for an owner: no question.
     let prefs = window.global::<Prefs>();
@@ -128,7 +108,7 @@ fn an_owner_is_asked_only_for_what_needs_an_administrator() {
     prefs.set_backup_pass2(pass.into());
     prefs.invoke_backup_confirm();
     assert!(file.is_file(), "{}", prefs.get_backup_error());
-    assert_eq!(brokers(&log), 2);
+    assert_eq!(brokers(&log), 1);
     store.set_service_state("running".into());
     let restore = || {
         prefs.set_restore_file(file.display().to_string().into());
@@ -139,10 +119,10 @@ fn an_owner_is_asked_only_for_what_needs_an_administrator() {
         assert!(!prefs.get_restore_busy());
     };
     restore();
-    assert_eq!(brokers(&log), 2);
+    assert_eq!(brokers(&log), 1);
     // One the node refuses an owner is restored the administrator's way:
     // the rights are asked for it alone.
     std::fs::write(&refuse, "").unwrap();
     restore();
-    assert_eq!(brokers(&log), 3);
+    assert_eq!(brokers(&log), 2);
 }

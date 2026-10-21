@@ -41,7 +41,9 @@ fn opts(policy: &CenterPolicy, account: &Account, own: &[PathBuf]) -> RunOptions
         timeouts: Default::default(),
         sudo: None,
         account: Some(account.clone()),
+        separate: false,
         own: own.to_vec(),
+        root: None,
         limits: None,
     }
 }
@@ -141,4 +143,70 @@ async fn a_folder_mode_command_of_the_account_stays_in_its_folders_and_off_the_k
     .unwrap();
     assert_ne!(r["exit_code"], 0, "{r}");
     assert!(!r["stdout"].as_str().unwrap().contains("secret-key"), "{r}");
+}
+
+/// A command of `nerve-run` (the test's own account stands in for it) has
+/// its built-in folders in Landlock's set as in the gate's, `/tmp`,
+/// `/var/tmp` and its home, and the environment of its home: its XDG
+/// folders, no session of anyone's, and git trusting the repositories it
+/// reaches (issue #142).
+#[tokio::test]
+async fn a_command_of_nerve_run_has_its_home_and_the_temporary_folders() {
+    if !nerve_sandbox::Confinement::detect().available() {
+        eprintln!("skipped: Landlock is not available here");
+        return;
+    }
+    // The owner's home lies outside `/tmp` and `/var/tmp`, as a real one
+    // does, wherever this checkout and its temporary folders are: the
+    // owner's protected entries (`~/.ssh` and the like) inside `/tmp` would
+    // keep the command from making a file there, as from every folder that
+    // holds one. It need not be there: only its protected entries count.
+    let owner_home = Path::new("/nonexistent-owner-of-nerve-142");
+    let d = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(d.path()).unwrap();
+    let run_home = root.join("run-home");
+    let work = root.join("work");
+    std::fs::create_dir_all(&run_home).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let mut folders = vec![Folder {
+        path: work.display().to_string(),
+        access: Access::ALL,
+    }];
+    folders.extend(nerve_node::account::built_in(&run_home));
+    let policy = CenterPolicy {
+        mode: Mode::Folder,
+        folders,
+        ..CenterPolicy::default()
+    };
+    let account = me(&run_home);
+    let mut o = opts(&policy, &account, &[]);
+    // `~` of the folders and rules is the owner's, not the account's.
+    let spec = exec::landlock_spec(&policy, owner_home, &[], &[]);
+    for t in ["/tmp", "/var/tmp"] {
+        assert!(spec.write.iter().any(|w| w == Path::new(t)), "{spec:?}");
+    }
+    o.landlock = Some(spec);
+    o.separate = true;
+    let tmp = format!("/tmp/nerve-142-{}", std::process::id());
+    let probe = format!(
+        "echo \"$HOME|$XDG_CONFIG_HOME|$XDG_CACHE_HOME|${{XDG_RUNTIME_DIR-none}}|${{DBUS_SESSION_BUS_ADDRESS-none}}\"; \
+         echo t > {tmp} && cat {tmp} && rm {tmp}; \
+         echo h > \"$HOME/h\" && cat \"$HOME/h\"; \
+         echo $GIT_CONFIG_KEY_0=$GIT_CONFIG_VALUE_0"
+    );
+    let call = RunCall {
+        command: probe,
+        cwd: work.clone(),
+        timeout: Some(Duration::from_secs(20)),
+        limits: Default::default(),
+    };
+    let r = exec::run(&call, &o, |_| {}).await.unwrap();
+    let out = r["stdout"].as_str().unwrap();
+    let h = run_home.display();
+    assert_eq!(
+        out,
+        format!("{h}|{h}/.config|{h}/.cache|none|none\nt\nh\nsafe.directory=*\n"),
+        "{}",
+        r["stderr"]
+    );
 }

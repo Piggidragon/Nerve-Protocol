@@ -124,22 +124,6 @@ export global Store {
     in-out property <bool> keyring-usable;
     in-out property <string> keyring-why;
 
-    // The installed node runs commands as the app's own user (src/app.rs,
-    // Ctl::show_status): a center's command could then change the node's
-    // settings as its owner. The Overview warns and offers an account of
-    // their own for the commands.
-    in-out property <bool> commands-as-you;
-    in-out property <string> commands-account;
-    // How a command gets root besides: through these groups and sudo, in
-    // words ("docker and sudo"); empty when it does not.
-    in-out property <string> commands-root-via;
-    // The owner said not to show the card again for this account and these
-    // ways to root (src/settings.rs); Settings, General brings it back.
-    in-out property <bool> commands-dismissed;
-    callback separate-account();
-    callback commands-dismiss();
-    callback commands-show();
-
     // Elevation: an installed node's files are the system's; an owner is
     // asked only for what needs an administrator, anyone else once, and the
     // app says why first.
@@ -177,6 +161,22 @@ export global Perm {
     in-out property <string> error;
     in-out property <string> mode;
     in-out property <string> mode-until;
+    // The installed Linux node runs folder and allowlist mode as nerve-run,
+    // an account of its own (src/app/perm.rs): whether it does here, the
+    // account this center's commands run as now, whether allowlist mode
+    // runs as the owner, the folders nerve-run always has, and the folder
+    // grants that failed, and the access nerve-run keeps although it should
+    // have lost it, which stops all its commands; whether Landlock holds
+    // this center's commands, and what the node says nerve-run may read of
+    // the owner's home without it.
+    in-out property <bool> separate;
+    in-out property <string> account;
+    in-out property <bool> as-owner;
+    in-out property <string> built-in;
+    in-out property <string> grant-errors;
+    in-out property <string> stale;
+    in-out property <bool> landlock: true;
+    in-out property <string> home-warning;
     in-out property <[FolderRow]> folders;
     in-out property <[string]> allow;
     in-out property <[string]> deny;
@@ -226,6 +226,7 @@ export global Perm {
     callback refresh();
     callback mode-pick(string);
     callback mode-apply();
+    callback as-owner-set(bool);
     callback folder-choose();
     callback folder-add();
     callback folder-set(string, bool, bool, bool);
@@ -399,14 +400,12 @@ export global Prefs {
     callback raw-set();
     callback raw-unset();
     callback raw-add();
-    // The account commands run as (machine.user), choosing another, and on
-    // Windows giving the service its new password.
+    // Windows: the account commands run as (machine.user), and giving the
+    // service its new password.
     in-out property <string> account;
-    in-out property <string> account-new;
     in-out property <string> account-password;
     in-out property <string> account-error;
     in-out property <bool> account-busy;
-    callback account-use();
     callback account-password-save();
     callback raw-remove();
     callback accept-file();

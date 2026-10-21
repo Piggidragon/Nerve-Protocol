@@ -67,8 +67,10 @@ pub struct RunCall {
 
 impl RunCall {
     /// `cwd` defaults to `home`, the home of the account the command runs
-    /// as. On the installed node the folder is looked at as that account
-    /// (crate::account::FsAs).
+    /// as, resolved like a given one: the policy judges the real folder, and
+    /// a root start opens it without following a link (AsRoot), so a home
+    /// whose path runs through one would fail there. On the installed node
+    /// the folder is looked at as that account (crate::account::FsAs).
     pub fn parse(args: &Map<String, Value>, home: &Path) -> Result<RunCall, RpcError> {
         let a: RunArgs = params(args)?;
         if a.command.trim().is_empty() {
@@ -76,7 +78,8 @@ impl RunCall {
         }
         let cwd = match a.cwd {
             Some(c) => WirePath::parse(&c)?.real,
-            None => home.to_path_buf(),
+            // One that does not resolve is refused below as it is named.
+            None => nerve_policy::paths::resolve(home).unwrap_or_else(|_| home.to_path_buf()),
         };
         if !cwd.is_dir() {
             return Err(crate::fs::bad_path(format!(
@@ -386,7 +389,6 @@ pub fn landlock_spec(
         read: leave_out(&[nerve_sandbox::system_dirs(), f.read].concat(), own),
         write: leave_out(&[nerve_sandbox::system_writable(), f.write].concat(), own),
         exec: leave_out(&[nerve_sandbox::system_dirs(), f.exec].concat(), own),
-        connect: None,
     }
 }
 
@@ -557,15 +559,6 @@ fn real_checked(p: &Path) -> std::io::Result<PathBuf> {
     {
         Ok(c)
     }
-}
-
-/// Where a command of `folders` mode may connect to socket files while the
-/// node's keys are in the keyring: anywhere but the folders in `own`, which
-/// then hold the session bus the keyring answers on
-/// (crate::paths::keyring_places). With the files the rule is not set, and
-/// commands connect where they did.
-pub fn connect_rule(own: &[PathBuf]) -> Vec<PathBuf> {
-    leave_out(&[PathBuf::from("/")], own)
 }
 
 /// The configured folders where commands may write: the `w` folders of every
@@ -1082,14 +1075,42 @@ pub struct RunOptions {
     /// The account the command runs as (the installed node, every mode,
     /// crate::account); `None` runs it as the node's own user.
     pub account: Option<crate::service::Account>,
+    /// Whether that account is `nerve-run`, whose command gets the
+    /// environment of its own home ([`separate_env`]).
+    pub separate: bool,
     /// The node's own folders, which the account must not reach.
     pub own: Vec<PathBuf>,
+    /// Set only for an allowed sudo command of `nerve-run`, which runs as
+    /// `account`, root: where it starts, and how ([`AsRoot`]).
+    pub root: Option<AsRoot>,
     /// Linux: the command runs in a cgroup of its own below these, held to
     /// these limits (crate::cgroup); `None` runs it without.
     pub limits: Option<(
         std::sync::Arc<crate::cgroup::Cgroups>,
         nerve_policy::config::Granted,
     )>,
+}
+
+/// The environment of a command of `nerve-run` besides HOME, USER and
+/// LOGNAME: what it sets, and what it takes away. Its tools keep their
+/// configs and caches in its own `home` (the XDG folders), it has no session
+/// of anyone's to talk to, and git trusts the repositories it reaches: they
+/// belong to the owner, whose folders it was given, and git refuses them as
+/// another account's otherwise ("dubious ownership"). The setting goes in as
+/// git's command-line configuration (`GIT_CONFIG_COUNT`, git 2.31 on), the
+/// one place besides the account's own files it honours `safe.directory`.
+pub fn separate_env(home: &Path) -> (Vec<(String, String)>, Vec<&'static str>) {
+    let under = |p: &str| home.join(p).display().to_string();
+    let set = vec![
+        ("XDG_CONFIG_HOME".into(), under(".config")),
+        ("XDG_CACHE_HOME".into(), under(".cache")),
+        ("XDG_DATA_HOME".into(), under(".local/share")),
+        ("XDG_STATE_HOME".into(), under(".local/state")),
+        ("GIT_CONFIG_COUNT".into(), "1".into()),
+        ("GIT_CONFIG_KEY_0".into(), "safe.directory".into()),
+        ("GIT_CONFIG_VALUE_0".into(), "*".into()),
+    ];
+    (set, vec!["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"])
 }
 
 /// What a sudo command needs: the password and the prompt sudo was told to
@@ -1141,6 +1162,100 @@ pub fn sudo_line(sudo_path: &str, args: &str, prompt: &str) -> String {
         sh_quote(sudo_path),
         sh_quote(prompt)
     )
+}
+
+/// The line root's shell gets for an allowed `sudo <args>` that the node
+/// starts as root itself ([`AsRoot`]): `args` without a leading `-n` and
+/// `--`, which change nothing for a start without sudo (it asks for no
+/// password, and the command is what follows). Any other option of sudo
+/// (`-E`, `-u <user>`, …) asks for something this start does not do, and
+/// the shell would read it as an option of its own, so the call is refused
+/// with the reason; so is a line that names no command.
+pub fn root_line(args: &str) -> Result<&str, RpcError> {
+    let mut rest = args.trim_start();
+    loop {
+        let end = rest
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        let (word, after) = rest.split_at(end);
+        match word {
+            "-n" => rest = after.trim_start(),
+            "--" => {
+                rest = after.trim_start();
+                break;
+            }
+            _ => break,
+        }
+    }
+    if rest.is_empty() {
+        return Err(RpcError::invalid_args("the sudo command names no command"));
+    }
+    if rest.starts_with('-') {
+        let word = rest.split_ascii_whitespace().next().unwrap_or(rest);
+        return Err(RpcError::invalid_args(format!(
+            "a sudo command of a pairing whose commands run as nerve-run starts as root without the sudo program, so it takes no sudo option but -n and -- (this one starts with {word}); allow and send the command without it"
+        )));
+    }
+    Ok(rest)
+}
+
+/// An allowed sudo command of a pairing whose commands run as `nerve-run`,
+/// which the node starts as root itself (crate::link). Its shell gets only
+/// the line the sudo allow list named, and starts in `folder`: the call's
+/// working folder, opened by the node as `by` (the owner, whose sudo list
+/// let it run, or the node's own user for `None`) without following a link,
+/// so it is the folder the policy judged. The child enters it with `by`'s
+/// file system ids before it becomes root: it holds CAP_SETUID and
+/// CAP_SETGID only, so as root it has no right past a folder's mode until
+/// the shell runs, and the folder is often in the owner's closed home. The
+/// command gets a fixed environment ([`ROOT_PATH`]) and `/bin/sh`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct AsRoot {
+    folder: std::sync::Arc<std::os::fd::OwnedFd>,
+    by: Option<crate::service::Account>,
+}
+
+/// [`AsRoot`]: Linux only.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone)]
+pub enum AsRoot {}
+
+/// The `PATH` of a command the node starts as root: the system's own
+/// folders, never one the node's environment names.
+pub const ROOT_PATH: &str = crate::keyring_setup::SYSTEM_PATH;
+
+impl AsRoot {
+    /// Opens `cwd`, the resolved folder the policy judged, as `by`.
+    pub fn open(cwd: &Path, by: Option<&crate::service::Account>) -> Result<AsRoot, RpcError> {
+        #[cfg(target_os = "linux")]
+        {
+            let folder = {
+                let _as = by.map(crate::account::FsAs::new).transpose();
+                let _as = _as.map_err(|e| {
+                    RpcError::new(
+                        ErrorCode::Unavailable,
+                        format!("cannot act as {}: {e}", by.map_or("", |a| &a.name)),
+                    )
+                })?;
+                crate::fs::open_folder(cwd)
+            };
+            let folder = folder
+                .map_err(|e| crate::fs::bad_path(format!("cannot open {}: {e}", to_wire(cwd))))?;
+            Ok(AsRoot {
+                folder: std::sync::Arc::new(folder),
+                by: by.cloned(),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (cwd, by);
+            Err(RpcError::new(
+                ErrorCode::Unavailable,
+                "only the installed Linux node starts commands as root",
+            ))
+        }
+    }
 }
 
 /// Checks `password` with `sudo -S -k -v`, which runs nothing and caches
@@ -1480,7 +1595,9 @@ pub async fn run(
     opts: &RunOptions,
     started: impl FnOnce(&Ender),
 ) -> Result<Value, RpcError> {
-    let (program, mut args) = shell_command(opts.shell.as_deref(), &call.command);
+    // Root's command runs in /bin/sh, whatever shell the others use.
+    let shell = opts.shell.as_deref().filter(|_| opts.root.is_none());
+    let (program, mut args) = shell_command(shell, &call.command);
     // PowerShell in a container would stand somewhere else than its folder.
     if opts.container.is_some()
         && powershell(&program)
@@ -1558,12 +1675,19 @@ pub async fn run(
     #[cfg(target_os = "linux")]
     {
         let join = cgroup.as_ref().map(crate::cgroup::CommandCgroup::procs_fd);
-        let switch = match &opts.account {
-            Some(a) => Some(
+        let switch = match (&opts.account, &opts.root) {
+            (Some(a), Some(r)) => Some(
+                r.folder
+                    .try_clone()
+                    .and_then(|f| crate::account::Switch::entering(a, f, r.by.as_ref(), &opts.own))
+                    .map_err(|e| RpcError::internal(e.to_string()))?,
+            ),
+            (Some(a), None) => Some(
                 crate::account::Switch::new(a, Some(&call.cwd), &opts.own)
                     .map_err(|e| RpcError::invalid_args(e.to_string()))?,
             ),
-            None => None,
+            (None, Some(_)) => return Err(RpcError::internal("a root command needs root")),
+            (None, None) => None,
         };
         // Root as the account (the owner chose it, warned) gets root's
         // rights back at exec, which no_new_privs would keep from it.
@@ -1586,6 +1710,10 @@ pub async fn run(
             });
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(r) = &opts.root {
+        match *r {}
+    }
     #[cfg(not(any(target_os = "linux", windows)))]
     if let Some(a) = &opts.account {
         return Err(RpcError::new(
@@ -1595,9 +1723,20 @@ pub async fn run(
     }
     match &opts.account {
         Some(a) => {
+            // Root's command gets nothing of the node's environment.
+            if opts.root.is_some() {
+                cmd.env_clear().env("PATH", ROOT_PATH);
+            }
             cmd.env("HOME", &a.home)
                 .env("USER", &a.name)
                 .env("LOGNAME", &a.name);
+            if opts.separate {
+                let (set, unset) = separate_env(&a.home);
+                cmd.envs(set);
+                for k in unset {
+                    cmd.env_remove(k);
+                }
+            }
         }
         None => {
             cmd.current_dir(&call.cwd);
@@ -1948,7 +2087,9 @@ mod tests {
             timeouts: Timeouts::default(),
             sudo: None,
             account: None,
+            separate: false,
             own: Vec::new(),
+            root: None,
             limits: None,
         }
     }
@@ -2336,7 +2477,6 @@ mod tests {
         assert_eq!(r["stderr"], "", "the prompt is left out: {r}");
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn sudo_line_quotes_the_program() {
         assert_eq!(
@@ -2425,24 +2565,6 @@ mod tests {
         let (r, _) = within_a_few_seconds(&c, &o).await;
         let e = r.unwrap_err();
         assert!(e.message.contains("past timeout_ms"), "{}", e.message);
-    }
-
-    /// With the keys in the keyring a command connects to socket files anywhere
-    /// but the node's own folders, the session bus's among them: no rule holds
-    /// those.
-    #[test]
-    fn the_connect_rule_leaves_the_own_folders_out() {
-        let d = tempfile::tempdir().unwrap();
-        let w = std::fs::canonicalize(d.path()).unwrap();
-        for dir in ["run/user/1000", "run/user/1001", "run/lock"] {
-            std::fs::create_dir_all(w.join(dir)).unwrap();
-        }
-        let bus = w.join("run/user/1000");
-        let got = connect_rule(std::slice::from_ref(&bus));
-        assert!(got.contains(&w.join("run/user/1001")), "{got:?}");
-        assert!(got.contains(&w.join("run/lock")), "{got:?}");
-        assert!(!got.iter().any(|p| bus.starts_with(p)), "{got:?}");
-        assert!(!got.iter().any(|p| p.starts_with(&bus)), "{got:?}");
     }
 
     #[test]
@@ -3136,7 +3258,7 @@ mod tests {
         let home = std::env::temp_dir();
         let a = json!({"command": "ls"}).as_object().unwrap().clone();
         let c = RunCall::parse(&a, &home).unwrap();
-        assert_eq!(c.cwd, home);
+        assert_eq!(c.cwd, std::fs::canonicalize(&home).unwrap());
         let bad = json!({"command": "ls", "shell": "x"})
             .as_object()
             .unwrap()
@@ -3160,6 +3282,42 @@ mod text_tests {
         Timeouts {
             default: secs(default),
             max: secs(max),
+        }
+    }
+
+    /// Root's shell gets an allowed sudo line without a leading `-n` and
+    /// `--`; any other option of sudo, and a line that names no command,
+    /// are refused with the reason (#142).
+    #[test]
+    fn a_root_line_takes_only_n_and_the_end_of_options() {
+        for (args, line) in [
+            ("apt update", "apt update"),
+            ("-n apt update", "apt update"),
+            ("-- apt update", "apt update"),
+            ("-n -- apt update", "apt update"),
+            ("-n  -n\tapt -y install x", "apt -y install x"),
+        ] {
+            assert_eq!(root_line(args).unwrap(), line, "{args:?}");
+        }
+        for args in [
+            "-E apt update",
+            "-u bob id",
+            "-n -E id",
+            "-nE id",
+            "-- -x",
+            "-- -n id",
+            "-- -- id",
+            "-i",
+        ] {
+            let e = root_line(args).unwrap_err();
+            assert!(
+                e.message.contains("no sudo option but -n and --"),
+                "{args:?}: {e:?}"
+            );
+        }
+        for args in ["", "-n", "--", "-n --  "] {
+            let e = root_line(args).unwrap_err();
+            assert!(e.message.contains("names no command"), "{args:?}: {e:?}");
         }
     }
 
@@ -3330,7 +3488,9 @@ mod windows_tests {
             timeouts: Timeouts::default(),
             sudo: None,
             account: None,
+            separate: false,
             own: Vec::new(),
+            root: None,
             limits: None,
         }
     }

@@ -443,25 +443,6 @@ fn every_page_light_and_dark() {
     shots.take_as_is("overview-restart-soon");
     store.set_toast_shown(false);
     store.set_restart_due(false);
-    // Commands run as the app's user, an owner of the node.
-    store.set_commands_as_you(true);
-    store.set_commands_account("alex".into());
-    store.set_commands_root_via("docker and sudo".into());
-    shots.take("overview-commands-as-you");
-    store.set_commands_root_via("".into());
-    shots.take("overview-commands-as-you-plain");
-    // Hidden by its owner: Settings, General keeps the line.
-    store.invoke_show(Page::Settings);
-    prefs.set_tab(0);
-    // As the node's status says it, which reading the page asked anew.
-    store.set_commands_as_you(true);
-    store.set_commands_dismissed(true);
-    store.set_commands_root_via("docker and sudo".into());
-    prefs.set_account("alex".into());
-    shots.take("settings-general-commands-as-you");
-    store.invoke_show(Page::Overview);
-    store.set_commands_dismissed(false);
-    store.set_commands_as_you(false);
     // Commands without their limits: one line, and the restart.
     let st = store.get_status();
     let mut off = st.clone();
@@ -542,6 +523,39 @@ fn every_page_light_and_dark() {
     perm.set_edit_list(1);
     shots.take_full("permissions-edit", 2150);
     perm.set_edit_list(-1);
+    // The installed Linux node: folder mode runs as nerve-run, with the
+    // folders it always has; allowlist mode as nerve-run or as the owner; a
+    // folder grant that failed (issue #142).
+    perm.set_separate(true);
+    perm.set_account("nerve-run".into());
+    perm.set_built_in("/tmp, /var/tmp and its home /var/lib/nerve-run".into());
+    perm.set_mode("folder".into());
+    shots.take_full("permissions-nerve-run", 2150);
+    perm.set_grant_errors("/home/alex/usb-stick: its file system does not support POSIX ACLs, so nerve-run cannot be given it; give a folder on another file system (ext4, xfs, btrfs and tmpfs have them)".into());
+    shots.take("permissions-grant-errors");
+    perm.set_grant_errors("".into());
+    // Access nerve-run should have lost: none of its commands runs.
+    perm.set_stale("/home/alex/old-project/build: Permission denied (os error 13)".into());
+    shots.take("permissions-stale-grants");
+    perm.set_stale("".into());
+    // A kernel without Landlock, a folder given in the owner's home.
+    perm.set_landlock(false);
+    perm.set_home_warning("Without Landlock, nerve-run can read every file in your home /home/alex that other accounts may read, not only the folders you give it, as it passes through your home to /home/alex/project. This warning stays while you give it a folder in your home: umask 027 and `chmod -R o-rwx` narrow what it can read there, and only folders outside your home or a kernel with Landlock end it.".into());
+    shots.take_full("permissions-nerve-run-without-landlock", 2150);
+    perm.set_landlock(true);
+    perm.set_home_warning("".into());
+    perm.set_mode("allowlist".into());
+    perm.set_as_owner(true);
+    shots.take("permissions-allowlist-as-owner");
+    perm.set_mode_choice("folder".into());
+    perm.set_mode_open(true);
+    shots.take("permissions-mode-folder-nerve-run");
+    perm.set_mode_open(false);
+    perm.set_as_owner(false);
+    perm.set_separate(false);
+    perm.set_account("".into());
+    perm.set_built_in("".into());
+    perm.invoke_pick(0);
     // Allowlist mode: the allow list, the deny rules as its exceptions.
     let office = perm.get_centers().iter().position(|c| c == OFFICE).unwrap();
     for (list, rule) in [
@@ -643,10 +657,8 @@ fn every_page_light_and_dark() {
     shots.take_full("settings-limits", 1150);
     prefs.set_tab(0);
     shots.take_full("settings-general", 1000);
-    // Where no keyring can hold the keys, an account to choose, a limit
-    // being saved and one refused, and a setting by its name.
-    prefs.set_account_new("nerve-work".into());
-    shots.take("settings-general-choices");
+    // Where no keyring can hold the keys, a limit being saved and one
+    // refused, and a setting by its name.
     store.set_keyring_usable(false);
     store.set_keyring_why(nerve_node_desktop::view::no_keyring("windows-service").into());
     prefs.set_tab(1);
@@ -666,7 +678,6 @@ fn every_page_light_and_dark() {
     shots.take("settings-advanced-filled");
     prefs.set_tab(2);
     store.set_keyring_usable(usable);
-    prefs.set_account_new("".into());
     prefs.set_raw_key("".into());
     prefs.set_raw_value("".into());
     // The limits as they were: the edits above were only shown.

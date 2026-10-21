@@ -42,11 +42,6 @@ pub struct LandlockSpec {
     /// Programs below these may run. The files there can be read by name too
     /// (see `landlock_rules::prepare`), the folders not listed.
     pub exec: Vec<PathBuf>,
-    /// Where set, the command connects only to socket files below these
-    /// (Landlock ABI 9, Linux 7.1; older kernels do not restrict it). Not
-    /// set, it connects to any it can name, as before ABI 9.
-    #[serde(default)]
-    pub connect: Option<Vec<PathBuf>>,
 }
 
 /// What the node sends the shim on its stdin.
@@ -245,12 +240,6 @@ impl Confinement {
         self.landlock_abi.is_some() || self.appcontainer
     }
 
-    /// Whether Landlock can keep a command from connecting to a socket file
-    /// ([`LandlockSpec::connect`]): ABI 9 on.
-    pub fn keeps_sockets(&self) -> bool {
-        self.landlock_abi.is_some_and(|v| v >= 9)
-    }
-
     /// The `confinement` string of the `exec` state.
     pub fn describe(&self) -> String {
         match self.landlock_abi {
@@ -417,8 +406,7 @@ pub mod landlock_rules {
     //! Landlock rules for a `folders` command. Every filesystem access is
     //! handled (so denied unless a rule allows it). Where the kernel supports
     //! it, the command also cannot signal processes outside its sandbox or
-    //! reach abstract sockets, and with [`LandlockSpec::connect`] set, socket
-    //! files outside those folders.
+    //! reach abstract sockets.
 
     use super::LandlockSpec;
     use landlock::{
@@ -442,14 +430,7 @@ pub mod landlock_rules {
         // Only the write rights, so a folder that may be written but not read
         // (`w` without `r`) stays unreadable; reading is the `read` set's.
         let write = AccessFs::from_write(ABI_WANTED);
-        // Connecting to a socket file is its own right from ABI 9 on, and
-        // handled only where the spec says where: a kernel without it
-        // drops it (best effort), and the node asks for that only where it
-        // knows the kernel has it.
-        let mut handled = AccessFs::from_all(ABI_WANTED);
-        if spec.connect.is_some() {
-            handled |= AccessFs::ResolveUnix;
-        }
+        let handled = AccessFs::from_all(ABI_WANTED);
         let mut rs = Ruleset::default().handle_access(handled).map_err(e)?;
         if !Scope::from_all(ABI_WANTED).is_empty() {
             rs = rs.scope(Scope::from_all(ABI_WANTED)).map_err(e)?;
@@ -463,11 +444,6 @@ pub mod landlock_rules {
             .add_rules(path_beneath_rules(
                 &spec.exec,
                 AccessFs::Execute | AccessFs::ReadFile,
-            ))
-            .map_err(e)?
-            .add_rules(path_beneath_rules(
-                spec.connect.as_deref().unwrap_or_default(),
-                AccessFs::ResolveUnix,
             ))
             .map_err(e)
     }
@@ -3715,7 +3691,6 @@ mod tests {
             read: [system_dirs(), vec![rw.path().into()]].concat(),
             write: [system_writable(), vec![rw.path().into()]].concat(),
             exec: system_dirs(),
-            connect: None,
         };
         let run = |target: &std::path::Path| {
             confined_sh(&spec, &format!("echo x > {}", target.display()))
@@ -3745,7 +3720,6 @@ mod tests {
             read: system_dirs(),
             write: [system_writable(), vec![wo.path().into()]].concat(),
             exec: [system_dirs(), vec![xo.path().into()]].concat(),
-            connect: None,
         };
         let d = |p: &std::path::Path| p.display().to_string();
         assert!(confined_sh(
@@ -3776,81 +3750,5 @@ mod tests {
             ..spec.clone()
         };
         assert!(!confined_sh(&none, &format!("{}/tool", d(xo.path()))));
-    }
-
-    /// Whether a child under `spec` connects to the socket file `socket`.
-    /// The child connects between fork and exec, so no tool is needed.
-    #[cfg(target_os = "linux")]
-    fn confined_connect(spec: &LandlockSpec, socket: &std::path::Path) -> bool {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::process::CommandExt;
-        let mut rs = Some(landlock_rules::prepare(spec).unwrap());
-        // SAFETY: an all-zero sockaddr_un is a valid empty address.
-        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let bytes = socket.as_os_str().as_bytes();
-        assert!(bytes.len() < addr.sun_path.len());
-        for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
-            *d = *s as libc::c_char;
-        }
-        let mut cmd = std::process::Command::new("/bin/true");
-        // SAFETY: Landlock's syscalls on a ruleset built before the fork,
-        // then socket, connect and close on an address built before it.
-        unsafe {
-            cmd.pre_exec(move || {
-                if let Some(r) = rs.take() {
-                    landlock_rules::enforce(r)?;
-                }
-                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let r = libc::connect(
-                    fd,
-                    &addr as *const libc::sockaddr_un as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-                );
-                let err = std::io::Error::last_os_error();
-                libc::close(fd);
-                if r != 0 {
-                    return Err(err);
-                }
-                Ok(())
-            });
-        }
-        cmd.status().is_ok_and(|s| s.success())
-    }
-
-    /// With `connect` set, a command connects to the socket files below it and
-    /// to none elsewhere, even in a folder it may read: the node's keys in the
-    /// keyring are behind the session bus, a socket file. Without it, socket
-    /// files are not limited. Skipped where the kernel has no ABI 9.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn landlock_keeps_a_command_off_socket_files_outside_connect() {
-        if !Confinement::detect().keeps_sockets() {
-            eprintln!("no Landlock ABI 9 here; skipped");
-            return;
-        }
-        let tmp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
-        let open = tmp.path().join("open");
-        let shut = tmp.path().join("shut");
-        std::fs::create_dir(&open).unwrap();
-        std::fs::create_dir(&shut).unwrap();
-        let _a = std::os::unix::net::UnixListener::bind(open.join("s")).unwrap();
-        let _b = std::os::unix::net::UnixListener::bind(shut.join("s")).unwrap();
-        let spec = LandlockSpec {
-            read: [system_dirs(), vec![tmp.path().into()]].concat(),
-            write: system_writable(),
-            exec: system_dirs(),
-            connect: Some(vec![open.clone()]),
-        };
-        assert!(confined_connect(&spec, &open.join("s")));
-        assert!(!confined_connect(&spec, &shut.join("s")));
-        let before = LandlockSpec {
-            connect: None,
-            ..spec.clone()
-        };
-        assert!(confined_connect(&before, &shut.join("s")));
     }
 }

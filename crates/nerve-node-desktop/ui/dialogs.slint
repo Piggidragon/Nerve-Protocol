@@ -317,8 +317,8 @@ export component AboutDialog inherits Dialog {
 export component ModeDialog inherits Dialog {
     title: Perm.mode-choice == "folder" ? "Folder mode for " + Perm.center : "User mode for " + Perm.center;
     subtitle: Perm.mode-choice == "folder"
-        ? "It may do what each of its folders allows."
-        : "It may do anything you may do, protected files aside. Best for a while, not for good.";
+        ? (Perm.separate ? "Its commands run as nerve-run, an account of its own, in the folders you give it, /tmp and its home." : "It may do what each of its folders allows.")
+        : "Its commands run as you: anything you may do, protected files aside. Best for a while, not for good.";
     card-width: 480px;
     close => {
         Perm.mode-open = false;
@@ -758,7 +758,7 @@ export component RestoreDialog inherits Dialog {
 // Why the app asks for administrator rights, before the system asks.
 export component ElevateDialog inherits Dialog {
     title: "Administrator rights";
-    subtitle: "You are not an owner of this node, so reading and changing it needs administrator rights.";
+    subtitle: "You are not the owner of this node, the account that installed it, so reading and changing it needs administrator rights.";
     card-width: 520px;
     close => {
         Store.elevate-open = false;

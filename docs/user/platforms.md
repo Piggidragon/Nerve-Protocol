@@ -30,9 +30,10 @@ Fedora 36 and later) and fontconfig.
 - Without Landlock, `nerve-run` reads in your home what any other account
   may: when your home is open to others (`ls -ld ~` shows `drwxr-xr-x` or
   `drwx--x--x`), and when you give it a folder in your home, which it passes
-  through. `install`, `status` and the app say so, as long as such a folder
-  is given. Give it folders outside your home, use `umask 027`, or use a
-  kernel with Landlock; see
+  through. `install`, `status` and the app say so: for an open home until
+  you close it (`chmod 750 ~`), and for a folder in your home as long as it
+  is given. Give it folders outside your home, or use a kernel with
+  Landlock; `umask 027` only narrows what it can read. See
   [modes](modes.md#your-home-and-other-accounts). With Landlock nothing is
   said: it holds each command to its folders.
 - Commands run with `no_new_privs`, so setuid programs cannot gain privileges.

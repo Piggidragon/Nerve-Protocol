@@ -117,10 +117,29 @@ pub fn owner_running() -> Option<String> {
 /// ([`TERMINAL_ENV`]).
 pub fn at_terminal() -> bool {
     use std::io::IsTerminal;
-    if owner_running().is_some() {
-        return std::env::var(TERMINAL_ENV).is_ok_and(|v| v == "1");
+    told_terminal(
+        owner_running().is_some(),
+        std::env::var(TERMINAL_ENV).ok().as_deref(),
+        std::io::stdin().is_terminal(),
+    )
+}
+
+/// [`at_terminal`] from what it reads: whether the node runs this command
+/// for its owner, the value of [`TERMINAL_ENV`], and whether this process's
+/// own input is a terminal. For the owner only what the node was told
+/// counts: its input is the connection's.
+fn told_terminal(for_owner: bool, told: Option<&str>, stdin_is_terminal: bool) -> bool {
+    if for_owner {
+        return told == Some("1");
     }
-    std::io::stdin().is_terminal()
+    stdin_is_terminal
+}
+
+/// Whether [`forward_if_needed`] tells the node that the owner is at a
+/// terminal: only where it passes this process's own input, and that input
+/// is a terminal's. A text it passes is no person typing.
+pub fn terminal_of(input: &Input, stdin_is_terminal: bool) -> bool {
+    matches!(input, Input::Stdin) && stdin_is_terminal
 }
 
 /// Refuses a change of the settings that stay root's when this command runs
@@ -314,8 +333,7 @@ pub fn forward_if_needed(cli: &Cli) -> Option<i32> {
     }
     let input = input_for(&cli.cmd);
     // The command is told whether the input it gets is a terminal's.
-    let terminal =
-        !matches!(input, Input::None) && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let terminal = terminal_of(&input, std::io::IsTerminal::is_terminal(&std::io::stdin()));
     Some(rt.block_on(forward(&paths, args, cwd, input, terminal, cli.json)))
 }
 
@@ -1827,6 +1845,67 @@ mod win {
 
 #[cfg(test)]
 mod tests {
+    /// The owner's program tells the node of a terminal only for its own
+    /// input at one; a command run for the owner believes only that (#142).
+    #[test]
+    fn the_terminal_signal_holds_at_both_ends() {
+        use super::{Input, terminal_of, told_terminal};
+        assert!(terminal_of(&Input::Stdin, true));
+        assert!(!terminal_of(&Input::Stdin, false));
+        assert!(!terminal_of(&Input::None, true));
+        assert!(!terminal_of(&Input::Text("y\n".into()), true));
+        // For the owner: what the node was told, never its own input, which
+        // is the connection's.
+        for stdin in [true, false] {
+            assert!(!told_terminal(true, None, stdin), "unset");
+            assert!(!told_terminal(true, Some("0"), stdin), "0");
+            assert!(!told_terminal(true, Some(""), stdin), "empty");
+            assert!(told_terminal(true, Some("1"), stdin), "1");
+            // Not for an owner: its own input, whatever the variable says.
+            assert_eq!(told_terminal(false, Some("1"), stdin), stdin);
+            assert_eq!(told_terminal(false, None, stdin), stdin);
+        }
+    }
+
+    /// [`super::at_terminal`] reads the node's variables: run again in a
+    /// process of its own with them set, and its input not a terminal.
+    #[test]
+    fn at_terminal_reads_what_the_node_told_it() {
+        const NAME: &str = "owner::tests::at_terminal_reads_what_the_node_told_it";
+        if std::env::var_os("NERVE_TEST_AT_TERMINAL").is_some() {
+            println!("at_terminal={}", super::at_terminal());
+            return;
+        }
+        let ask = |owner: Option<&str>, told: Option<&str>| {
+            let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+            c.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env("NERVE_TEST_AT_TERMINAL", "1")
+                .env_remove(super::OWNER_ENV)
+                .env_remove(super::TERMINAL_ENV)
+                .stdin(std::process::Stdio::null());
+            if let Some(o) = owner {
+                c.env(super::OWNER_ENV, o);
+            }
+            if let Some(t) = told {
+                c.env(super::TERMINAL_ENV, t);
+            }
+            let o = c.output().unwrap();
+            let out = String::from_utf8_lossy(&o.stdout).into_owned();
+            assert!(o.status.success(), "{out}");
+            if out.contains("at_terminal=true") {
+                true
+            } else {
+                assert!(out.contains("at_terminal=false"), "{out}");
+                false
+            }
+        };
+        assert!(!ask(Some("alice"), None), "unset");
+        assert!(!ask(Some("alice"), Some("0")), "0");
+        assert!(ask(Some("alice"), Some("1")), "1");
+        // Not run for an owner: its own input, here none.
+        assert!(!ask(None, Some("1")));
+    }
+
     use super::*;
     use clap::Parser;
 

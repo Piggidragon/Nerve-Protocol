@@ -249,8 +249,11 @@ and no other groups; `uninstall` removes both.
 - A link that is put on the way to a granted folder after you gave it, or in
   place of a folder below it, is not followed: that grant fails until its
   path is a plain folder again.
-- A file a command makes private (mode 0600 or 0700) stays its own: the ACL
-  mask hides your entry then. If you narrow a file's group bits later
+- A file or folder a command makes private (mode 0600 or 0700) stays its
+  own: the ACL mask hides your entry then, and you cannot read it without
+  `sudo` (`sudo cat`, or `sudo chown` it to you). That is known and
+  accepted: most tools make their files 0644 and 0755, and `nerve-run`
+  keeps what it makes private to itself as any account does. If you narrow a file's group bits later
   (`chmod g-w`), `nerve-run` loses that right too.
 - An allowed [sudo](sudo.md) command of a pairing whose commands run as
   `nerve-run` runs as root, started by the node: the sudo list is its only

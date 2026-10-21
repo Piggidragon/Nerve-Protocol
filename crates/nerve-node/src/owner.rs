@@ -30,21 +30,18 @@
 //! mode command reads, as its folder is out of the command's Landlock rules
 //! (crate::daemon::Shared::sealed). So a confined command cannot use the
 //! socket itself, however it connects; the checks of the caller's process
-//! (no `no_new_privs`, not below a command) are a second layer. A program of
-//! the owner's that runs things on request reads the token for it, unless
-//! Landlock keeps the command off that program's socket (ABI 9,
-//! crate::exec::folder_spec). On Windows the
-//! pipe's DACL keeps every AppContainer out, as it would keep one from a
+//! (no `no_new_privs`, not below a command) are a second layer. On Windows
+//! the pipe's DACL keeps every AppContainer out, as it would keep one from a
 //! token file, so there is no token.
 //!
 //! What it does not stop: a command of a center that runs as an owner's
 //! account without a sandbox (`user` and `allowlist` mode) reads the token
 //! as the owner does, and one that gets a process outside the node's process
-//! tree and sandbox (the account's own `systemd --user`, a tmux server, the
-//! task scheduler; for a `folder` mode command below Landlock ABI 9 or
-//! through a socket the owner allowed) is that owner. That is the owner's choice of mode and
-//! account; the app warns when commands run as its user
-//! (docs/user/desktop.md).
+//! tree and sandbox (a program of the account's that runs things on request,
+//! in `folder` mode too) is that owner. That is the owner's choice of mode
+//! and account; the app warns when commands run as its user
+//! (docs/user/desktop.md), and a separate account for `folder` mode is
+//! planned (#142).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

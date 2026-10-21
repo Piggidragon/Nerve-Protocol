@@ -174,12 +174,12 @@ command's job (Windows), the commands that stay root's (`run`, `install`,
 `update`, `uninstall`, `service`, `setup`, `sudo on`), and a `backup` or
 `restore` without the file the caller opened itself.
 
-The owner token is the boundary against a `folder` mode command that runs as
-an owner, as far as the command is kept off the sockets of the owner's
-programs that run things on request (Landlock ABI 9, `exec::folder_spec`;
-below that, or through an allowed socket, such a program reads the token for
-it): a new random one at each start, written whole and renamed into
-place as `owner.token` beside the socket before the socket is made, 0640
+The owner token keeps the processes of a `folder` mode command that runs as
+an owner off the socket; a program of the owner's that runs things on request
+is not held by the sandbox and reads the token for it, which is the owner's
+to answer for (user docs, desktop.md "Administrator rights"). It is a new
+random one at each start, written whole and renamed into place as
+`owner.token` beside the socket before the socket is made, 0640
 `nerve:nerve-admin` (the unit's `SupplementaryGroups=nerve-admin` lets the
 node give the file to that group; without it the file is 0600 and the node
 logs why its owners cannot use it), compared in constant time, removed at

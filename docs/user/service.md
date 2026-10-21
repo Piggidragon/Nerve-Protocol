@@ -107,13 +107,13 @@ account's home.
 
 - In `user` mode a command may do what that account may do.
 - In `folder` mode it is that account as well, held by Landlock to the
-  folders you gave the center ([modes](modes.md)), and from Linux 7.1 to the
-  socket files in them and those you allow
-  ([modes](modes.md#socket-files)). That is the only difference to `user`
-  mode. On an older kernel a command can ask a program of that account's
-  that runs things on request (its systemd session, a tmux server) to run
-  one outside the sandbox: there `folder` mode is no boundary against that
-  account, which is yours when `install` took you.
+  folders you gave the center ([modes](modes.md)). That is the only
+  difference to `user` mode. Landlock holds the command's own processes,
+  not the account's other programs: one of them that runs things on request
+  runs what the command asks outside the sandbox, so `folder` mode is no
+  boundary against that account. When `install` took you, that account is
+  yours, and that is yours to answer for; an account of their own
+  ([setup](#setup)) keeps commands from what is yours.
 - In `allowlist` mode it runs what an allow rule names, as that account.
 
 No command can read the node's keys: they are private to `nerve`. Before a

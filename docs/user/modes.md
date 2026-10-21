@@ -150,16 +150,15 @@ The node confines commands with Landlock:
 - Landlock cannot run a file it may not read. So an `x` folder also lets a
   command read files there by name. It still cannot list the folder.
 - The node's own folders are in none of these sets. That keeps a command from
-  the node's files, but only as far as Landlock reaches. From Linux 7.1 a
-  command also connects only to the socket files in its folders and those
-  you allow ([below](#socket-files)). Before that, and through a socket you
-  allow or one in a folder you grant, `folder` mode is no boundary against
-  the other programs of the account commands run as: a command can ask one
-  that runs commands on request, such as the user's systemd session or a
-  tmux server, to run a program outside the sandbox. While the commands run
-  as the node's own user (a node you run yourself, with no `machine.user`),
-  that program reads the node's files and changes its settings through the
-  control socket. Run the commands as another account, one that only the node uses and that
+  the node's files, but only as far as Landlock reaches. Landlock holds the
+  command's own processes, not the other programs of the account it runs
+  as: `folder` mode is no boundary against those of them that run things on
+  request (a session's service manager, a terminal multiplexer and the
+  like), which run what the command asks outside the sandbox, as that
+  account. While the commands run as the node's own user (a node you run
+  yourself, with no `machine.user`), such a program reads the node's files
+  and changes its settings through the control socket. Run the commands as
+  another account, one that only the node uses and that
   gets root in no way without a password (not root, not in `docker` or a like
   group, no `NOPASSWD` sudo, nobody works as it and uses sudo from it), to keep
   them from the node's files and settings: see [Linux](platforms.md#linux).
@@ -196,17 +195,16 @@ The node confines commands with Landlock:
   what that account may not open stays closed as well. Landlock only takes
   away; it gives the account nothing it lacks.
 - That account is the user who installed, unless you chose another, so
-  the command runs as an owner of the node. It cannot change the node's
-  settings through the owners' socket itself: the node answers only a
+  the command runs as an owner of the node. Its own processes cannot change
+  the node's settings through the owners' socket: the node answers only a
   request with its owner token, and the token's folder `/run/nerve-node` is
   in none of these sets, whatever folders you grant ([administrator
-  rights](desktop.md#administrator-rights)). That holds against the owner's
-  other programs only where the command is kept off their sockets: from
-  Linux 7.1, with no socket of a program that runs things on request
-  allowed or in its folders. Elsewhere such a program reads the token for
-  it, and a command can do all the owner can, Nerve's settings too; the
-  app's account card says so. In `user` and `allowlist` mode it does not
-  hold either ([below](#user-mode)).
+  rights](desktop.md#administrator-rights)). A program of yours that runs
+  things on request is not held so (above): through one a command can do
+  all you can, Nerve's settings too, and the app's account card says so.
+  That is yours to answer for, as in `user` and `allowlist` mode
+  ([below](#user-mode)). Folder mode under an account of its own is planned
+  ([#142](https://github.com/Piggidragon/Nerve-Protocol/issues/142)).
 
 Check that your kernel supports it, with the node running:
 
@@ -214,9 +212,7 @@ Check that your kernel supports it, with the node running:
 nerve-node status
 ```
 
-The first line reads `daemon: running (confinement landlock v…)`. Below
-`landlock v9` commands are not kept off socket files ([above](#socket-files)),
-and `status --json` says `"sockets_kept": false`. With
+The first line reads `daemon: running (confinement landlock v…)`. With
 `confinement none` the node cannot confine commands, so `folder` mode refuses
 every command. A line `folder mode runs no command: …` says the same, and
 why.
@@ -455,7 +451,8 @@ In short: `folder` mode keeps the command's own files and the owners' pipe
 closed, but it is not shown to hold against every program of yours that
 runs things on request. One that opens itself to all AppContainers runs
 what the command asks as you, outside the container, and then a command
-can do all you can, Nerve's settings too.
+can do all you can, Nerve's settings too. As on Linux, that is yours to
+answer for while commands run as you.
 
 - **The network.** The container has the capabilities `internetClient`,
   `internetClientServer` and `privateNetworkClientServer` (code). Checked: a
@@ -619,9 +616,10 @@ limit:
   with them. On the installed Windows node `folder` mode runs only such
   commands ([Windows](#what-a-command-can-reach-in-folder-mode-windows)).
 
-And in `folder` mode on a node you run yourself, a command can hand work to the
-programs of your own session that run commands on request, which are outside
-the sandbox ([Linux](#what-a-command-can-reach-in-folder-mode-linux)).
+And in `folder` mode while commands run as you (on a node you run yourself,
+or one installed with your account), a command can hand work to the programs
+of yours that run commands on request, which are outside the sandbox
+([Linux](#what-a-command-can-reach-in-folder-mode-linux)).
 
 No rule closes these limits.
 

@@ -139,21 +139,18 @@ user who installed, unless an account was chosen before. Then a center's
 command runs as an owner, and the pairing's [mode](modes.md) decides what it
 can do with the node:
 
-- **`folder` mode:** the command cannot use the owners' way in itself. On
-  Linux it cannot read the owner token, whatever folders you give it (the
-  token's folder is in none of its sandbox's rules), so the node refuses its
-  requests. From Linux 7.1 it also connects to no socket file outside its
-  folders but those you allow ([modes](modes.md#socket-files)), so it cannot
-  ask a program of yours that runs things on request (your systemd user
-  manager, a tmux server, the session bus) to run one outside the sandbox.
-  Before Linux 7.1 it can, and that program reads the token: there
-  `folder` mode is no boundary against your programs, and a command can do
-  all you can, Nerve's settings too. The same holds where you allow the
-  socket of such a program, or grant a folder that holds one. On Windows the
-  owner pipe's permissions let in no AppContainer, and your files are closed
-  to one unless you grant them; it is not shown to hold against every
-  program of yours that runs things on request
-  ([modes](modes.md#what-the-appcontainer-does-not-stop)).
+- **`folder` mode:** the command's own process stays in its folders and
+  cannot use the owners' way in. On Linux it cannot read the owner token,
+  whatever folders you give it (the token's folder is in none of its
+  sandbox's rules), so the node refuses its requests. On Windows the owner
+  pipe's permissions let in no AppContainer, and your files are closed to
+  one unless you grant them. But while it runs as you, `folder` mode is no
+  boundary against your own programs that run things on request: such a
+  program runs what the command asks outside the sandbox, as you, and then
+  the command can do all you can, Nerve's settings too. As in `user` mode,
+  that is yours to answer for. Folder mode under an account of its own is
+  planned ([#142](https://github.com/Piggidragon/Nerve-Protocol/issues/142));
+  until then a separate account (below) is the boundary.
 - **`user` and `allowlist` mode:** the command runs as you, with your rights
   and without a sandbox. It can read the owner token and change the node's
   settings as you can, also through a program of yours outside the node
@@ -171,13 +168,9 @@ command can get around; it does not hold alone. A command account that is
 no owner (below) keeps commands from the node's settings in every mode.
 
 The Overview says so in one card, "Center commands run as you",
-with what that gives them: all you can do, Nerve's settings too while a
-pairing is in `user` or `allowlist` mode, while a pairing in `folder` mode
-has a socket allowed, and on Linux before 7.1, where the node cannot keep
-commands off your programs' sockets; or all you can in their folders while
-every pairing is in `folder` mode and the node keeps them there; and root
-where your account is in a group such as `docker` or may use sudo. The card
-goes by what the node reports (`sockets_kept` in `status --json`). **Don't show again** hides the
+with what that gives them in every mode: all you can do, Nerve's settings
+too, and root where your account is in a group such as `docker` or may use
+sudo. **Don't show again** hides the
 card until the account or those ways to root change; **Settings**,
 **General** keeps the line and shows the card again. **Create a separate
 account** gives the

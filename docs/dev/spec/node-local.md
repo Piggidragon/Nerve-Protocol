@@ -1090,21 +1090,20 @@ nothing of the config. `update` of 0.0.2 asks it that way to wait for the
 node it restarted, and puts the old program back if it does not answer `ok`;
 since 0.0.3 `install`, `update` and `setup` send the token.
 
-The token holds as far as the sandbox does. Any program of the commands'
-account that runs commands for whoever connects to its socket runs them
-outside the sandbox, as the account's own process, which reads the token
-(and, as the node's own user, `node.toml` and the keys) as the CLI does. The
-user's systemd and D-Bus session (`systemd-run --user`) is one, a tmux or
-screen server another (`tmux run-shell`, its socket in `/tmp`); there are
-more. With Landlock ABI 9 (Linux 7.1) a `folder` mode command gets a connect
-rule (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, `exec::folder_spec`): it connects
-only to the socket files in its folders and the pairing's `policy.sockets`,
-never to the node's own folders, `/run/nerve-node` or the session bus
-(`paths::bus_places`), keys in files or not. That closes them, unless the
-owner allows such a socket or grants a folder that holds one. Below ABI 9
-there is no such rule, and `folder` mode is no boundary against the
-account's other programs; `status` says which (`sockets_kept`), and the
-desktop app's account card follows it. The boundary is `machine.user`: the commands run as another
+The token holds as far as the sandbox does, and the sandbox holds the
+command's own processes only. Any program of the commands' account that runs
+things for whoever asks it runs them outside the sandbox, as the account's
+own process, which reads the token (and, as the node's own user, `node.toml`
+and the keys) as the CLI does; the account's session service manager and a
+terminal multiplexer are such programs, and there are more. The connect rule
+(`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`) is set only while the keys are in the
+keyring and leaves out only the node's own folders (`exec::connect_rule`), so
+it does not change that. While the commands run as the node's own user or as
+an owner, `folder` mode is therefore no boundary against that account's
+other programs: that is the owner's choice and responsibility, and the
+desktop app's account card says "Nerve's settings too" in every mode. A
+separate account for `folder` mode by default is planned (issue #142). The
+boundary is `machine.user`: the commands run as another
 account that only the node uses and that gets root in no way without a
 password: not root, not in `docker`, `lxd`, `incus-admin`, `libvirt` or
 `disk`, no `NOPASSWD` sudo, and nobody works as it and uses `sudo` or `su`

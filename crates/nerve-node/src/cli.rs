@@ -2403,16 +2403,13 @@ async fn setup_steps(
     }
 
     // Where the keys go, before pairing makes one. Where they may not be in
-    // the keyring (the installed node on Windows, an old Landlock), setup
-    // does not ask; it says why.
+    // the keyring (the installed node on Windows), setup does not ask; it
+    // says why.
     let now = read_config(paths).await?.0.machine.secret_storage;
     let storage = if let Some(n) = no_keyring {
         let _ = writeln!(out, "Warning: {}.", n.why());
         SecretStorage::File
     } else {
-        if crate::secrets::landlock(paths) == crate::secrets::Landlock::Unknown {
-            let _ = writeln!(out, "{LANDLOCK_UNKNOWN}");
-        }
         let answer = ask(
             input,
             out,
@@ -2531,11 +2528,6 @@ async fn setup_steps(
     );
     Ok(())
 }
-
-/// Setup's warning where the kernel's Landlock ABI cannot be read: below
-/// ABI 9 the keys would not be allowed in the keyring
-/// (crate::secrets::keyring_old_landlock), and here nobody can tell.
-const LANDLOCK_UNKNOWN: &str = "Warning: the Landlock ABI of this kernel cannot be read (Landlock is missing or off), so setup cannot tell whether the node's keys may be in the system keyring. On a kernel below Landlock ABI 9 a folder mode command cannot run programs from its folders while the keys are in the keyring: the sandbox cannot grant the keyring's access and execute together. Unless you know this kernel has ABI 9 or later, keep the keys in files (file).";
 
 /// How setup names where the keys are.
 fn storage_place(s: SecretStorage) -> &'static str {
@@ -5701,80 +5693,6 @@ mod tests {
         r.unwrap();
         assert!(!out.contains("are in files now"), "{out}");
         assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
-    }
-
-    /// Below Landlock ABI 9 the keys stay in files: setup warns and does
-    /// not ask, taking keys left in the keyring into files; `config set`
-    /// refuses the keyring; `config accept` refuses a file that keeps them
-    /// there. Where the ABI cannot be read, setup warns and still asks.
-    #[test]
-    fn below_landlock_9_the_keys_stay_in_files() {
-        use crate::secrets::{Landlock, for_tests::pretend_landlock};
-        let (_d, paths) = setup(&["home"]);
-        let key = nerve_transport::keys::NodeKey::generate().unwrap();
-        crate::secrets::store_center_key(&paths, SecretStorage::File, "home", &key).unwrap();
-        let set = |to: &str| run(&paths, &["config", "set", "machine.secret_storage", to]);
-        // The ABI cannot be read: a warning, the question, and the keyring
-        // if asked for.
-        pretend_landlock(&paths, Landlock::Unknown);
-        let (r, out) = setup_with(&paths, "\nkeyring\n\n\n");
-        r.unwrap();
-        assert!(
-            out.contains("the Landlock ABI of this kernel cannot be read"),
-            "{out}"
-        );
-        assert!(out.contains("keep the keys in files (file)"), "{out}");
-        assert!(out.contains("Where the node keeps its keys"), "{out}");
-        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
-        // A file changed by hand that keeps them there is not taken.
-        pretend_landlock(&paths, Landlock::Abi(5));
-        let text = std::fs::read_to_string(paths.config_file()).unwrap();
-        std::fs::write(paths.config_file(), format!("{text}# edited\n")).unwrap();
-        let e = run(&paths, &["config", "accept"]).unwrap_err();
-        assert!(e.contains("was not accepted"), "{e}");
-        assert!(e.contains("Landlock ABI 5, below 9"), "{e}");
-        std::fs::write(paths.config_file(), &text).unwrap();
-        // Setup warns, asks nothing about the keys, and moves them out.
-        let (r, out) = setup_with(&paths, "\n\n\n");
-        r.unwrap();
-        assert!(!out.contains("Where the node keeps its keys"), "{out}");
-        assert!(out.contains("Warning: on this kernel (Landlock ABI 5, below 9) a folder mode command cannot run programs from its folders while the node's keys are in the system keyring: the sandbox cannot grant the keyring's access and execute together"), "{out}");
-        assert!(out.contains("the node's keys are in files now"), "{out}");
-        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
-        assert_eq!(config_key_at(&paths), (true, false));
-        assert!(paths.key_file("home").exists());
-        let e = set("keyring").unwrap_err();
-        assert!(e.contains("Landlock ABI 5, below 9"), "{e}");
-        assert!(e.contains("nothing was changed"), "{e}");
-        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
-        // ABI 9 lets them go there again.
-        pretend_landlock(&paths, Landlock::Abi(9));
-        set("keyring").unwrap();
-        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
-    }
-
-    /// Below Landlock ABI 9 with the keys in a keyring that does not
-    /// answer, setup still offers to install one, so that it can take the
-    /// keys into files.
-    #[test]
-    fn below_landlock_9_setup_reaches_the_keyring_to_empty_it() {
-        use crate::secrets::{Landlock, for_tests::pretend_landlock};
-        let (_d, paths) = setup(&[]);
-        run(
-            &paths,
-            &["config", "set", "machine.secret_storage", "keyring"],
-        )
-        .unwrap();
-        pretend_landlock(&paths, Landlock::Abi(5));
-        crate::secrets::store::set_unreachable(true);
-        let k = crate::keyring_setup::tests::FakeKeyring::new(false);
-        let (r, out) = setup_keyring(&paths, None, &k, "y\n\n\n");
-        crate::secrets::store::set_unreachable(false);
-        r.unwrap();
-        assert!(out.contains("Install it now? [y/N]"), "{out}");
-        assert!(out.contains("the node's keys are in files now"), "{out}");
-        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
-        assert_eq!(config_key_at(&paths), (true, false));
     }
 
     /// Where no keyring answers, setup offers to install one: no keeps the

@@ -339,7 +339,6 @@ pub fn guard_missing(v: &Value) -> bool {
 pub fn no_keyring(reason: &str) -> &'static str {
     match reason {
         "windows-service" => "Not on Windows: the service would not find them in a keyring.",
-        "old-landlock" => "Not on Linux below 7.1: it cannot keep commands away from the keyring.",
         _ => "No keyring answers for the node's account.",
     }
 }

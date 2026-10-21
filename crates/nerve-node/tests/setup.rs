@@ -11,14 +11,10 @@ fn paths(root: &std::path::Path) -> NodePaths {
     NodePaths::new(root.join("config"), root.join("state"))
 }
 
-/// The answer to setup's question where the keys go, Enter, or nothing
-/// where setup does not ask it: on a kernel whose Landlock ABI is below 9
-/// the keys stay in files (docs/user/config.md).
+/// The answer to setup's question where the keys go: Enter keeps them in
+/// files.
 fn storage_answer() -> &'static str {
-    match nerve_sandbox::Confinement::detect().landlock_abi {
-        Some(v) if v < 9 => "",
-        _ => "\n",
-    }
+    "\n"
 }
 
 async fn setup(paths: &NodePaths, answers: &str) -> Result<String, String> {

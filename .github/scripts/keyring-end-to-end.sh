@@ -35,6 +35,12 @@ PASS=ci-owner-pass
 BIN=/usr/local/bin/nerve-node
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=$(mktemp -d)
+# The program where the owner can run it: a checkout is often below a home
+# that only its user may enter.
+INSTALL_FROM=$(mktemp -d)
+chmod 755 "$INSTALL_FROM"
+install -m 755 "$NODE" "$INSTALL_FROM/nerve-node"
+NODE=$INSTALL_FROM/nerve-node
 # A folder every account can enter, and none the owner's.
 cd /
 
@@ -61,7 +67,7 @@ cleanup() {
   # What a failed run leaves: the node, the accounts, the owner.
   if [ -e "$BIN" ]; then "$BIN" uninstall --purge >/dev/null 2>&1 || true; fi
   userdel -r "$OWNER" >/dev/null 2>&1 || true
-  rm -rf "$OUT"
+  rm -rf "$OUT" "$INSTALL_FROM"
   exit "$code"
 }
 trap cleanup EXIT
@@ -93,7 +99,6 @@ printf '%s:%s\n' "$OWNER" "$PASS" | chpasswd
 [ ! -e "$BIN" ] || fail "the test left the node installed"
 
 step "2. Install the node as the owner"
-chmod 755 "$NODE"
 owners_sudo "$NODE" install
 as_owner status | tee "$OUT/status-files"
 grep -q 'daemon: running' "$OUT/status-files"
@@ -135,6 +140,17 @@ done
 as_owner status | tee "$OUT/status-keyring"
 grep -q 'daemon: running' "$OUT/status-keyring" || fail "the node does not come up with its keys in the keyring"
 if grep -q 'folder mode runs no command' "$OUT/status-keyring"; then fail "folder mode is refused with the keys in the keyring"; fi
+# What status says in JSON: the node found its keyring and no folder mode
+# command is held back (the refusal this job exists to keep away).
+as_owner --json status | tee "$OUT/status-json"
+python3 - "$OUT/status-json" <<'PY' || fail "status does not say the node runs with its keys in the keyring"
+import json, sys
+text = open(sys.argv[1]).read()
+status = json.loads(text[text.index("{"):])
+status = status.get("data", status)
+assert status["keyring_failed"] is False, status
+assert "folder_commands_off" not in status or status["folder_commands_off"] is None, status
+PY
 
 step "6. real_account.rs: a center, a restart, a folder mode command as nerve-run"
 NERVE_REAL_KEYRING=1 NERVE_REAL_OWNER=$OWNER \

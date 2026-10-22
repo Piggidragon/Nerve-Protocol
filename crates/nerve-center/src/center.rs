@@ -79,24 +79,28 @@ pub struct Inner {
     /// worked.
     rotation_failed: AtomicBool,
     /// The stored state. Code that holds it takes no other lock of the
-    /// center or of a session, only ones that take nothing more (a link's
-    /// `status`, the log's, `written`): everything else is copied out before
-    /// it is locked. A lock taken under it that is also
-    /// held while the state is taken would deadlock two requests, and with
-    /// them every runtime worker (issue #150).
+    /// center or of a session, only ones that never take it (a link's
+    /// `status` and `wire`, the log's, `saves` and `writing`): everything
+    /// else is copied out before it is locked. A lock taken under it that is
+    /// also held while the state is taken would deadlock two requests, and
+    /// with them every runtime worker (issue #150).
     store: Mutex<Store>,
     dirty: AtomicBool,
     /// The number of the last snapshot of the state taken for its file,
     /// counted under the state's lock, so the numbers follow the changes.
     snapshots: AtomicU64,
-    /// The number of the snapshot the file holds. Locked while the file is
-    /// written, so writes go one at a time and an older snapshot never
-    /// replaces a newer one.
-    written: Mutex<u64>,
+    /// The state file's snapshots: the newest one waiting to be written and
+    /// the number of the one the file holds.
+    saves: Mutex<Saves>,
+    /// Held while the state file is written, so writes go one at a time.
+    writing: Mutex<()>,
     /// How long each write of the state file waits first, for the test of a
     /// slow disk.
     #[cfg(test)]
     save_delay_ms: AtomicU64,
+    /// The writes of the state file, for the test of merged saves.
+    #[cfg(test)]
+    file_writes: AtomicU64,
     codes: Mutex<Codes>,
     links: Mutex<BTreeMap<String, Arc<Link>>>,
     changes: broadcast::Sender<Change>,
@@ -139,6 +143,28 @@ pub struct Inner {
 struct Snapshot {
     n: u64,
     text: std::io::Result<Vec<u8>>,
+}
+
+/// The saves of the state file (see [`Center::write_snapshot`]).
+#[derive(Default)]
+struct Saves {
+    /// The newest snapshot not written yet, with its number.
+    waiting: Option<(u64, Vec<u8>)>,
+    /// The number of the snapshot the file holds.
+    written: u64,
+    /// Why the last write failed.
+    failed: String,
+}
+
+/// Runs `f`, which blocks, so that it holds no worker of a multi-thread
+/// runtime: the worker's other tasks move to another thread meanwhile.
+fn off_the_workers<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /// A one-click install running in the background.
@@ -380,9 +406,12 @@ impl Center {
             store: Mutex::new(store),
             dirty: AtomicBool::new(false),
             snapshots: AtomicU64::new(0),
-            written: Mutex::new(0),
+            saves: Mutex::new(Saves::default()),
+            writing: Mutex::new(()),
             #[cfg(test)]
             save_delay_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            file_writes: AtomicU64::new(0),
             codes: Mutex::new(Codes::default()),
             links: Mutex::new(BTreeMap::new()),
             changes,
@@ -595,21 +624,52 @@ impl Center {
         }
     }
 
-    /// Writes `snap` as the state file, unless the file holds a newer
-    /// snapshot already: that one has every change of this one.
+    /// Returns once the state file holds `snap` or a newer snapshot, which
+    /// has every change of this one. Saves that come together are merged:
+    /// each write takes the newest snapshot waiting, so a burst of changes
+    /// costs about two writes, not one each. The wait is taken off the
+    /// runtime's workers, so a slow disk stops no other request (issue
+    /// #150).
     fn write_snapshot(&self, snap: Snapshot) -> std::io::Result<()> {
         let text = snap.text?;
-        let mut written = self.written.lock().unwrap();
-        if *written >= snap.n {
-            return Ok(());
+        {
+            let mut w = self.saves.lock().unwrap();
+            if w.written >= snap.n {
+                return Ok(());
+            }
+            if w.waiting.as_ref().is_none_or(|(n, _)| *n < snap.n) {
+                w.waiting = Some((snap.n, text));
+            }
         }
-        #[cfg(test)]
-        std::thread::sleep(Duration::from_millis(
-            self.save_delay_ms.load(Ordering::SeqCst),
-        ));
-        Store::write_file(&self.dir, &text)?;
-        *written = snap.n;
-        Ok(())
+        off_the_workers(|| {
+            let _one = self.writing.lock().unwrap();
+            // What waits now is this snapshot or a newer one: a write that
+            // took this one away has ended, and covered it unless it failed.
+            let (n, text) = {
+                let mut w = self.saves.lock().unwrap();
+                if w.written >= snap.n {
+                    return Ok(());
+                }
+                match w.waiting.take() {
+                    Some(next) => next,
+                    None => return Err(std::io::Error::other(w.failed.clone())),
+                }
+            };
+            #[cfg(test)]
+            {
+                self.file_writes.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(
+                    self.save_delay_ms.load(Ordering::SeqCst),
+                ));
+            }
+            let r = Store::write_file(&self.dir, &text);
+            let mut w = self.saves.lock().unwrap();
+            match &r {
+                Ok(()) => w.written = w.written.max(n),
+                Err(e) => w.failed = e.to_string(),
+            }
+            r
+        })
     }
 
     /// Runs `f` on the stored state and saves it, all or nothing: when `f`
@@ -3100,6 +3160,80 @@ mod tests {
         saving.join().unwrap();
         let back = Store::load(dir.path()).unwrap().unwrap();
         assert_eq!(back.center_name, "after");
+    }
+
+    /// Saves that come together are merged: eight changes at once with a
+    /// disk that takes 500 ms a write are on disk in about two writes (1 s),
+    /// not eight one after the other (4 s), and a read meanwhile does not
+    /// wait.
+    #[test]
+    fn saves_that_come_together_are_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.save_delay_ms.store(500, Ordering::SeqCst);
+        let go = Arc::new(std::sync::Barrier::new(8));
+        let t = Instant::now();
+        let savers: Vec<_> = (0..8)
+            .map(|i| {
+                let (c, go) = (c.clone(), go.clone());
+                std::thread::spawn(move || {
+                    go.wait();
+                    c.update(|s| s.pair_code_minutes = 10 + i);
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(200));
+        let r = Instant::now();
+        c.name();
+        assert!(
+            r.elapsed() < Duration::from_millis(200),
+            "a read waited {:?}",
+            r.elapsed()
+        );
+        for s in savers {
+            s.join().unwrap();
+        }
+        // Two writes when the threads come at once; one more is allowed
+        // for a thread that starts late on a busy machine.
+        let writes = c.file_writes.load(Ordering::SeqCst);
+        assert!(writes <= 3, "eight saves wrote the file {writes} times");
+        assert!(
+            t.elapsed() < Duration::from_millis(2500),
+            "eight saves took {:?}",
+            t.elapsed()
+        );
+        let now = c.read(|s| s.pair_code_minutes);
+        assert_eq!(
+            Store::load(dir.path()).unwrap().unwrap().pair_code_minutes,
+            now
+        );
+    }
+
+    /// A save that waits for a slow disk holds no worker of the runtime: a
+    /// task queued on the saving worker runs at once, not after the save,
+    /// so the ports keep answering while the disk is slow (issue #150).
+    #[test]
+    fn a_slow_save_holds_no_runtime_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.save_delay_ms.store(500, Ordering::SeqCst);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let saver = rt.spawn(async move {
+            let t = Instant::now();
+            // Queued on this worker, which then saves.
+            let other = tokio::spawn(async move { t.elapsed() });
+            c.update(|s| s.pair_code_minutes = 11);
+            other.await.unwrap()
+        });
+        let waited = rt.block_on(saver).unwrap();
+        assert!(
+            waited < Duration::from_millis(250),
+            "a task waited {waited:?} for the save's worker"
+        );
     }
 
     /// Saves that finish out of order leave the newest state in the file:

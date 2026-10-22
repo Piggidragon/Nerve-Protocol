@@ -643,14 +643,16 @@ impl Center {
         }
         off_the_workers(|| {
             let _one = self.writing.lock().unwrap();
-            // What waits now is this snapshot or a newer one: a write that
-            // took this one away has ended, and covered it unless it failed.
+            // Only a snapshot at least as new as this one is written here, so
+            // Ok always means the file holds this change. When none waits, a
+            // write that took this one away has ended, and failed (else it
+            // covered it). An older one that waits is left to its own save.
             let (n, text) = {
                 let mut w = self.saves.lock().unwrap();
                 if w.written >= snap.n {
                     return Ok(());
                 }
-                match w.waiting.take() {
+                match w.waiting.take_if(|(n, _)| *n >= snap.n) {
                     Some(next) => next,
                     None => return Err(std::io::Error::other(w.failed.clone())),
                 }
@@ -3233,6 +3235,97 @@ mod tests {
         assert!(
             waited < Duration::from_millis(250),
             "a task waited {waited:?} for the save's worker"
+        );
+    }
+
+    /// Runs the race of a covering write that fails (review round 2 of
+    /// #150): `one` is being written (500 ms a write); `two` waits behind
+    /// it; `four`, the newest, is saved by `save`; `two`'s write takes
+    /// `four` and fails, as the folder is closed for it; an older snapshot
+    /// (`three`, taken before `four`) reaches the queue only then. The save
+    /// of `four` may not write `three` and report `four` as kept. Returns
+    /// what that save returned and the name in the file.
+    #[cfg(unix)]
+    fn a_failed_covering_write(
+        save: impl FnOnce(&Center) -> Result<(), String> + Send + 'static,
+    ) -> (Result<(), String>, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.save_delay_ms.store(500, Ordering::SeqCst);
+        let t0 = Instant::now();
+        let at = move |ms: u64| {
+            std::thread::sleep(Duration::from_millis(ms).saturating_sub(t0.elapsed()))
+        };
+        let update = |name: &'static str| {
+            let c = c.clone();
+            std::thread::spawn(move || c.update(|s| s.center_name = name.into()))
+        };
+        let one = update("one");
+        at(50);
+        // Taken under the lock, and not at the queue yet.
+        let late = {
+            let mut s = c.store.lock().unwrap();
+            s.center_name = "three".into();
+            c.snapshot(&s)
+        };
+        at(100);
+        let two = update("two");
+        at(200);
+        let q = {
+            let c = c.clone();
+            std::thread::spawn(move || save(&c))
+        };
+        at(700);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        at(800);
+        let older = {
+            let c = c.clone();
+            std::thread::spawn(move || c.write_snapshot(late))
+        };
+        at(1200);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        one.join().unwrap();
+        two.join().unwrap();
+        let r = q.join().unwrap();
+        let _ = older.join().unwrap();
+        let on_disk = Store::load(dir.path()).unwrap().unwrap().center_name;
+        (r, on_disk)
+    }
+
+    /// A save is only Ok when the file holds its snapshot or a newer one:
+    /// after the write that took it away failed, it does not write an older
+    /// snapshot in its place and report success.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_whose_covering_write_failed_does_not_write_an_older_one() {
+        let (r, on_disk) = a_failed_covering_write(|c| {
+            let mut s = c.store.lock().unwrap();
+            s.center_name = "four".into();
+            let snap = c.snapshot(&s);
+            drop(s);
+            c.write_snapshot(snap).map_err(|e| e.to_string())
+        });
+        assert!(
+            r.is_err() || on_disk == "four",
+            "the save of four returned Ok, but the file holds {on_disk:?}"
+        );
+    }
+
+    /// The same race through `update_saved`: a change it reports as kept
+    /// (a node's new key, say) is in the file, or it fails and is undone.
+    #[cfg(unix)]
+    #[test]
+    fn update_saved_is_kept_before_it_is_told() {
+        let (r, on_disk) = a_failed_covering_write(|c| {
+            c.update_saved(|s| {
+                s.center_name = "four".into();
+                Ok(())
+            })
+        });
+        assert!(
+            r.is_err() || on_disk == "four",
+            "update_saved returned Ok, but the file holds {on_disk:?}"
         );
     }
 

@@ -14,6 +14,19 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const HEAD_BYTES: usize = 16 * 1024;
 /// How long a peer may take to send its request head.
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
+/// The slowest a peer may send a request body or take a response, on
+/// average after [`HEAD_TIMEOUT`]: a peer that sends or reads slower holds
+/// one of the listener's connections, so it is dropped.
+pub const MIN_RATE: u64 = 16 * 1024;
+/// The size of each part of a response written; one that the peer does not
+/// take within [`HEAD_TIMEOUT`] ends the write.
+const WRITE_PART: usize = 16 * 1024;
+
+/// How long a peer has to send or take `len` bytes: [`HEAD_TIMEOUT`], and
+/// a second more for each [`MIN_RATE`] bytes.
+pub fn time_for(len: usize) -> Duration {
+    HEAD_TIMEOUT + Duration::from_millis(len as u64 * 1000 / MIN_RATE)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -148,19 +161,27 @@ pub async fn read_request<R: AsyncRead + Unpin>(
     if rest.len() > len {
         rest.truncate(len);
     }
-    let mut body = rest;
-    while body.len() < len {
-        let mut chunk = vec![0u8; (len - body.len()).min(64 * 1024)];
-        let n = tokio::time::timeout(HEAD_TIMEOUT, io.read(&mut chunk))
-            .await
-            .map_err(|_| "timed out reading the request body".to_string())?
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err("connection closed inside the request body".into());
+    // Each read has HEAD_TIMEOUT, and the whole body `time_for` its length:
+    // a body sent a byte at a time would otherwise hold the connection for
+    // as long as the peer likes.
+    let read = async {
+        let mut body = rest;
+        while body.len() < len {
+            let mut chunk = vec![0u8; (len - body.len()).min(64 * 1024)];
+            let n = tokio::time::timeout(HEAD_TIMEOUT, io.read(&mut chunk))
+                .await
+                .map_err(|_| "timed out reading the request body".to_string())?
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("connection closed inside the request body".to_string());
+            }
+            body.extend_from_slice(&chunk[..n]);
         }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    out.body = body;
+        Ok(body)
+    };
+    out.body = tokio::time::timeout(time_for(len), read)
+        .await
+        .map_err(|_| "the request body came too slowly".to_string())??;
     Ok(out)
 }
 
@@ -245,6 +266,10 @@ impl Response {
         self
     }
 
+    /// Writes the response. A peer that takes no part of it for
+    /// [`HEAD_TIMEOUT`], or takes all of it slower than [`time_for`] allows,
+    /// gets `TimedOut`: it would hold the connection, and with it one of the
+    /// listener's, for as long as it likes.
     pub async fn write<W: AsyncWrite + Unpin>(&self, io: &mut W) -> std::io::Result<()> {
         let mut head = format!("HTTP/1.1 {} {}\r\n", self.status, reason(self.status));
         for (k, v) in &self.headers {
@@ -254,9 +279,25 @@ impl Response {
             "Content-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
             self.body.len()
         ));
-        io.write_all(head.as_bytes()).await?;
-        io.write_all(&self.body).await?;
-        io.flush().await
+        let timed_out = || {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the peer takes the response too slowly",
+            )
+        };
+        let write = async {
+            for part in std::iter::once(head.as_bytes()).chain(self.body.chunks(WRITE_PART)) {
+                tokio::time::timeout(HEAD_TIMEOUT, io.write_all(part))
+                    .await
+                    .map_err(|_| timed_out())??;
+            }
+            tokio::time::timeout(HEAD_TIMEOUT, io.flush())
+                .await
+                .map_err(|_| timed_out())?
+        };
+        tokio::time::timeout(time_for(head.len() + self.body.len()), write)
+            .await
+            .map_err(|_| timed_out())?
     }
 }
 
@@ -490,6 +531,45 @@ mod tests {
         a.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
         drop(a);
         assert!(read_request_head(&mut b).await.is_err());
+    }
+
+    /// A peer that reads nothing of its answer is dropped once a part of it
+    /// waits [`HEAD_TIMEOUT`]: it would hold the connection, and one of the
+    /// listener's slots, for good (issue #150).
+    #[tokio::test]
+    async fn a_peer_that_takes_nothing_of_the_response_is_dropped() {
+        let (_a, mut b) = tokio::io::duplex(1024);
+        let resp = Response::new(200, "text/plain", vec![b'x'; 64 * 1024]);
+        let t = std::time::Instant::now();
+        let r = tokio::time::timeout(HEAD_TIMEOUT * 3, resp.write(&mut b))
+            .await
+            .expect("the write waited on a peer that takes nothing");
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(t.elapsed() >= HEAD_TIMEOUT, "{:?}", t.elapsed());
+    }
+
+    /// A request body sent a byte now and then is dropped after
+    /// [`time_for`] its length, though each byte comes within
+    /// [`HEAD_TIMEOUT`] of the last (issue #150).
+    #[tokio::test]
+    async fn a_body_sent_a_byte_at_a_time_is_dropped() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        let sender = tokio::spawn(async move {
+            a.write_all(b"POST / HTTP/1.1\r\nContent-Length: 1000\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..1000 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if a.write_all(b"x").await.is_err() {
+                    return;
+                }
+            }
+        });
+        let r = tokio::time::timeout(HEAD_TIMEOUT * 3, read_request(&mut b, 1000))
+            .await
+            .expect("the body was waited for without end");
+        assert!(r.unwrap_err().contains("too slowly"));
+        sender.abort();
     }
 
     #[tokio::test]

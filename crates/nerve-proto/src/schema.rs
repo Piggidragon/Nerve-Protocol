@@ -229,6 +229,14 @@ fn below(at: &str, step: &str) -> String {
 /// docs/dev/spec/protocol.md §6 for what it allows. The first problem found
 /// is returned.
 pub fn check(schema: &Value, role: Role) -> Result<(), SchemaError> {
+    // The size first: it bounds the walk's work (an `enum`'s values are
+    // compared with each other), and `text_len` stops soon after the limit.
+    if text_len(schema, MAX_TEXT_BYTES) > MAX_TEXT_BYTES {
+        return Err(SchemaError {
+            pointer: String::new(),
+            reason: format!("the schema is over {} KiB", MAX_TEXT_BYTES / 1024),
+        });
+    }
     if role == Role::Params && schema.get("type") != Some(&Value::from("object")) {
         return Err(SchemaError {
             pointer: String::new(),
@@ -253,13 +261,6 @@ pub fn check(schema: &Value, role: Role) -> Result<(), SchemaError> {
         let mut next = Vec::new();
         node(m, &at, depth == 1, &mut next)?;
         stack.extend(next.into_iter().rev().map(|(s, p)| (s, p, depth + 1)));
-    }
-    let len = text_len(schema, MAX_TEXT_BYTES);
-    if len > MAX_TEXT_BYTES {
-        return Err(SchemaError {
-            pointer: String::new(),
-            reason: format!("the schema is over {} KiB", MAX_TEXT_BYTES / 1024),
-        });
     }
     Ok(())
 }
@@ -463,24 +464,29 @@ struct Bound<'a> {
 }
 
 impl Bound<'_> {
-    /// The least integer a lower bound lets through.
+    /// The least integer a lower bound lets through. An integer is an `i64`
+    /// or a `u64` (see `Ty::fits`), so a bound past that range lets through
+    /// one past its end, and a float bound far out cannot overflow here.
     fn first_integer(self) -> i128 {
-        match (int(self.n), self.exclusive) {
+        let i = match (int(self.n), self.exclusive) {
             (Some(i), false) => i,
             (Some(i), true) => i + 1,
             (None, false) => self.n.as_f64().unwrap_or(f64::NAN).ceil() as i128,
-            (None, true) => self.n.as_f64().unwrap_or(f64::NAN).floor() as i128 + 1,
-        }
+            (None, true) => (self.n.as_f64().unwrap_or(f64::NAN).floor() as i128).saturating_add(1),
+        };
+        i.clamp(i128::from(i64::MIN), i128::from(u64::MAX) + 1)
     }
 
-    /// The greatest integer an upper bound lets through.
+    /// The greatest integer an upper bound lets through, held to the
+    /// integers as `first_integer` is.
     fn last_integer(self) -> i128 {
-        match (int(self.n), self.exclusive) {
+        let i = match (int(self.n), self.exclusive) {
             (Some(i), false) => i,
             (Some(i), true) => i - 1,
             (None, false) => self.n.as_f64().unwrap_or(f64::NAN).floor() as i128,
-            (None, true) => self.n.as_f64().unwrap_or(f64::NAN).ceil() as i128 - 1,
-        }
+            (None, true) => (self.n.as_f64().unwrap_or(f64::NAN).ceil() as i128).saturating_sub(1),
+        };
+        i.clamp(i128::from(i64::MIN) - 1, i128::from(u64::MAX))
     }
 }
 
@@ -908,6 +914,8 @@ mod tests {
             json!({"type": "integer", "exclusiveMinimum": 1, "exclusiveMaximum": 3}),
             json!({"type": "integer", "minimum": 1.5, "maximum": 2.5}),
             json!({"type": "integer", "minimum": 0, "exclusiveMinimum": 3, "maximum": 4}),
+            json!({"type": "integer", "exclusiveMinimum": -1e300, "exclusiveMaximum": 1e300}),
+            json!({"type": "integer", "minimum": 1e19, "maximum": 1e20}),
             json!({"type": "integer", "minimum": 1, "enum": [1, 2]}),
             json!({"type": ["integer", "null"], "minimum": 1, "enum": [1, null]}),
             json!({"type": "string", "maxLength": 3, "const": "abc"}),
@@ -1086,6 +1094,22 @@ mod tests {
                 json!({"type": "integer", "minimum": 1.2, "maximum": 1.8}),
                 "leave no integer",
             ),
+            // Bounds far past what an integer can be (an i64 or a u64).
+            (
+                "exclusiveMinimum",
+                json!({"type": "integer", "exclusiveMinimum": 1e300, "maximum": 5}),
+                "exclusiveMinimum and maximum leave no integer",
+            ),
+            (
+                "minimum",
+                json!({"type": "integer", "minimum": -5, "exclusiveMaximum": -1e300}),
+                "minimum and exclusiveMaximum leave no integer",
+            ),
+            (
+                "minimum",
+                json!({"type": "integer", "minimum": 1e20, "maximum": 1e21}),
+                "leave no integer",
+            ),
             (
                 "enum",
                 json!({"type": "integer", "minimum": 5, "enum": [5, 1]}),
@@ -1261,6 +1285,19 @@ mod tests {
     }
 
     #[test]
+    fn a_long_enum_is_refused_for_its_size_at_once() {
+        // An enum's values are compared with each other, so a schema far
+        // over the limit is refused before that work, not after it.
+        let e: Vec<Value> = (0..50_000).map(Value::from).collect();
+        let s = with(json!({"type": "integer", "enum": e}));
+        let start = std::time::Instant::now();
+        let e = check(&s, Role::Params).unwrap_err();
+        assert!(e.reason.contains("over 16 KiB"), "{e}");
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    }
+
+    #[test]
     fn text_len_counts_compact_json() {
         let v = json!({"a\"b": [1, -2.5, true, false, null, "ü\n\\"], "c": {}, "d": [],
                        "e": {"f": 1e300, "g": u64::MAX}});
@@ -1307,9 +1344,11 @@ mod tests {
         take_apart(props);
         take_apart(items);
         take_apart(args);
+        // Refused for their size, which is counted without recursion before
+        // the walk (that one stops at the depth limit).
         for c in checked {
             let e = c.unwrap_err();
-            assert!(e.reason.contains("deeper than"), "{e}");
+            assert!(e.reason.contains("over 16 KiB"), "{e}");
         }
         assert_eq!(deep, Ok(()));
         assert!(shallow.is_err());

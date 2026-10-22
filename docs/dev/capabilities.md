@@ -23,8 +23,8 @@ conditions, `pattern` or `format`. `nerve_proto::schema::check` says whether
 a schema keeps to it, `nerve_proto::schema::validate` whether arguments fit
 one. The node runs `check` on every schema it publishes (a test covers each
 built-in one) and on a provider's, and `validate` on a provider's arguments;
-the center runs `check` when it reads a descriptor and `validate` before
-every call it sends.
+the center runs `check` on every schema of a descriptor it reads (event data
+and state included) and `validate` before every call it sends.
 
 ## Descriptor
 
@@ -58,7 +58,8 @@ every call it sends.
   an id, and an action with such a name, and keeps the rest.
 - The center builds a catalog per node from its descriptor
   (`nerve-center` `catalog.rs`): one unit per `cap.action`, and the units it
-  left out (a bad name, a schema outside the subset) with their reasons. The
+  left out (a bad name, a schema outside the subset; every action of a
+  capability whose event data or state is outside it) with their reasons. The
   catalog is rebuilt from the descriptor, never stored; the overview shows
   what was left out.
 - `provider` says which process serves the capability: `node` for the node's

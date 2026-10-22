@@ -504,7 +504,10 @@ Errors carry a string code in `error.data.code` (§5.3).
   refused. There is no field for "allowed", a mode or a folder.
 - `deadline_ms` is a duration in milliseconds from receipt; past it the node
   fails the call with `timeout`.
-- `progress.id` and `cancel.id` are the `invoke` request id.
+- `progress.id` and `cancel.id` are the `invoke` request id. An `invoke` id
+  is an integer of 0 or more, since `exec.signal` and the `exec/exit` event
+  name a call by it (§7.3); a node refuses an `invoke` with a string id
+  (`invalid_request`). Other requests may use either.
 - Topics are `<cap>/<event>`, `<cap>/state` or `<cap>/*`. Events of the `node`
   and `settings` capabilities are implicit: they are sent without
   `sub`. Everything else needs one.
@@ -623,7 +626,9 @@ in the subset when:
   numeric bounds `integer` or `number`. `required` names each property once,
   and only properties that `properties` names. `enum` is not empty, and its
   values and `const` fit the type. No pair of bounds leaves nothing between
-  them.
+  them: of `minimum` and `exclusiveMinimum` the tighter counts (the same for
+  the upper pair), and for `integer` there must be a whole number between
+  them. Each value of `enum` and the `const` keeps to the schema's bounds.
 - The arguments schema's root is `{"type": "object", …}`. It nests at most 3
   levels deep, a result, event data or state at most 4: the root is level 1,
   and a property's or an array's items schema is one level below its
@@ -639,8 +644,9 @@ like goes into `description`; a choice of values is an `enum`.
 An action without `params` takes any object of arguments, as
 `{"type": "object"}`; without `result` (or an event without `data`) the
 descriptor says nothing of it. A center leaves out an action whose schemas
-are outside the subset, with the reason, and offers the rest; the owner sees
-what was left out (harness.md §7). A node does not attach a provider's action
+are outside the subset, with the reason, and offers the rest; it leaves out
+every action of a capability whose `state` or an event's `data` is outside
+it. The owner sees what was left out (harness.md §7). A node does not attach a provider's action
 whose schemas are outside it (node-local.md §7).
 
 Arguments fit a schema when their value has its type, takes a value of
@@ -648,7 +654,9 @@ Arguments fit a schema when their value has its type, takes a value of
 with `additionalProperties: false`, no field `properties` does not name; the
 same holds for each field and item. An `integer` is a number without a
 fraction or an exponent, so `5.0` is not one. `default` is a hint for the
-caller; neither end fills it in. Arguments that do not fit are refused with
+caller; neither end fills it in. An argument that may be left out and whose
+`null` the node reads as left out says so with `null` in its type
+(`["integer", "null"]`), as the node's own do. Arguments that do not fit are refused with
 `invalid_args` whose `data` holds `field`, the dotted path to what does not
 fit (`sudo.sealed`, `entries[2].name`, empty for the arguments as a whole),
 and `expected`, in words (`an integer from 1 to 600`).
@@ -687,7 +695,7 @@ concurrently.
 | `signal` | actuate | `{call, signal: "term"|"kill"|"int"}` → `{}` |
 
 - `command` is a string run by the node's shell. `call` is the `invoke` id of a
-  running `run`.
+  running `run`, an integer (§5.1).
 - `timeout_ms` is the longest the command may run; 0 is the same as none.
   A node ends every command: one without `timeout_ms` gets the node's
   default, one with a larger value gets the node's maximum, and past its limit

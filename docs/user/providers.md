@@ -70,7 +70,7 @@ call that was waiting for it fails with `unavailable`.
 Each action describes its arguments and its result with a JSON Schema. The
 center hands them to the agent and checks every call's arguments against
 them, so only a small, plain part of JSON Schema is allowed: one type per
-value (or one type or `null`), properties, required fields, lists, a list of
+value (or one type and `null`), properties, required fields, lists, a list of
 allowed values (`enum`), bounds for numbers, texts and lists, and
 descriptions. References (`$ref`), alternatives (`oneOf`, `anyOf`), conditions,
 patterns and formats are not, nor is nesting more than three levels deep in

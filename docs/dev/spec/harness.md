@@ -72,8 +72,8 @@ that does not match `Host` are refused (403).
 ## 4. Tools
 
 - `nodes` lists the paired nodes, whether they are online and what
-  they offer. A node the owner disabled in the center is listed and marked as
-  disabled, with no offer.
+  they offer: the capabilities the agent has a tool of. A node the owner
+  disabled in the center is listed and marked as disabled, with no offer.
 - A capability with a profile becomes one tool per action, `<cap>_<action>`,
   shared by every node that offers the same capability with the same
   arguments and effect. Its first, required argument `node` names the node.

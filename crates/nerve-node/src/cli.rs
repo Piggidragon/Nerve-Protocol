@@ -1141,6 +1141,7 @@ impl List {
                 // capability (`C:\tools\x.exe`).
                 Some((scope, _)) if scope.len() > 1 && rules::valid_scope(scope) => {
                     rules::validate(new)?;
+                    rules::check_no_written_controls(new)?;
                     Ok(new.to_string())
                 }
                 _ => self.command_rule(new, false),
@@ -1152,6 +1153,7 @@ impl List {
                     format!("sudo {new}")
                 };
                 rules::validate_command_glob(&glob)?;
+                rules::check_no_written_controls(&glob)?;
                 Ok(glob)
             }
         }
@@ -3539,6 +3541,14 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
                 let toml::Value::Array(a) = list else {
                     return Err(format!("{key} is not a list"));
                 };
+                // The text `rule ls` prints for a tab or line break is not
+                // one: the rule would look like the listed one and not be.
+                if ["allow", "deny", "sudo_allow"]
+                    .iter()
+                    .any(|l| key.starts_with("center.") && key.ends_with(&format!(".policy.{l}")))
+                {
+                    rules::check_no_written_controls(value)?;
+                }
                 a.push(literal(value));
             }
             ConfigCmd::Remove { key, value } => {
@@ -8244,7 +8254,28 @@ mod tests {
             deny()
         );
         // A rule with a backslash and an `n` of its own is found as it is.
-        let own = "exec.run:type C:\\new\\x";
+        // A `\n` of the rule's own cannot be added (it would pass for a line
+        // break): `config add` refuses it, and a pair of backslashes it takes.
+        let e = run(
+            &paths,
+            &[
+                "config",
+                "add",
+                "center.home.policy.deny",
+                "exec.run:type C:\\new",
+            ],
+        )
+        .unwrap_err();
+        assert!(e.contains("the letter t, r or n"), "{e}");
+        let before = deny();
+        let e = run(
+            &paths,
+            &["rule", "edit", "deny", guard[12], "exec.run:a\\tb"],
+        )
+        .unwrap_err();
+        assert!(e.contains("the letter t, r or n"), "{e}");
+        assert_eq!(deny(), before);
+        let own = "exec.run:type C:\\\\new";
         run(&paths, &["config", "add", "center.home.policy.deny", own]).unwrap();
         let ls = run(&paths, &["rule", "ls", "deny"]).unwrap();
         assert!(ls.contains(own), "{ls}");

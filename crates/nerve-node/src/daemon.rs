@@ -1990,7 +1990,8 @@ fn is_quiet_key(key: &str) -> bool {
 fn show_value(v: &Value) -> String {
     let text = match v {
         Value::Null => "unset".to_string(),
-        Value::String(s) => s.clone(),
+        // A rule of the guard holds tabs and line breaks; the log is lines.
+        Value::String(s) => nerve_policy::rules::escape_controls(s),
         other => other.to_string(),
     };
     clip(&text, 80)
@@ -3372,6 +3373,19 @@ node_id = "n1"
             text,
             "settings changed by local (version 7): relay.listen: 0.0.0.0:7490 -> 0.0.0.0:7491; relay.node changed"
         );
+    }
+
+    /// A guard rule holds tabs and line breaks; the log line keeps them
+    /// written out, so one change is one line.
+    #[test]
+    fn a_rule_with_line_breaks_is_one_log_line() {
+        let rule = nerve_policy::rules::GUARD[0];
+        assert!(rule.contains('\n'));
+        let list =
+            |v: &[&str]| Value::Array(v.iter().map(|s| Value::String(s.to_string())).collect());
+        let text = describe_leaf("center.lab.policy.deny", &list(&[]), &list(&[rule]));
+        assert!(!text.contains(['\n', '\r', '\t']), "{text:?}");
+        assert!(text.contains("\\r\\n"), "{text}");
     }
 
     #[test]

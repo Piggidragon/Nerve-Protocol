@@ -361,8 +361,15 @@ macro_rules! node {
     };
 }
 
-/// Up to eight spaces, tabs or line breaks: the indent of a line in a script.
+/// Up to sixteen spaces, tabs or line breaks: the indent of a line in a
+/// script, four levels of four.
 macro_rules! ws {
+    () => {
+        concat!(ws8!(), ws8!())
+    };
+}
+
+macro_rules! ws8 {
     () => {
         concat!(
             "{,[ \t\r\n]}{,[ \t\r\n]}{,[ \t\r\n]}{,[ \t\r\n]}",
@@ -371,14 +378,25 @@ macro_rules! ws {
     };
 }
 
-/// The scope and where a command of the service rules starts: the line's
-/// start or after `;`, `&`, `|`, `(` or a line break, then `sudo` and its
-/// flags if the command begins with it. `sudo` counts only at a command's
-/// start, so a quoted mention (`git commit -m "run sudo systemctl stop
-/// nerve-node"`) runs.
+/// The scope and where a command starts: the line's start or after `;`,
+/// `&`, `|`, `(`, `{` or a line break, then a shell keyword (`then`, `do`,
+/// `else`, `!`, `time`, `nohup`) or a brace.
+macro_rules! begin {
+    () => {
+        concat!(
+            "exec.run:{,*[;&|({\r\n]}",
+            ws!(),
+            "{,then ,do ,else ,[{] ,! ,time ,nohup }"
+        )
+    };
+}
+
+/// [`begin!`], then `sudo` and its flags if the command begins with it. `sudo`
+/// counts only at a command's start, so a quoted mention on one line (`git
+/// commit -m "run sudo systemctl stop nerve-node"`) runs.
 macro_rules! command {
     () => {
-        concat!("exec.run:{,*[;&|(\r\n]}", ws!(), "{,sudo ,sudo * }")
+        concat!(begin!(), "{,sudo ,sudo * }")
     };
 }
 
@@ -386,14 +404,14 @@ macro_rules! command {
 /// or a character that chains the next command.
 macro_rules! end {
     () => {
-        "{,[ \t\r\n\"');&|]*}"
+        "{,[ \t\r\n\"');&|}]*}"
     };
 }
 
 /// [`end!`], and a comma, which ends a name in a PowerShell list.
 macro_rules! end_ps {
     () => {
-        "{,[ \t\r\n\"');,&|]*}"
+        "{,[ \t\r\n\"');,&|}]*}"
     };
 }
 
@@ -415,12 +433,14 @@ macro_rules! end_ps {
 /// may remove any of them.
 pub const GUARD: &[&str] = &[
     // By name where a command starts: the line's start, after `;`, `&`,
-    // `|`, `(` or a line break (with its indent), and after `sudo`; then the
-    // line's end, a space, a tab, a line break or a quote.
+    // `|`, `(`, `{` or a line break (with its indent), a shell keyword, and
+    // `sudo`; then the line's end, a space, a tab, a line break or a quote.
+    // The program follows `sudo` or one of its common flags directly, so
+    // `sudo cargo build -p nerve-node` runs.
     concat!(
-        "exec.run:{,*[;&|(\r\n]}",
-        ws!(),
-        "{,*sudo }nerve-node{,-desktop}{,.exe}{,[ \t\r\n\"']*}"
+        begin!(),
+        "{,sudo ,sudo -? ,sudo -- ,sudo -u root ,sudo -n -u root }",
+        "nerve-node{,-desktop}{,.exe}{,[ \t\r\n\"']*}"
     ),
     "exec.run:*[/\\]nerve-node{,-desktop}{,.exe}{,[ \t\r\n\"']*}",
     "exec.run:*/run/nerve-node{,/*,[ \t\r\n\"']*}",
@@ -585,6 +605,19 @@ pub fn escape_controls(rule: &str) -> String {
         }
     }
     out
+}
+
+/// Why a rule of the allow, deny or sudo list may not hold a `\t`, `\r` or
+/// `\n` written with a backslash, if it does. `rule ls` writes the tab and
+/// line breaks of a rule so ([`escape_controls`]), and a rule typed with the
+/// listed text would be a different glob: there `\n` is the letter `n`.
+pub fn check_no_written_controls(rule: &str) -> Result<(), String> {
+    if unescape_controls(rule) == rule {
+        return Ok(());
+    }
+    Err(format!(
+        "rule {rule:?}: a `\\t`, `\\r` or `\\n` in a glob is the letter t, r or n, not a tab or line break. Write the character itself (as `rule guard` puts the guard's rules), `[\\]` for a backslash, or `/` in a path"
+    ))
 }
 
 /// The reverse of [`escape_controls`]: `\t`, `\r` and `\n` become the
@@ -792,10 +825,19 @@ mod tests {
             "cat ~/.config/nerve\r\nls",
             "ls $HOME/.local/state/nerve\n",
             "type %ProgramData%/Nerve\r\ndir",
+            // sudo and the keywords before a program: at a command's start.
+            "sudo -n nerve-node status",
+            "if true; then nerve-node status; fi",
+            "if true; then sudo nerve-node status; fi",
+            "for i in 1; do sudo -u root nerve-node audit; done",
+            "{ nerve-node status; }",
         ] {
             assert!(run(c), "should be refused: {c}");
         }
         for c in [
+            // sudo has to begin the command, in rule 0 too.
+            "git commit -m \"use sudo nerve-node audit to see it\"",
+            "echo \"then run sudo nerve-node service stop\"",
             "ls ~/.config",
             "cargo build -p nerve-node",
             "cargo test -p nerve-node-desktop --test shots",
@@ -863,6 +905,25 @@ mod tests {
         for o in GUARD_OLD {
             validate(o).unwrap();
             assert!(!GUARD.contains(o), "{o} is current");
+        }
+    }
+
+    /// What the rules refuse although it only mentions the node, as the docs
+    /// say: a line break in quoted text starts a command, and `pkill -f`
+    /// reads on to a name later in the line. A change here is a change of the
+    /// documented limit.
+    #[test]
+    fn the_known_false_positives_stay_the_documented_ones() {
+        let rules: Vec<String> = GUARD.iter().map(|g| g.to_string()).collect();
+        let set = RuleSet::new(&rules, Path::new("/home/alice"));
+        for c in [
+            "git commit -m \"Guard the service\n\nnerve-node now refuses systemctl stop\"",
+            "git commit -F - <<'EOF'\nFix it\n\nsystemctl stop nerve-node is refused now\nEOF",
+            "git commit -m \"Docs (Stop-Service nerve-node)\"",
+            "echo \"{ sudo systemctl stop nerve-node }\"",
+            "pkill -f \"cargo run -p nerve-node\"",
+        ] {
+            assert!(set.find("exec", "run", c).is_some(), "{c}");
         }
     }
 
@@ -1023,6 +1084,25 @@ mod tests {
             "get-service nerve-node | stop-service",
             "GET-SERVICE NERVE-NODE | STOP-SERVICE",
             "Get-Process Nerve-Node | Stop-Process",
+            // A shell keyword or a brace is not a program: a command after
+            // one starts a command, with or without sudo.
+            "if systemctl is-active --quiet nerve-node; then sudo systemctl restart nerve-node; fi",
+            "if true; then systemctl restart nerve-node; fi",
+            "for i in 1 2; do sudo systemctl restart nerve-node; done",
+            "if x; then echo; else sudo systemctl stop nerve-node; fi",
+            "{ sudo systemctl stop nerve-node; }",
+            "{sudo systemctl stop nerve-node;}",
+            "! sudo systemctl stop nerve-node",
+            "time sudo systemctl restart nerve-node",
+            "nohup sudo systemctl restart nerve-node &",
+            "if ($true) { Stop-Service nerve-node }",
+            "if ($true) {Stop-Service nerve-node}",
+            "try { Restart-Service nerve-node -Force } catch { Write-Error $_ }",
+            "foreach ($s in 1..2) { Restart-Service nerve-node }",
+            "$null = 1; if ($?) { sc stop nerve-node }",
+            "f() {\n    if x; then\n        if y; then\n            sudo systemctl restart nerve-node\n        fi\n    fi\n}",
+            "foreach ($i in 1..2) {\n    if ($i) {\n        if ($i -gt 1) {\n            Restart-Service nerve-node\n        }\n    }\n}",
+            "f() {\n                sudo systemctl restart nerve-node\n}",
         ] {
             let found = all.find("exec", "run", c);
             let Some(rule) = found else {
@@ -1112,6 +1192,10 @@ mod tests {
             "pkill nerve-node-extra",
             "pkill -f my-nerve-node",
             "pkill -u nerve sshd",
+            // Keywords and braces need a command start in front.
+            "git commit -m \"then sudo systemctl stop nerve-node\"",
+            "echo \"do sudo pkill nerve-node\"",
+            "echo then sudo service nerve-node restart",
         ] {
             assert!(!run(c), "should stay allowed: {c}");
         }

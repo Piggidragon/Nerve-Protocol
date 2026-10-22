@@ -635,6 +635,18 @@ fn the_app_drives_the_cli_end_to_end() {
     assert!(perm.get_allow().iter().any(|r| r == "fs.read:~/notes/*"));
     perm.invoke_rule_remove(0, "fs.read:~/notes/*".into());
     assert!(!allowed("fs.read:~/notes/*"));
+    // The text `rule ls` writes for a line break is not one: refused, with
+    // the field kept.
+    perm.set_allow_text("exec.run:a\\nb".into());
+    perm.invoke_rule_add(0);
+    assert!(!allowed("exec.run:a\\nb"));
+    assert!(
+        store.get_toast().contains("the letter t, r or n"),
+        "{}",
+        store.get_toast()
+    );
+    assert_eq!(perm.get_allow_text(), "exec.run:a\\nb");
+    perm.set_allow_text("".into());
     perm.invoke_cap_set("exec.run".into(), 1);
     assert_eq!(
         config(&paths).centers[0].policy.caps.get("exec.run"),

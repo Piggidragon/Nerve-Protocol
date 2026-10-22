@@ -55,21 +55,33 @@ not want.
 The Windows commands match in any case (`STOP-SERVICE`, `NET STOP`,
 `sc stop Nerve-Node`, `taskkill /IM NERVE-NODE.EXE`), as Windows reads them.
 The rules see a line break or a tab after a name or before a command as they
-see a space or `;`, so the second line of a script counts, with its indent.
-That holds for the rules that name the node's programs, sockets and folders
+see a space or `;`, so the second line of a script counts, with an indent of
+up to 16 characters. A command also starts after `{` and after the shell
+words `then`, `do`, `else`, `!`, `time` and `nohup`, so
+`if x; then sudo systemctl restart nerve-node; fi`, `{ Stop-Service nerve-node }`
+and `try { Restart-Service nerve-node } catch { }` are refused. That holds for the rules that name the node's programs, sockets and folders
 too. A rule with such a character is listed with `\t`, `\r` and `\n` written
 out, so `rule ls` and the app's rule lists keep one line a rule, and `rule rm`
 and `rule edit` take the entry as it is listed there (the new entry of `rule
-edit` too).
+edit` too). `config add` and the app's add field take the character itself
+(as `rule guard` puts the guard's rules): a rule typed with a written `\n`,
+`\r` or `\t` is refused, since in a glob that is the letter, not the line
+break. Write a backslash as `[\]` or `/`, or a doubled one.
 
 The rules match the whole line, so some lines are refused that only mention
 the node: a line that stops some other service and names `nerve-node` later,
-and a quoted text with `;`, `|` or `(` in front of a command's words
-(`git commit -m "Docs (Stop-Service nerve-node)"`). A quoted mention is
-otherwise left alone: `sudo` counts only at a command's start, so
-`git commit -m "run sudo systemctl stop nerve-node"` runs. The rules do not
-read `kill` with a process id (`kill $(pidof nerve-node)`), `pkill nerve` as
-a part of the name, or `sudo` behind another program (`env X=1 sudo ...`).
+a `pkill -f` whose pattern holds the name (`pkill -f "cargo run -p
+nerve-node"`), and a quoted text with `;`, `|`, `(` or `{` in front of a
+command's words (`git commit -m "Docs (Stop-Service nerve-node)"`). A line
+break inside quotes starts a command like any other, so a line of a commit
+message or a here-document that begins with `nerve-node ...` or
+`systemctl stop nerve-node` is refused too. A quoted mention on one line is
+otherwise left alone: `sudo` counts only at a command's start (also for the
+rule on the program itself, where it may be followed by one of its flags,
+`-u root` included), so `git commit -m "run sudo systemctl stop nerve-node"`
+runs. The rules do not read `kill` with a process id (`kill $(pidof
+nerve-node)`), `pkill nerve` as a part of the name, or `sudo` behind another
+program (`env X=1 sudo ...`, `timeout 30 sudo ...`).
 
 ```sh
 nerve-node rule guard --center lab   # puts back the ones a pairing lacks

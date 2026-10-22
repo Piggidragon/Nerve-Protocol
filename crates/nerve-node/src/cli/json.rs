@@ -62,6 +62,13 @@ pub(super) async fn changed(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> 
     print(out, v)
 }
 
+/// Whether the command runs with `--json` and without a form of its own
+/// ([`changed`]): its output is printed only once it is done, so it may not
+/// ask a question on it.
+pub(super) fn active() -> bool {
+    ALSO.try_with(|_| ()).is_ok()
+}
+
 fn print(out: &mut dyn Write, v: Value) -> Result<(), String> {
     writeln!(out, "{v}").map_err(|e| format!("cannot write the answer: {e}"))
 }
@@ -358,4 +365,17 @@ async fn relay(paths: &NodePaths) -> Result<Value, String> {
         "nodes": nodes,
         "tunnels": live.as_ref().map(|v| v["tunnels"].clone()),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A command runs with `--json` within [`changed`]'s scope, and only
+    /// there does [`active`] say so.
+    #[test]
+    fn active_only_with_json() {
+        assert!(!active());
+        assert!(ALSO.sync_scope(std::cell::RefCell::default(), active));
+    }
 }

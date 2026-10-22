@@ -1121,11 +1121,35 @@ pub fn behind(file: &Path, want: &[Granted], who: Who, retry: bool) -> bool {
     }
 }
 
+/// The accounts the record in `file` names entries for: `None` without a
+/// record, with one that names none, and with one that cannot be read,
+/// where the node refuses every command of `nerve-run` until it can
+/// ([`sync`]).
+pub fn recorded(file: &Path) -> Option<Who> {
+    match read_record(file) {
+        Ok(Some(r)) if !(r.grants.is_empty() && r.traverse.is_empty()) => Some(Who {
+            run: r.uid,
+            owner: r.owner,
+        }),
+        _ => None,
+    }
+}
+
+/// The access entry of `uid` on `p`, for the tests of other modules.
+#[cfg(test)]
+pub(crate) fn access_entry(p: &Path, uid: u32) -> Option<u16> {
+    get(&c_path(p).unwrap(), ACCESS)
+        .unwrap()
+        .and_then(|a| a.user(uid))
+}
+
 /// Takes every entry the record in `file` names off again: `uninstall`, as
 /// root, which may change any file. Also those on files `nerve-run` made
 /// there, which are its own, and those go to the owner, as `heir` names its
 /// uid and gid for the record's owner: its uid is freed next, and the next
 /// account to get it must not have them. The record goes once all are off.
+/// `install` does the same before the owner changes (crate::service), so
+/// that no entry stays that the new owner could not take off.
 pub fn remove_all(file: &Path, heir: &dyn Fn(u32) -> (u32, u32)) -> Report {
     let mut report = Report::default();
     let r = match read_record(file) {

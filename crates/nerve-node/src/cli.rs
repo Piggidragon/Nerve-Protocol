@@ -120,8 +120,8 @@ pub enum Cmd {
     Unlock,
     /// Install the node as a service that starts with the machine and runs under a user of its own, make the account nerve-run for its commands and take you as the owner (Linux with sudo from your own account, Windows as administrator).
     Install {
-        /// Run by root itself (Linux): make root the owner, so that user mode, and allowlist mode as the owner, run commands as root, with every right on the machine and over Nerve; needs --accept-root-owner. At a terminal install asks instead.
-        #[arg(long, value_name = "ACCOUNT", value_parser = ["root"])]
+        /// Run by root itself (Linux): `root` makes root the owner, so that user mode, and allowlist mode as the owner, run commands as root, with every right on the machine and over Nerve; needs --accept-root-owner. At a terminal install asks instead, and an owner root confirmed before stays. `none` leaves the node without an owner, root or another.
+        #[arg(long, value_name = "ACCOUNT", value_parser = ["root", "none"])]
         owner: Option<String>,
         /// Confirms --owner=root: you accept that nothing in Nerve holds those commands back.
         #[arg(long)]
@@ -2125,17 +2125,12 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             owner,
             accept_root_owner,
         } => {
-            let root = root_owner(owner.is_some(), accept_root_owner)?;
+            let root = root_owner(owner.as_deref(), accept_root_owner, cfg!(windows))?;
             let layout = Layout::system();
             owner_check(&[&paths, &layout.paths]).await?;
             let exe = std::env::current_exe().map_err(|e| format!("this program: {e}"))?;
             #[cfg(windows)]
-            if root == crate::service::RootOwner::Accepted {
-                return Err(
-                    "--owner=root is for Linux: on Windows the account that installs is the owner"
-                        .into(),
-                );
-            }
+            let _ = root;
             #[cfg(windows)]
             return crate::winsvc::install(
                 &layout,
@@ -2149,7 +2144,15 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 use std::io::IsTerminal;
                 let stdin = std::io::stdin();
                 let mut input = std::io::BufReader::new(stdin.lock());
-                let terminal = stdin.is_terminal();
+                let terminal = at_terminal(
+                    stdin.is_terminal(),
+                    std::io::stdout().is_terminal(),
+                    json::active(),
+                );
+                let invoker = invoker();
+                if !terminal && crate::service::root_question_due(&layout, &invoker, root) {
+                    eprintln!("{}", crate::service::NO_QUESTION);
+                }
                 let keyring = crate::keyring_setup::HostKeyring {
                     exe: layout.bin.clone(),
                 };
@@ -2160,7 +2163,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                     terminal_input(terminal, &mut input),
                     root,
                     &exe,
-                    &invoker(),
+                    &invoker,
                     out,
                 )
             }
@@ -2266,22 +2269,48 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
     }
 }
 
-/// The input `install` asks its questions on (the keyring, root as the
-/// owner): the terminal's, and none where the input is no terminal, piped
-/// or closed. A script that installs gets each question's no, or the
-/// refusal, instead of a question that its input would answer.
+/// Whether `install` may ask its questions (the keyring, root as the
+/// owner): only where its input (`stdin`) and its output (`stdout`) are a
+/// terminal, and not with `--json` (`json`), whose output is printed only at
+/// the end. Elsewhere nobody would see the question while install waits.
+#[cfg_attr(windows, allow(dead_code))]
+fn at_terminal(stdin: bool, stdout: bool, json: bool) -> bool {
+    stdin && stdout && !json
+}
+
+/// The input `install` asks its questions on: the terminal's, and none
+/// where it may not ask ([`at_terminal`]), as where the input is piped or
+/// closed. A script that installs gets each question's no, or the refusal,
+/// instead of a question that its input would answer.
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn terminal_input(terminal: bool, input: &mut dyn BufRead) -> Option<&mut dyn BufRead> {
     terminal.then_some(input)
 }
 
-/// Whether `install`'s flags make root the owner: `--owner=root` and
-/// `--accept-root-owner` together (crate::service::RootOwner), else install
-/// asks at a terminal. Either alone is refused, with what the pair means.
-fn root_owner(owner: bool, accepted: bool) -> Result<crate::service::RootOwner, String> {
+/// What `install`'s flags choose for the owner (crate::service::RootOwner):
+/// root with `--owner=root` and `--accept-root-owner` together, none with
+/// `--owner=none`, else install asks at a terminal. `--owner=root` or
+/// `--accept-root-owner` alone is refused, with what the pair means. On
+/// Windows (`windows`), where the account that installs is the owner, both
+/// are refused first.
+fn root_owner(
+    owner: Option<&str>,
+    accepted: bool,
+    windows: bool,
+) -> Result<crate::service::RootOwner, String> {
+    use crate::service::RootOwner;
+    if windows && (owner.is_some() || accepted) {
+        return Err(
+            "--owner and --accept-root-owner are for Linux: on Windows the account that installs is the owner".into(),
+        );
+    }
     match (owner, accepted) {
-        (true, true) => Ok(crate::service::RootOwner::Accepted),
-        (false, false) => Ok(crate::service::RootOwner::Ask),
+        (Some("root"), true) => Ok(RootOwner::Accepted),
+        (Some("none"), false) => Ok(RootOwner::NoOwner),
+        (Some("none"), true) => {
+            Err("--accept-root-owner goes with --owner=root only, not with --owner=none".into())
+        }
+        (None, false) => Ok(RootOwner::Ask),
         _ => Err(format!(
             "--owner=root and --accept-root-owner go together: with both, root is the owner of the node, and {}",
             crate::service::ROOT_OWNER_MEANS
@@ -5825,7 +5854,7 @@ mod tests {
                 Cmd::Install {
                     owner,
                     accept_root_owner,
-                } => root_owner(owner.is_some(), accept_root_owner),
+                } => root_owner(owner.as_deref(), accept_root_owner, false),
                 _ => unreachable!(),
             }
         };
@@ -5839,12 +5868,55 @@ mod tests {
             assert!(e.contains("go together"), "{e}");
             assert!(e.contains(crate::service::ROOT_OWNER_MEANS), "{e}");
         }
+        // No owner, root or another, is chosen with --owner=none alone.
+        assert_eq!(flags(&["--owner=none"]).unwrap(), RootOwner::NoOwner);
+        let e = flags(&["--owner=none", "--accept-root-owner"]).unwrap_err();
+        assert!(e.contains("--owner=root only"), "{e}");
         let e = flags(&["--owner=alice", "--accept-root-owner"]).unwrap_err();
         assert!(e.contains("invalid value"), "{e}");
         // Input that is no terminal's answers no question.
         let mut piped = std::io::Cursor::new(b"y\n".to_vec());
         assert!(terminal_input(false, &mut piped).is_none());
         assert!(terminal_input(true, &mut piped).is_some());
+    }
+
+    /// On Windows, where the account that installs is the owner, either
+    /// flag is refused with what holds there, before the pair is looked at.
+    #[test]
+    fn windows_refuses_the_owner_flags_first() {
+        use crate::service::RootOwner;
+        for (owner, accepted) in [
+            (Some("root"), false),
+            (None, true),
+            (Some("root"), true),
+            (Some("none"), false),
+        ] {
+            let e = root_owner(owner, accepted, true).unwrap_err();
+            assert_eq!(
+                e,
+                "--owner and --accept-root-owner are for Linux: on Windows the account that installs is the owner",
+                "{owner:?} {accepted}"
+            );
+        }
+        assert_eq!(root_owner(None, false, true).unwrap(), RootOwner::Ask);
+    }
+
+    /// Install asks only where its input and its output are a terminal and
+    /// it runs without --json: elsewhere nobody would see the question.
+    #[test]
+    fn install_asks_only_where_the_question_is_seen() {
+        assert!(at_terminal(true, true, false));
+        for (stdin, stdout, json) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+            (false, false, false),
+        ] {
+            assert!(!at_terminal(stdin, stdout, json), "{stdin} {stdout} {json}");
+        }
+        let said = crate::service::NO_QUESTION;
+        assert!(said.contains("--owner=root --accept-root-owner"), "{said}");
+        assert!(said.contains("the answer is no"), "{said}");
     }
 
     /// Setup chooses no account: it has no flags, and asks for none.

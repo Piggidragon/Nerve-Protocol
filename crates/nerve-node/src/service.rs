@@ -851,8 +851,9 @@ fn plain_log(log: &Path) -> Result<(), String> {
 /// order. `invoker` is the account that ran install (`SUDO_USER`, the
 /// app's `PKEXEC_UID`, else root): it becomes the owner. Running it again
 /// puts back what is missing and restarts the service; run by root alone it
-/// keeps the owner the unit names, and root never becomes the owner here,
-/// as nobody is asked ([`RootOwner`]).
+/// keeps the owner the unit names, root included where root confirmed it
+/// at an earlier install, and root never becomes the owner newly here, as
+/// nobody is asked ([`RootOwner`]).
 pub fn install(
     layout: &Layout,
     sys: &dyn System,
@@ -879,15 +880,45 @@ pub fn install(
 /// ([`owner_of_install`]). Root as the owner runs the commands of `user`
 /// mode, and of `allowlist` mode as the owner, as root, which nothing in
 /// the node holds back; so it is the person's own explicit choice, never a
-/// default.
+/// default. Once confirmed it stays at a later install, until
+/// [`RootOwner::NoOwner`] or an install through sudo names another owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootOwner {
-    /// Asked at a terminal, default no; without one the answer is no.
+    /// Asked at a terminal where root would become the owner newly
+    /// ([`root_question_due`]), default no; without a terminal the answer
+    /// is no. An owner root confirmed at an earlier install stays.
     Ask,
     /// Chosen with `--owner=root --accept-root-owner`, for an install
     /// without a terminal.
     Accepted,
+    /// Chosen with `--owner=none`: the node has no owner after the install,
+    /// whichever it had.
+    NoOwner,
 }
+
+/// What [`RootOwner`] comes to for the owner of an install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chosen {
+    /// Root, confirmed now or at an earlier install.
+    Root,
+    /// The owner as before: the account that ran install through sudo, or
+    /// the one the unit names.
+    Keep,
+    /// None.
+    NoOwner,
+}
+
+/// Whether install asks root whether root is to be the owner: run by root
+/// itself without a choice made by the flags, where root is not the owner
+/// already.
+pub fn root_question_due(layout: &Layout, invoker: &str, root: RootOwner) -> bool {
+    root == RootOwner::Ask && invoker == ROOT && unit_owner(layout).as_deref() != Some(ROOT)
+}
+
+/// What install says on stderr where root's question is due but nobody can
+/// see it: its input or its output is no terminal, or it runs with
+/// `--json`. The answer is no then, at once.
+pub const NO_QUESTION: &str = "install asks whether root is to be the owner of this node only where its input and its output are a terminal, and not with --json; here the answer is no. `--owner=root --accept-root-owner` makes root the owner without the question.";
 
 /// The name of the one account with uid 0 that may be the owner, and only
 /// after the confirmation of [`RootOwner`].
@@ -917,9 +948,13 @@ pub fn install_asking(
     // Root is the owner only of an install that root runs itself: through
     // sudo the account that ran it becomes the owner. Refused before
     // anything changes.
-    if root == RootOwner::Accepted && invoker != ROOT {
+    if root != RootOwner::Ask && invoker != ROOT {
+        let flag = match root {
+            RootOwner::NoOwner => "--owner=none",
+            _ => "--owner=root",
+        };
         return Err(format!(
-            "--owner=root is for an install that root runs itself; this one runs for {invoker} (through sudo or pkexec), who becomes the owner: leave the flags out, or run it as root without sudo"
+            "{flag} is for an install that root runs itself; this one runs for {invoker} (through sudo or pkexec), who becomes the owner: leave the flags out, or run it as root without sudo"
         ));
     }
     let mut steps = Steps {
@@ -961,8 +996,19 @@ fn install_steps(
     }
     // Asked before anything changes.
     let root = match root {
-        RootOwner::Accepted => true,
-        RootOwner::Ask => ask_root_owner(layout, invoker, input.as_deref_mut(), steps.out),
+        RootOwner::Accepted => Chosen::Root,
+        RootOwner::NoOwner => Chosen::NoOwner,
+        RootOwner::Ask if root_question_due(layout, invoker, root) => {
+            if ask_root_owner(layout, input.as_deref_mut(), steps.out) {
+                Chosen::Root
+            } else {
+                Chosen::Keep
+            }
+        }
+        // Run by root where root is the owner: confirmed at an earlier
+        // install.
+        RootOwner::Ask if invoker == ROOT => Chosen::Root,
+        RootOwner::Ask => Chosen::Keep,
     };
     let account = system_account(sys, USER, &layout.home, USER_MARK, "the user", steps)?;
     let run = system_account(
@@ -1011,6 +1057,14 @@ fn install_steps(
         crate::account::RUN_USER
     ));
     let owner = owner_of_install(layout, sys, invoker, root, steps)?;
+    #[cfg(target_os = "linux")]
+    {
+        let owner_uid = match owner.as_deref() {
+            Some(name) => sys.account(name)?.map(|a| a.uid),
+            None => None,
+        };
+        drop_earlier_grants(layout, sys, run.uid, owner_uid, steps)?;
+    }
     let in_keyring = crate::secrets::stated_storage(&layout.paths) == SecretStorage::Keyring;
     let real = |p: &Path| std::fs::canonicalize(p).ok();
     if real(exe).is_some() && real(exe) == real(&layout.bin) {
@@ -1046,6 +1100,61 @@ fn install_steps(
     sys.wait_running(&layout.paths)?;
     steps.did(format!(
         "the service {UNIT_NAME} runs as {USER} and starts with the machine"
+    ));
+    Ok(())
+}
+
+/// Takes nerve-run's entries off every folder the record names, as root and
+/// as `uninstall` does, where they were put on for another owner than the
+/// one this install makes (`owner`, `None` without one) or for another
+/// nerve-run than `run`. The node acts on the owner's files as the owner
+/// alone (crate::acl::sync), so the new owner could not take the old one's
+/// entries off, and a node without an owner keeps none at all: they would
+/// stay, also on a uid freed later. The record goes with them, and the node
+/// gives the grants again for the new owner when it starts. The service
+/// stops first, so that the node of the earlier owner does not give them
+/// again meanwhile; where not all came off, it runs again as it was and
+/// install changes the owner not.
+#[cfg(target_os = "linux")]
+fn drop_earlier_grants(
+    layout: &Layout,
+    sys: &dyn System,
+    run: u32,
+    owner: Option<u32>,
+    steps: &mut Steps,
+) -> Result<(), String> {
+    let record = crate::acl::record_file(&layout.paths);
+    let Some(had) = crate::acl::recorded(&record) else {
+        return Ok(());
+    };
+    if had.run == run && Some(had.owner) == owner {
+        return Ok(());
+    }
+    let running = layout.unit.exists() && sys.unit_state()?.state == "running";
+    if running {
+        sys.systemctl(&["stop", UNIT_NAME])?;
+        steps.did(format!(
+            "stopped the service {UNIT_NAME}, as the owner of the node changes"
+        ));
+    }
+    // What nerve-run made there goes to the earlier owner, whose folders
+    // they are (to root where that account is gone).
+    let r = crate::acl::remove_all(&record, &|owner| {
+        crate::account::of_uid(owner).map_or((0, 0), |a| (a.uid, a.gid))
+    });
+    if !r.stale.is_empty() {
+        if running {
+            let _ = sys.systemctl(&["start", UNIT_NAME]);
+        }
+        return Err(format!(
+            "the owner of the node changes, but the access of nerve-run to the folders the earlier owner gave it could not all be taken off: {}; the owner stays as it was: run `{} install` again once that is fixed",
+            r.errors.join("; "),
+            layout.edition.program
+        ));
+    }
+    steps.did(format!(
+        "the owner of the node changes, so {}; the node gives the folders again for the new owner when it starts",
+        gave_to_owner(r.not_given)
     ));
     Ok(())
 }
@@ -1087,30 +1196,24 @@ fn unit_owner(layout: &Layout) -> Option<String> {
         .and_then(|t| owner_in_unit(&t))
 }
 
-/// [`unit_owner`], root aside: root stays the owner only when confirmed
-/// again ([`RootOwner`]).
-fn earlier_owner(layout: &Layout) -> Option<String> {
-    unit_owner(layout).filter(|o| o != ROOT)
-}
-
 /// Asks root, at a terminal (`input`), whether root is to be the owner of
-/// the install it runs itself, after saying what that means. Only `y`,
-/// `Y` or `yes` is a yes; another answer, the end of the input, or no
-/// terminal at all (piped input is none) is a no. Not asked of an install
-/// for another account.
+/// the install it runs itself, after saying what that means and what a yes
+/// and a no do. Only `y`, `Y` or `yes` is a yes; another answer, the end of
+/// the input, or no terminal at all (piped input is none) is a no. Asked
+/// only where [`root_question_due`].
 fn ask_root_owner(
     layout: &Layout,
-    invoker: &str,
     input: Option<&mut (dyn BufRead + '_)>,
     out: &mut dyn Write,
 ) -> bool {
-    let Some(input) = input.filter(|_| invoker == ROOT) else {
+    let Some(input) = input else {
         return false;
     };
-    let now = match earlier_owner(layout) {
-        Some(o) => format!("{o} is the owner of this node now, and stays it on a no."),
-        None => "Without an owner, only root changes the node, and user mode runs no command."
-            .to_string(),
+    let now = match unit_owner(layout) {
+        Some(o) => format!(
+            "{o} is the owner of this node now: on a yes root replaces {o} as the owner, on a no {o} stays it."
+        ),
+        None => "The node has no owner now: on a yes root becomes its owner; on a no it stays without one, so only root changes the node and user mode runs no command.".to_string(),
     };
     let _ = writeln!(
         out,
@@ -1122,38 +1225,49 @@ fn ask_root_owner(
 }
 
 /// The owner of the install: `invoker`, the account that ran it, when that
-/// is an account the node can use; run by root alone, root when `root`
-/// says root confirmed it ([`RootOwner`]), else the owner the unit names
-/// already, root aside. Without one, user mode runs no command and only
-/// root changes the node.
+/// is an account the node can use; run by root alone, root where `choice`
+/// says root confirmed it, now or at an earlier install ([`RootOwner`]),
+/// none with `--owner=none`, else the owner the unit names already.
+/// Without one, user mode runs no command and only root changes the node.
 fn owner_of_install(
     layout: &Layout,
     sys: &dyn System,
     invoker: &str,
-    root: bool,
+    choice: Chosen,
     steps: &mut Steps,
 ) -> Result<Option<String>, String> {
-    let name = match (invoker, earlier_owner(layout)) {
-        (ROOT, _) if root => ROOT,
-        (ROOT, Some(b)) => {
+    let p = layout.edition.program;
+    let no_owner = format!(
+        "Warning: no owner: install ran as root, not through sudo, so only root changes the node and user mode runs no command; `sudo {p} install` from the owner's own account makes it the owner, and root becomes it on a yes to install's question at a terminal, or with `{p} install --owner=root --accept-root-owner`"
+    );
+    let name = match (invoker, choice, unit_owner(layout)) {
+        (ROOT, Chosen::NoOwner, before) => {
+            if let Some(b) = before {
+                steps.did(format!(
+                    "{b} is no longer the owner of the node, as --owner=none says"
+                ));
+            }
+            steps.did(no_owner);
+            return Ok(None);
+        }
+        (ROOT, Chosen::Root, Some(b)) if b == ROOT => {
+            steps.did(format!(
+                "root stays the owner of the node, as confirmed at an earlier install; `{p} install --owner=none` takes that back"
+            ));
+            ROOT
+        }
+        (ROOT, Chosen::Root, _) => ROOT,
+        (ROOT, Chosen::Keep, Some(b)) => {
             steps.did(format!("{b} stays the owner of the node"));
             return Ok(Some(b));
         }
-        (ROOT, None) => {
-            if unit_owner(layout).as_deref() == Some(ROOT) {
-                steps.did(
-                    "root is no longer the owner: an install keeps it the owner only when root confirms it again",
-                );
-            }
-            steps.did(format!(
-                "Warning: no owner: install ran as root, not through sudo, so only root changes the node and user mode runs no command; `sudo {p} install` from the owner's own account makes it the owner, and root becomes it on a yes to install's question at a terminal, or with `{p} install --owner=root --accept-root-owner`",
-                p = layout.edition.program
-            ));
+        (ROOT, Chosen::Keep, None) => {
+            steps.did(no_owner);
             return Ok(None);
         }
-        (i, _) => i,
+        (i, _, _) => i,
     };
-    let account = match usable_owner(sys, &layout.paths, name, root) {
+    let account = match usable_owner(sys, &layout.paths, name, choice == Chosen::Root) {
         Ok(a) => a,
         Err(e) => {
             steps.did(format!(
@@ -2817,7 +2931,7 @@ pub(crate) mod tests {
                 out.contains("Warning: root is the owner of the node, as you confirmed"),
                 "{out}"
             );
-            assert!(!out.contains("no owner"), "{out}");
+            assert!(!out.contains("Warning: no owner"), "{out}");
             assert_eq!(owner_of_unit(&l).as_deref(), Some("root"));
             // Root needs no polkit to start and stop the service.
             for p in [l.polkit_rule(), l.polkit_pkla(), l.service_helper()] {
@@ -2861,19 +2975,218 @@ pub(crate) mod tests {
         // the owner instead.
         let (r, out) = install_by(&l, &sys, "root", RootOwner::Ask, Some("\n"));
         r.unwrap();
-        assert!(out.contains("alice is the owner of this node now"), "{out}");
+        assert!(
+            out.contains("alice is the owner of this node now: on a yes root replaces alice as the owner, on a no alice stays it."),
+            "{out}"
+        );
         assert!(out.contains("alice stays the owner of the node"), "{out}");
         assert_eq!(owner_of_unit(&l).as_deref(), Some("alice"));
         let (r, _) = install_by(&l, &sys, "root", RootOwner::Ask, Some("y\n"));
         r.unwrap();
         assert_eq!(owner_of_unit(&l).as_deref(), Some("root"));
         assert!(!l.polkit_rule().exists());
-        // The choice is each install's: run again without a yes, root is
-        // the owner no longer.
-        let (r, out) = install_by(&l, &sys, "root", RootOwner::Ask, None);
+        // Without an owner the question says that a no keeps it so.
+        let l = layout(&d.path().join("none"));
+        let (r, out) = install_by(&l, &sys, "root", RootOwner::Ask, Some("n\n"));
         r.unwrap();
-        assert!(out.contains("root is no longer the owner"), "{out}");
+        assert!(
+            out.contains("The node has no owner now: on a yes root becomes its owner; on a no it stays without one"),
+            "{out}"
+        );
+    }
+
+    /// Root confirmed as the owner stays it at a later install by root, at
+    /// a terminal or not, and is not asked again; `--owner=none` takes it
+    /// away, as an install through sudo names another owner.
+    #[test]
+    fn a_confirmed_root_owner_stays_until_it_is_taken_back() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(&d.path().join("root"));
+        install_by(&l, &sys, "root", RootOwner::Accepted, None)
+            .0
+            .unwrap();
+        for typed in [None, Some("\n"), Some("n\n")] {
+            let (r, out) = install_by(&l, &sys, "root", RootOwner::Ask, typed);
+            r.unwrap();
+            assert!(!out.contains("[y/N]"), "{typed:?}: {out}");
+            assert!(!root_question_due(&l, "root", RootOwner::Ask));
+            assert!(
+                out.contains("root stays the owner of the node, as confirmed at an earlier install; `nerve-node install --owner=none` takes that back"),
+                "{typed:?}: {out}"
+            );
+            assert!(!out.contains("Warning: no owner"), "{typed:?}: {out}");
+            assert_eq!(owner_of_unit(&l).as_deref(), Some("root"), "{typed:?}");
+        }
+        // The app's install, which asks nothing, keeps it too.
+        install(&l, &sys, Path::new("/bin/true"), "root", &mut Vec::new()).unwrap();
+        assert_eq!(owner_of_unit(&l).as_deref(), Some("root"));
+        let (r, out) = install_by(&l, &sys, "root", RootOwner::NoOwner, Some("y\n"));
+        r.unwrap();
+        assert!(!out.contains("[y/N]"), "{out}");
+        assert!(
+            out.contains("root is no longer the owner of the node, as --owner=none says"),
+            "{out}"
+        );
+        assert!(out.contains("Warning: no owner"), "{out}");
         assert_eq!(owner_of_unit(&l), None);
+        // Without an owner root is asked again.
+        assert!(root_question_due(&l, "root", RootOwner::Ask));
+        // --owner=none drops another owner as well, and is root's alone.
+        install_by(&l, &sys, "alice", RootOwner::Ask, None)
+            .0
+            .unwrap();
+        assert_eq!(owner_of_unit(&l).as_deref(), Some("alice"));
+        let (r, out) = install_by(&l, &sys, "alice", RootOwner::NoOwner, None);
+        assert!(
+            r.unwrap_err()
+                .contains("--owner=none is for an install that root runs itself"),
+            "{out}"
+        );
+        assert_eq!(owner_of_unit(&l).as_deref(), Some("alice"));
+        install_by(&l, &sys, "root", RootOwner::NoOwner, None)
+            .0
+            .unwrap();
+        assert_eq!(owner_of_unit(&l), None);
+        // Through sudo another account becomes the owner over root.
+        install_by(&l, &sys, "root", RootOwner::Accepted, None)
+            .0
+            .unwrap();
+        install_by(&l, &sys, "alice", RootOwner::Ask, None)
+            .0
+            .unwrap();
+        assert_eq!(owner_of_unit(&l).as_deref(), Some("alice"));
+    }
+
+    /// A grant as the node of the owner of `l` gave it: nerve-run's entries
+    /// on `folder` and its file `data.txt`, and the record of them, which
+    /// names that owner. `None` where the file system has no ACLs.
+    #[cfg(target_os = "linux")]
+    fn granted(l: &Layout, sys: &Fake, folder: &Path) -> Option<u32> {
+        use nerve_policy::config::Access;
+        let run = sys.account(crate::account::RUN_USER).unwrap().unwrap().uid;
+        let owner = owner_of_unit(l).map_or(0, |o| sys.account(&o).unwrap().unwrap().uid);
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join("data.txt"), "the owner's").unwrap();
+        let record = crate::acl::record_file(&l.paths);
+        let want = [crate::acl::Granted {
+            path: folder.to_path_buf(),
+            access: Access::ALL,
+        }];
+        // The test may change its own files only: they stand for the
+        // owner's.
+        let who = crate::acl::Who {
+            run,
+            owner: unsafe { libc::geteuid() },
+        };
+        let r = crate::acl::sync(&record, &want, who, &|| Ok(None));
+        if !r.errors.is_empty() {
+            eprintln!("skipped: no POSIX ACLs here ({:?})", r.errors);
+            return None;
+        }
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        v["owner"] = owner.into();
+        std::fs::write(&record, v.to_string()).unwrap();
+        assert!(crate::acl::access_entry(&folder.join("data.txt"), run).is_some());
+        Some(run)
+    }
+
+    /// Where install changes the owner (root to none, alice to root), it
+    /// first takes nerve-run's entries off every grant the record names, as
+    /// root, with the service stopped, and the record goes; the node gives
+    /// the grants again for the new owner. Where the owner stays, they stay.
+    /// Where they cannot all come off, the owner stays as it was and the
+    /// service runs again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_owner_change_takes_the_earlier_grants_off_first() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        for (first, then, after) in [
+            (
+                (ROOT, RootOwner::Accepted),
+                (ROOT, RootOwner::NoOwner),
+                None,
+            ),
+            (
+                ("alice", RootOwner::Ask),
+                (ROOT, RootOwner::Accepted),
+                Some(ROOT),
+            ),
+            (
+                (ROOT, RootOwner::Accepted),
+                ("alice", RootOwner::Ask),
+                Some("alice"),
+            ),
+        ] {
+            let l = layout(&d.path().join(format!("{}-{:?}", first.0, then.1)));
+            install_by(&l, &sys, first.0, first.1, None).0.unwrap();
+            let folder = l.home.with_file_name("granted");
+            let Some(run) = granted(&l, &sys, &folder) else {
+                return;
+            };
+            let record = crate::acl::record_file(&l.paths);
+            let before = sys.calls().len();
+            let (r, out) = install_by(&l, &sys, then.0, then.1, None);
+            r.unwrap();
+            assert_eq!(owner_of_unit(&l).as_deref(), after);
+            for p in [folder.clone(), folder.join("data.txt"), folder.join("sub")] {
+                assert_eq!(crate::acl::access_entry(&p, run), None, "{p:?}");
+            }
+            assert!(!record.exists());
+            assert!(
+                out.contains("the owner of the node changes, so took nerve-run's access to the folders given to it off again"),
+                "{out}"
+            );
+            let calls = sys.calls()[before..].to_vec();
+            let at = |c: &str| calls.iter().position(|x| x == c).unwrap();
+            assert!(
+                at(&format!("systemctl stop {UNIT_NAME}"))
+                    < at(&format!("systemctl restart {UNIT_NAME}")),
+                "{calls:?}"
+            );
+        }
+        // The owner stays: so do the entries and the record.
+        let l = layout(&d.path().join("stays"));
+        install_by(&l, &sys, "alice", RootOwner::Ask, None)
+            .0
+            .unwrap();
+        let folder = l.home.with_file_name("granted");
+        let run = granted(&l, &sys, &folder).unwrap();
+        install_by(&l, &sys, ROOT, RootOwner::Ask, None).0.unwrap();
+        install_by(&l, &sys, "alice", RootOwner::Ask, None)
+            .0
+            .unwrap();
+        assert!(crate::acl::access_entry(&folder.join("data.txt"), run).is_some());
+        assert!(crate::acl::record_file(&l.paths).exists());
+        // A folder below the grant that cannot be opened: the entries do not
+        // all come off, so the owner stays alice and the service runs again.
+        // Root opens any folder, so only as another account.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let sub = folder.join("sub");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0)).unwrap();
+        let before = sys.calls().len();
+        let (r, out) = install_by(&l, &sys, ROOT, RootOwner::Accepted, None);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("could not all be taken off") && e.contains("the owner stays as it was"),
+            "{e}"
+        );
+        assert!(out.contains("as the owner of the node changes"), "{out}");
+        assert_eq!(owner_of_unit(&l).as_deref(), Some("alice"));
+        assert!(crate::acl::record_file(&l.paths).exists());
+        assert_eq!(
+            sys.calls()[before..],
+            [
+                format!("systemctl stop {UNIT_NAME}"),
+                format!("systemctl start {UNIT_NAME}")
+            ]
+        );
     }
 
     /// Without a terminal, `--owner=root --accept-root-owner` makes root the

@@ -2,6 +2,7 @@
 //! handshake, describe, MCP `list` and `execute` through to `invoke`, an unknown node
 //! (401) and the one-link rule.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
@@ -174,12 +175,59 @@ fn serve(ws: WebSocketStream<BoxIo>, desc: Value) -> mpsc::UnboundedReceiver<See
 
 /// [`serve`], also giving the task, which ends the link when it is aborted.
 fn serve_task(
-    mut ws: WebSocketStream<BoxIo>,
+    ws: WebSocketStream<BoxIo>,
     desc: Value,
+) -> (mpsc::UnboundedReceiver<Seen>, tokio::task::JoinHandle<()>) {
+    let (_, changes) = mpsc::unbounded_channel();
+    serve_changing(ws, Arc::new(Mutex::new(desc)), changes)
+}
+
+/// A node whose description changes: [`describe_anew`] sets `desc` and
+/// sends on `changes`, and the node tells the center, which fetches it.
+type Described = (Arc<Mutex<Value>>, mpsc::UnboundedSender<()>);
+
+/// [`serve`] of a node whose description changes, with the handle that
+/// changes it.
+fn serve_described(
+    ws: WebSocketStream<BoxIo>,
+    desc: Value,
+) -> (mpsc::UnboundedReceiver<Seen>, Described) {
+    let (change, changes) = mpsc::unbounded_channel();
+    let desc = Arc::new(Mutex::new(desc));
+    let (seen, _) = serve_changing(ws, desc.clone(), changes);
+    (seen, (desc, change))
+}
+
+/// The node describes itself as `d` now, and the center has fetched it
+/// once `ready` says so.
+async fn describe_anew(c: &Center, node: &Described, d: Value, ready: impl Fn(&Center) -> bool) {
+    *node.0.lock().unwrap() = d;
+    node.1.send(()).unwrap();
+    wait_for(|| ready(c).then_some(())).await;
+}
+
+fn serve_changing(
+    mut ws: WebSocketStream<BoxIo>,
+    desc: Arc<Mutex<Value>>,
+    mut changes: mpsc::UnboundedReceiver<()>,
 ) -> (mpsc::UnboundedReceiver<Seen>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        while let Some(m) = text(&mut ws).await {
+        let mut seq = 0;
+        loop {
+            let m = tokio::select! {
+                m = text(&mut ws) => match m {
+                    Some(m) => m,
+                    None => break,
+                },
+                Some(()) = changes.recv() => {
+                    seq += 1;
+                    let ev = json!({"cap": "node", "name": "descriptor_changed", "seq": seq,
+                                    "ts": 1, "data": {}});
+                    send(&mut ws, Message::notification(method::EVENT, ev)).await;
+                    continue;
+                }
+            };
             match m {
                 Message::Request {
                     id,
@@ -205,7 +253,7 @@ fn serve_task(
                         continue;
                     }
                     let result = match m.as_str() {
-                        method::DESCRIBE => desc.clone(),
+                        method::DESCRIBE => desc.lock().unwrap().clone(),
                         method::INVOKE => {
                             let _ = tx.send(Seen::Invoke(Value::Object(params.clone())));
                             json!({"content": format!("echo {}", params["args"]), "encoding": "utf-8"})
@@ -245,12 +293,22 @@ async fn rpc(e: &Engine, id: u64, method: &str, params: Value) -> Value {
         .expect("a reply")
 }
 
-/// The `tools/call` params that run `unit` (`cap.action`) on `node` with the
-/// arguments `args`: one `execute`. The tests name units, never tools: this
-/// is the one place that knows how a unit is called.
+/// The `tools/call` params of one `execute` of `unit` (`cap.action`) on
+/// `node` with the arguments `args`.
 fn run_params(node: &str, unit: &str, args: Value) -> Value {
     assert!(args.is_object(), "the arguments are an object");
     json!({"name": "execute", "arguments": {"node": node, "capability": unit, "args": args}})
+}
+
+/// Runs `unit` on `node` through `e` as a harness's model must: `list` for
+/// its details, then `execute` as the request `id`; the reply, none when the
+/// call was cancelled. The tests name units, never tools: this is the one
+/// place that knows how a unit is called.
+async fn run_as(e: &Engine, id: Value, node: &str, unit: &str, args: Value) -> Option<Value> {
+    list_text(e, json!({"node": node, "capability": unit})).await;
+    e.handle(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": run_params(node, unit, args)}))
+        .await
 }
 
 /// Waits until a node has described itself and offers the agent something.
@@ -286,11 +344,13 @@ async fn list_text(e: &Engine, args: Value) -> String {
         .to_string()
 }
 
-/// Runs `unit` on `node` through `e` as a harness would; the JSON-RPC reply.
+/// [`run_as`] with an id of its own; the JSON-RPC reply.
 async fn run(e: &Engine, node: &str, unit: &str, args: Value) -> Value {
     static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
     let id = ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    rpc(e, id, "tools/call", run_params(node, unit, args)).await
+    run_as(e, json!(id), node, unit, args)
+        .await
+        .expect("a reply")
 }
 
 #[tokio::test]
@@ -418,9 +478,12 @@ async fn a_cancelled_mcp_call_is_cancelled_on_the_node() {
     let call = tokio::spawn({
         let e = e.clone();
         async move {
-            e.handle(
-                json!({"jsonrpc": "2.0", "id": "run-1", "method": "tools/call",
-                "params": run_params("box-1", "exec.run", json!({"command": "hang"}))}),
+            run_as(
+                &e,
+                json!("run-1"),
+                "box-1",
+                "exec.run",
+                json!({"command": "hang"}),
             )
             .await
         }
@@ -559,9 +622,10 @@ fn log_lines(c: &nerve_center::center::Center, text: &str) -> Vec<String> {
         .collect()
 }
 
-/// A capability whose name the center cannot split is left out on its own:
-/// the node's other capabilities stay offered, and the owner sees why.
-/// `list` does not name it, and the log says it once.
+/// A capability whose name the center cannot split (a `.` in it) is left
+/// out on its own: the node's other capabilities stay offered, `_` is a
+/// letter like the others, and the owner sees why. `list` does not name it,
+/// and the log says it once.
 #[tokio::test]
 async fn only_the_capability_with_a_bad_name_is_left_out() {
     let dir = tempfile::tempdir().unwrap();
@@ -570,26 +634,27 @@ async fn only_the_capability_with_a_bad_name_is_left_out() {
     assert_eq!(pair(&r, &key, "box-1").await.0, 200);
     let (ws, _) = handshake(&r, &key).await;
     let mut d = descriptor(&key, "box-1");
-    d["capabilities"][0]["id"] = json!("my_fs");
+    d["capabilities"][0]["id"] = json!("my.fs");
     d["capabilities"][0]["actions"]["list"] = d["capabilities"][0]["actions"]["read"].clone();
+    d["capabilities"][1]["id"] = json!("my_exec");
     let _seen = serve(ws, d);
     let c = r.center.clone();
     described(&c).await;
-    assert_eq!(offered(&c, "box-1"), ["exec.run"]);
+    assert_eq!(offered(&c, "box-1"), ["my_exec.run"]);
     let ov = overview(&r).await;
-    let reason = "capability name \"my_fs\": letters, digits and - only, no _";
+    let reason = "capability name \"my.fs\": letters, digits, - and _ only";
     assert_eq!(
         ov["nodes"][0]["broken"],
-        json!([{"name": "my_fs.list", "reason": reason},
-               {"name": "my_fs.read", "reason": reason}])
+        json!([{"name": "my.fs.list", "reason": reason},
+               {"name": "my.fs.read", "reason": reason}])
     );
     // The overview still lists it for the owner, as not offered.
-    assert_eq!(ov["nodes"][0]["capabilities"][0]["id"], "my_fs");
+    assert_eq!(ov["nodes"][0]["capabilities"][0]["id"], "my.fs");
     assert_eq!(ov["nodes"][0]["capabilities"][0]["offered"], false);
     let e = Engine::new(&r.center, "test");
     let listed = list_text(&e, json!({"node": "box-1"})).await;
-    assert!(listed.contains("- exec.run: "), "{listed}");
-    assert!(!listed.contains("my_fs"), "{listed}");
+    assert!(listed.contains("- my_exec.run: "), "{listed}");
+    assert!(!listed.contains("my.fs"), "{listed}");
     // One line for both, however many there are.
     let lines = wait_for(|| {
         let l = log_lines(&c, "leaves out");
@@ -599,7 +664,7 @@ async fn only_the_capability_with_a_bad_name_is_left_out() {
     assert_eq!(
         lines,
         [format!(
-            "the center leaves out my_fs.list of the node's description: {reason} \
+            "the center leaves out my.fs.list of the node's description: {reason} \
              (and 1 more, listed in the overview)"
         )]
     );
@@ -923,6 +988,451 @@ async fn a_disabled_node_offers_nothing_and_gets_no_calls() {
         panic!("no invoke")
     };
     assert_eq!(inv["args"], json!({"path": "/x"}));
+    r.stop().await;
+}
+
+/// The text of a `tools/call` reply, and whether it is an error.
+fn said(r: &Value) -> (String, bool) {
+    (
+        r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        r["result"]["isError"] == true,
+    )
+}
+
+/// One `execute` alone, without the `list` a model must call first.
+async fn execute_only(e: &Engine, node: &str, unit: &str, args: Value) -> Value {
+    rpc(e, 77, "tools/call", run_params(node, unit, args)).await
+}
+
+/// The refusal of an `execute` of `unit` on box-1 that `list` did not give
+/// the session the details of.
+fn list_first(unit: &str) -> String {
+    format!(
+        "error list_first: call list with node \"box-1\" and capability {unit:?} first, then execute it with args that fit the params list gives."
+    )
+}
+
+/// The refusal of an `execute` of `unit` on box-1 that changed since.
+fn list_again(unit: &str) -> String {
+    format!(
+        "error list_first: {unit:?} on node box-1 changed since list gave its details: call list with node \"box-1\" and capability {unit:?} again, then execute it with args that fit the params list gives."
+    )
+}
+
+/// Waits a little for anything more the fake node saw; none is good.
+async fn nothing_more(seen: &mut mpsc::UnboundedReceiver<Seen>) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), seen.recv())
+            .await
+            .is_err(),
+        "the node received something"
+    );
+}
+
+/// A harness on the center's stdio server: JSON-RPC lines each way.
+struct Stdio {
+    to: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    from: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+}
+
+impl Stdio {
+    fn start(c: &Center) -> Stdio {
+        use tokio::io::AsyncBufReadExt;
+        let (ours, theirs) = tokio::io::duplex(1 << 20);
+        let (r, w) = tokio::io::split(theirs);
+        tokio::spawn(nerve_center::mcp::serve_lines(
+            c.clone(),
+            tokio::io::BufReader::new(r),
+            w,
+            "stdio",
+        ));
+        let (r, w) = tokio::io::split(ours);
+        Stdio {
+            to: w,
+            from: tokio::io::BufReader::new(r).lines(),
+        }
+    }
+
+    async fn send(&mut self, m: Value) {
+        use tokio::io::AsyncWriteExt;
+        self.to
+            .write_all(format!("{m}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    /// The next message of the server; none when none comes within `wait`.
+    async fn next(&mut self, wait: Duration) -> Option<Value> {
+        let line = tokio::time::timeout(wait, self.from.next_line())
+            .await
+            .ok()?
+            .unwrap()?;
+        Some(serde_json::from_str(&line).unwrap())
+    }
+
+    async fn ask(&mut self, id: u64, method: &str, params: Value) -> Value {
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+            .await;
+        let r = self.next(Duration::from_secs(10)).await.expect("a reply");
+        assert_eq!(r["id"], id, "{r}");
+        r
+    }
+
+    async fn tool(&mut self, id: u64, name: &str, args: Value) -> Value {
+        self.ask(id, "tools/call", json!({"name": name, "arguments": args}))
+            .await
+    }
+
+    /// `list` of fs.read on box-1, then its `execute`; the reply of that.
+    async fn read(&mut self, list: bool) -> Value {
+        if list {
+            let l = self
+                .tool(
+                    10,
+                    "list",
+                    json!({"node": "box-1", "capability": "fs.read"}),
+                )
+                .await;
+            assert!(!said(&l).1, "{l}");
+        }
+        self.tool(
+            11,
+            "execute",
+            json!({"node": "box-1", "capability": "fs.read", "args": {"path": "/x"}}),
+        )
+        .await
+    }
+}
+
+/// Pairs and connects box-1, served with `desc`, and waits for its
+/// description.
+async fn box_1(r: &Running, desc: impl FnOnce(Value) -> Value) -> mpsc::UnboundedReceiver<Seen> {
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(r, &key).await;
+    let seen = serve(ws, desc(descriptor(&key, "box-1")));
+    described(&r.center).await;
+    seen
+}
+
+/// Over stdio the tools are `list` and `execute` from the start, the server
+/// says no list will change, and none does: a node that describes itself
+/// anew or is disabled sends the harness nothing and changes no tool.
+#[tokio::test]
+async fn tools_list_is_exactly_list_and_execute_and_never_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let c = r.center.clone();
+    let mut h = Stdio::start(&c);
+    let init = h
+        .ask(1, "initialize", json!({"protocolVersion": "2025-06-18"}))
+        .await;
+    assert_eq!(init["result"]["capabilities"], json!({"tools": {}}));
+    h.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .await;
+    let before = h.ask(2, "tools/list", json!({})).await["result"].clone();
+    let names: Vec<&str> = before["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["list", "execute"]);
+
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(&r, &key).await;
+    let (_seen, node) = serve_described(ws, descriptor(&key, "box-1"));
+    described(&c).await;
+    let mut d = descriptor(&key, "box-1");
+    d["rev"] = json!(2);
+    d["capabilities"][0]["actions"]["write"] =
+        json!({"effect": "write", "summary": "Write a file.", "params": {"type": "object"}});
+    describe_anew(&c, &node, d, |c| offered(c, "box-1").len() == 3).await;
+    assert_eq!(offered(&c, "box-1"), ["exec.run", "fs.read", "fs.write"]);
+    c.set_disabled(&key.node_id(), true).unwrap();
+    // Nothing comes unasked: no notifications/tools/list_changed.
+    let unasked = h.next(Duration::from_millis(500)).await;
+    assert!(unasked.is_none(), "{unasked:?}");
+    let after = h.ask(3, "tools/list", json!({})).await["result"].clone();
+    assert_eq!(before, after);
+    r.stop().await;
+}
+
+/// `execute` of a unit `list` did not give the session the details of is
+/// refused with what to do instead, and nothing of it reaches the node or
+/// its statistics; after the list it runs.
+#[tokio::test]
+async fn execute_without_list_is_refused_and_never_reaches_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let mut seen = box_1(&r, |d| d).await;
+    let c = r.center.clone();
+    let e = Engine::new(&r.center, "test");
+    let stats = c.stats_json();
+    for (unit, args) in [
+        ("fs.read", json!({"path": "/x"})),
+        ("exec.run", json!({"command": "uname"})),
+        // Not even bad args are looked at before the list.
+        ("fs.read", json!({"path": 5})),
+    ] {
+        let (text, err) = said(&execute_only(&e, "box-1", unit, args).await);
+        assert!(err);
+        assert_eq!(text, list_first(unit));
+    }
+    // list(node) names it, but gives no details.
+    list_text(&e, json!({"node": "box-1"})).await;
+    let (text, _) = said(&execute_only(&e, "box-1", "fs.read", json!({"path": "/x"})).await);
+    assert_eq!(text, list_first("fs.read"));
+    nothing_more(&mut seen).await;
+    assert_eq!(c.stats_json(), stats);
+    assert!(log_lines(&c, "fs.read").is_empty());
+
+    list_text(
+        &e,
+        json!({"node": "box-1", "capability": ["fs.read", "exec.run"]}),
+    )
+    .await;
+    for (unit, args) in [
+        ("fs.read", json!({"path": "/x"})),
+        ("exec.run", json!({"command": "uname"})),
+    ] {
+        let done = execute_only(&e, "box-1", unit, args.clone()).await;
+        assert!(!said(&done).1, "{done}");
+        let Some(Seen::Invoke(inv)) = seen.recv().await else {
+            panic!("no invoke")
+        };
+        assert_eq!(inv["args"], args);
+    }
+    r.stop().await;
+}
+
+/// A unit whose schema changed must be listed again before it runs, so the
+/// model sees the params its args must fit now.
+#[tokio::test]
+async fn a_changed_schema_needs_a_new_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(&r, &key).await;
+    let (mut seen, node) = serve_described(ws, descriptor(&key, "box-1"));
+    let c = r.center.clone();
+    described(&c).await;
+    let e = Engine::new(&r.center, "test");
+    let done = run(&e, "box-1", "fs.read", json!({"path": "/x"})).await;
+    assert!(!said(&done).1, "{done}");
+    assert!(matches!(seen.recv().await, Some(Seen::Invoke(_))));
+
+    let mut d = descriptor(&key, "box-1");
+    d["capabilities"][0]["actions"]["read"]["params"]["properties"]["max"] =
+        json!({"type": "integer"});
+    let has_max = |c: &Center| {
+        c.offer("box-1").is_some_and(|o| {
+            o.units
+                .iter()
+                .any(|u| u.name == "fs.read" && u.params["properties"].get("max").is_some())
+        })
+    };
+    describe_anew(&c, &node, d, has_max).await;
+    let (text, err) = said(&execute_only(&e, "box-1", "fs.read", json!({"path": "/x"})).await);
+    assert!(err);
+    assert_eq!(text, list_again("fs.read"));
+    nothing_more(&mut seen).await;
+    // The list now gives the new param, and the call runs.
+    let listed = list_text(&e, json!({"node": "box-1", "capability": "fs.read"})).await;
+    assert!(
+        listed.contains("\"max\":{\"type\":\"integer\"}"),
+        "{listed}"
+    );
+    let done = execute_only(&e, "box-1", "fs.read", json!({"path": "/x", "max": 2})).await;
+    assert!(!said(&done).1, "{done}");
+    assert!(matches!(seen.recv().await, Some(Seen::Invoke(_))));
+    r.stop().await;
+}
+
+/// A new description that leaves a unit as it was (a rule edit, another
+/// capability turned off) needs no new list of that unit.
+#[tokio::test]
+async fn a_policy_edit_alone_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(&r, &key).await;
+    let (mut seen, node) = serve_described(ws, descriptor(&key, "box-1"));
+    let c = r.center.clone();
+    described(&c).await;
+    let e = Engine::new(&r.center, "test");
+    let done = run(&e, "box-1", "fs.read", json!({"path": "/x"})).await;
+    assert!(!said(&done).1, "{done}");
+    assert!(matches!(seen.recv().await, Some(Seen::Invoke(_))));
+
+    let mut d = descriptor(&key, "box-1");
+    d["rev"] = json!(5);
+    d["summary"] = json!("A fake node with a new rule.");
+    d["capabilities"][1]["exposure"] = json!("off");
+    describe_anew(&c, &node, d, |c| offered(c, "box-1") == ["fs.read"]).await;
+    let done = execute_only(&e, "box-1", "fs.read", json!({"path": "/y"})).await;
+    assert!(!said(&done).1, "{done}");
+    let Some(Seen::Invoke(inv)) = seen.recv().await else {
+        panic!("no invoke")
+    };
+    assert_eq!(inv["args"], json!({"path": "/y"}));
+    r.stop().await;
+}
+
+/// The node's own capabilities (`settings`, `node`, `audit`) are never
+/// listed at any level, and `execute` of them never reaches the node.
+#[tokio::test]
+async fn settings_node_audit_are_never_listed_or_executable() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let mut seen = box_1(&r, |mut d| {
+        let caps = d["capabilities"].as_array_mut().unwrap();
+        caps.push(
+            json!({"id": "node", "profile": "node", "exposure": "on", "summary": "The node.",
+            "actions": {"ping": {"effect": "read", "params": {"type": "object"}}}}),
+        );
+        caps.push(
+            json!({"id": "audit", "profile": "audit", "exposure": "on", "summary": "Audit.",
+            "actions": {"list": {"effect": "read", "params": {"type": "object"}}}}),
+        );
+        d
+    })
+    .await;
+    let e = Engine::new(&r.center, "test");
+    let reserved = ["settings.set", "node.ping", "audit.list"];
+    let all = list_text(&e, json!({})).await;
+    assert!(all.contains(", 2 capabilities\n"), "{all}");
+    let one = list_text(&e, json!({"node": "box-1"})).await;
+    for cap in ["settings", "node.", "audit"] {
+        assert!(!one.contains(cap), "{cap}: {one}");
+    }
+    let details = rpc(
+        &e,
+        5,
+        "tools/call",
+        json!({"name": "list", "arguments": {"node": "box-1", "capability": reserved}}),
+    )
+    .await;
+    let (text, err) = said(&details);
+    assert!(
+        err && text.starts_with("error unknown_capability: "),
+        "{text}"
+    );
+    assert_eq!(
+        details["result"]["structuredContent"]["capabilities"],
+        json!([])
+    );
+    for unit in reserved {
+        let (text, err) = said(&run(&e, "box-1", unit, json!({})).await);
+        assert!(err);
+        assert!(
+            text.starts_with(&format!(
+                "error unknown_capability: node box-1 offers no {unit:?}"
+            )),
+            "{text}"
+        );
+    }
+    nothing_more(&mut seen).await;
+    r.stop().await;
+}
+
+/// A session ended in the web UI goes on as a new one over the same stdio,
+/// which was shown nothing yet: its model must list again.
+#[tokio::test]
+async fn a_ui_ended_session_must_list_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let mut seen = box_1(&r, |d| d).await;
+    let c = r.center.clone();
+    let mut h = Stdio::start(&c);
+    h.ask(1, "initialize", json!({"protocolVersion": "2025-06-18"}))
+        .await;
+    let done = h.read(true).await;
+    assert!(!said(&done).1, "{done}");
+    let Some(Seen::Invoke(inv)) = seen.recv().await else {
+        panic!("no invoke")
+    };
+    let old = inv["ctx"]["session"].as_str().unwrap().to_string();
+
+    assert!(c.end_session(&old).await);
+    let Some(Seen::SessionEnd(s)) = seen.recv().await else {
+        panic!("no session.end")
+    };
+    assert_eq!(s, old);
+    let (text, err) = said(&h.read(false).await);
+    assert!(err);
+    assert_eq!(text, list_first("fs.read"));
+    nothing_more(&mut seen).await;
+    let done = h.read(true).await;
+    assert!(!said(&done).1, "{done}");
+    let Some(Seen::Invoke(inv)) = seen.recv().await else {
+        panic!("no invoke")
+    };
+    assert_ne!(inv["ctx"]["session"], old.as_str());
+    r.stop().await;
+}
+
+/// What `list` gave one session another was not given: two stdio harnesses
+/// and two HTTP sessions each list for themselves.
+#[tokio::test]
+async fn the_fetched_map_is_per_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let mut seen = box_1(&r, |d| d).await;
+    let c = r.center.clone();
+
+    let (mut a, mut b) = (Stdio::start(&c), Stdio::start(&c));
+    let done = a.read(true).await;
+    assert!(!said(&done).1, "{done}");
+    assert!(matches!(seen.recv().await, Some(Seen::Invoke(_))));
+    assert_eq!(said(&b.read(false).await).0, list_first("fs.read"));
+    nothing_more(&mut seen).await;
+
+    let h = nerve_center::mcp::HttpMcp::new(&r.center, Some("t".into()));
+    let auth = ("authorization", "Bearer t");
+    let mut sids = Vec::new();
+    for _ in 0..2 {
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"}});
+        let resp = h.request(http("POST", &[auth], init)).await;
+        let sid = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"))
+            .map(|(_, v)| v.clone())
+            .expect("a session id");
+        sids.push(sid);
+    }
+    let tool = |sid: &str, name: &str, args: Value| {
+        let body = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": name, "arguments": args}});
+        http("POST", &[auth, ("mcp-session-id", sid)], body)
+    };
+    let read = json!({"node": "box-1", "capability": "fs.read", "args": {"path": "/x"}});
+    let listed = h
+        .request(tool(
+            &sids[0],
+            "list",
+            json!({"node": "box-1", "capability": "fs.read"}),
+        ))
+        .await;
+    assert_eq!(listed.status, 200);
+    for (sid, want) in [(&sids[1], Some(list_first("fs.read"))), (&sids[0], None)] {
+        let resp = h.request(tool(sid, "execute", read.clone())).await;
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        match &want {
+            Some(t) => assert_eq!(&said(&v).0, t),
+            None => assert!(!said(&v).1, "{v}"),
+        }
+    }
+    assert!(matches!(seen.recv().await, Some(Seen::Invoke(_))));
+    nothing_more(&mut seen).await;
     r.stop().await;
 }
 
@@ -1446,9 +1956,14 @@ async fn a_call_in_flight_on_a_dropped_link(
     let call = tokio::spawn({
         let e = e.clone();
         async move {
-            e.handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": run_params("box-1", "exec.run", json!({"command": "make"}))}))
-                .await
+            run_as(
+                &e,
+                json!(2),
+                "box-1",
+                "exec.run",
+                json!({"command": "make"}),
+            )
+            .await
         }
     });
     // The center's frame 2.
@@ -1647,9 +2162,14 @@ async fn a_node_resumes_its_link_over_a_held_connection() {
     let call = tokio::spawn({
         let e = e.clone();
         async move {
-            e.handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": run_params("box-1", "exec.run", json!({"command": "make"}))}))
-                .await
+            run_as(
+                &e,
+                json!(2),
+                "box-1",
+                "exec.run",
+                json!({"command": "make"}),
+            )
+            .await
         }
     });
     let (invoke, _, _) = request(&mut old).await;
@@ -1762,9 +2282,14 @@ async fn a_frame_over_the_limit_ends_a_resumable_link() {
     let call = tokio::spawn({
         let e = e.clone();
         async move {
-            e.handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": run_params("box-1", "exec.run", json!({"command": "make"}))}))
-                .await
+            run_as(
+                &e,
+                json!(2),
+                "box-1",
+                "exec.run",
+                json!({"command": "make"}),
+            )
+            .await
         }
     });
     let (invoke, _, _) = request(&mut ws).await;

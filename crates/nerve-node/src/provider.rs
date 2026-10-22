@@ -380,7 +380,7 @@ fn capabilities(
     for f in fragment {
         if !valid_member_name(&f.id) {
             return Err(format!(
-                "capability name {:?}: letters, digits and - only, no _",
+                "capability name {:?}: letters, digits, - and _ only",
                 f.id
             ));
         }
@@ -409,7 +409,7 @@ fn capabilities(
         for (a, decl) in f.actions {
             if !valid_member_name(&a) {
                 return Err(format!(
-                    "action name {a:?} of capability {}: letters, digits and - only, no _",
+                    "action name {a:?} of capability {}: letters, digits, - and _ only",
                     f.id
                 ));
             }
@@ -673,8 +673,8 @@ mod tests {
         for (bad, why) in [
             (json!([]), "1 to 16"),
             (
-                json!([{"id": "my_cap", "actions": {"a": {"effect": "read"}}}]),
-                "no _",
+                json!([{"id": "my.cap", "actions": {"a": {"effect": "read"}}}]),
+                "capability name",
             ),
             (
                 json!([{"id": "fs", "actions": {"a": {"effect": "read"}}}]),
@@ -695,7 +695,7 @@ mod tests {
             ),
             (json!([{"id": "x", "actions": {}}]), "1 to 64 actions"),
             (
-                json!([{"id": "x", "actions": {"a_b": {"effect": "read"}}}]),
+                json!([{"id": "x", "actions": {"a.b": {"effect": "read"}}}]),
                 "action name",
             ),
         ] {

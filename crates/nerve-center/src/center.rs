@@ -230,9 +230,49 @@ pub struct Session {
     /// successful `read`, `sense` or `execute`). The action checker's model
     /// may be told, and its "only tainted sessions" scope acts on it.
     tainted: AtomicBool,
+    /// The units `list` gave this session the details of, with each one's
+    /// hash then: `execute` runs only what the model was shown as it is.
+    /// Locked on its own: never while the state is held (see
+    /// `Inner::store`), so the hashes are copied out of the state first.
+    fetched: Mutex<Fetched>,
+}
+
+/// The most units a session remembers having been shown; past it the one
+/// shown longest ago is forgotten, and the model just lists it again.
+pub const FETCHED_MAX: usize = 1024;
+
+/// A session's shown units by (node id, `cap.action`), and the order they
+/// were shown in, oldest first.
+#[derive(Default)]
+struct Fetched {
+    hashes: HashMap<(String, String), u64>,
+    order: VecDeque<(String, String)>,
 }
 
 impl Session {
+    /// Notes that `list` gave this session the details of `unit` of the
+    /// node `node_id`, whose hash was `hash`.
+    pub fn listed(&self, node_id: &str, unit: &str, hash: u64) {
+        let key = (node_id.to_string(), unit.to_string());
+        let mut f = self.fetched.lock().unwrap();
+        if f.hashes.insert(key.clone(), hash).is_some() {
+            f.order.retain(|k| *k != key);
+        }
+        f.order.push_back(key);
+        while f.order.len() > FETCHED_MAX {
+            if let Some(old) = f.order.pop_front() {
+                f.hashes.remove(&old);
+            }
+        }
+    }
+
+    /// The hash `unit` of the node `node_id` had when `list` gave this
+    /// session its details; none when it never did (or it was forgotten).
+    pub fn listed_hash(&self, node_id: &str, unit: &str) -> Option<u64> {
+        let key = (node_id.to_string(), unit.to_string());
+        self.fetched.lock().unwrap().hashes.get(&key).copied()
+    }
+
     pub fn ended(&self) -> bool {
         self.ended.load(Ordering::SeqCst)
     }
@@ -2093,6 +2133,7 @@ impl Center {
             calls: AtomicU64::new(0),
             nodes: Mutex::new(BTreeSet::new()),
             tainted: AtomicBool::new(false),
+            fetched: Mutex::new(Fetched::default()),
         });
         self.sessions
             .lock()
@@ -3434,6 +3475,36 @@ mod tests {
             Store::load(dir.path()).unwrap().unwrap().center_name,
             "latest"
         );
+    }
+
+    /// A session remembers at most `FETCHED_MAX` shown units: past it the
+    /// one shown longest ago is forgotten, and one shown again is new again.
+    #[test]
+    fn a_session_forgets_the_units_it_was_shown_longest_ago() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let s = c.new_session("test");
+        assert_eq!(s.listed_hash("n1", "fs.read"), None);
+        s.listed("n1", "fs.read", 1);
+        s.listed("n2", "fs.read", 2);
+        assert_eq!(s.listed_hash("n1", "fs.read"), Some(1));
+        assert_eq!(s.listed_hash("n2", "fs.read"), Some(2));
+        assert_eq!(s.listed_hash("n1", "fs.write"), None);
+        // Shown again, with what it is now.
+        s.listed("n1", "fs.read", 3);
+        for i in 0..FETCHED_MAX - 2 {
+            s.listed("n3", &format!("c{i}.a"), 0);
+        }
+        // n2's fs.read is the oldest now, and goes first.
+        assert_eq!(s.listed_hash("n2", "fs.read"), Some(2));
+        s.listed("n3", "last.a", 0);
+        assert_eq!(s.listed_hash("n2", "fs.read"), None);
+        assert_eq!(s.listed_hash("n1", "fs.read"), Some(3));
+        s.listed("n3", "after.a", 0);
+        assert_eq!(s.listed_hash("n1", "fs.read"), None);
+        assert_eq!(s.listed_hash("n3", "c0.a"), Some(0));
+        let f = s.fetched.lock().unwrap();
+        assert_eq!((f.hashes.len(), f.order.len()), (FETCHED_MAX, FETCHED_MAX));
     }
 
     /// The web UI's node and session lists read at the same time (two

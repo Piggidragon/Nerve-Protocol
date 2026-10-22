@@ -90,14 +90,18 @@ pub struct Offer {
 }
 
 /// Why a named unit of a node is not offered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Miss {
     /// The node is disabled in the center.
     Disabled,
     /// The node's owner turned its capability off.
     Off,
-    /// No such unit: unknown, reserved, broken or not offered yet.
-    Unknown,
+    /// The node describes it, but the center left it out (a bad name or a
+    /// schema outside the subset); the owner sees why in the overview.
+    Broken,
+    /// No such unit: unknown, reserved or not offered yet. `near` is the
+    /// offered one the name was likely meant to be.
+    Unknown { near: Option<String> },
 }
 
 /// A `list` answer: the text the model reads, and the same data.
@@ -194,15 +198,70 @@ pub fn unit(n: &NodeRecord, name: &str) -> Result<Unit, Miss> {
     if n.disabled {
         return Err(Miss::Disabled);
     }
-    let u = n
-        .catalog
-        .unit(name)
-        .filter(|u| shown(u))
-        .ok_or(Miss::Unknown)?;
-    if off_caps(n).contains(u.cap.as_str()) {
+    let off = off_caps(n);
+    let Some(u) = n.catalog.unit(name).filter(|u| shown(u)) else {
+        if n.catalog.broken(name).is_some() {
+            return Err(Miss::Broken);
+        }
+        let offered = n
+            .catalog
+            .units
+            .iter()
+            .filter(|u| shown(u) && !off.contains(u.cap.as_str()))
+            .map(|u| u.name.as_str());
+        return Err(Miss::Unknown {
+            near: near(name, offered).map(str::to_string),
+        });
+    };
+    if off.contains(u.cap.as_str()) {
         return Err(Miss::Off);
     }
     Ok(u.clone())
+}
+
+/// The one of `names` that `given` was likely meant to be: the closest by
+/// edit distance (letter case aside, two swapped letters one edit), when it
+/// is close enough for a slip of the keys and not just another short name.
+pub fn near<'a>(given: &str, names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let given: Vec<char> = given.to_lowercase().chars().collect();
+    // A long name the model made up is no slip: nothing is suggested.
+    if given.is_empty() || given.len() > ASKED_MAX {
+        return None;
+    }
+    let most = (given.len() / 3).clamp(1, 3);
+    let mut best: Option<(usize, &str)> = None;
+    for name in names {
+        let d = distance(&given, &name.to_lowercase().chars().collect::<Vec<_>>());
+        if d <= most && best.is_none_or(|(b, _)| d < b) {
+            best = Some((d, name));
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+/// The edit distance of `a` and `b`, with two swapped neighbours as one
+/// edit (optimal string alignment).
+fn distance(a: &[char], b: &[char]) -> usize {
+    let mut rows = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in rows.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in rows[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut d = (rows[i - 1][j] + 1)
+                .min(rows[i][j - 1] + 1)
+                .min(rows[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d = d.min(rows[i - 2][j - 2] + 1);
+            }
+            rows[i][j] = d;
+        }
+    }
+    rows[a.len()][b.len()]
 }
 
 /// `body` marked as content from the nodes, as every node-written text the
@@ -917,12 +976,63 @@ mod tests {
         let n = box_node();
         assert_eq!(unit(&n, "fs.read").unwrap().name, "fs.read");
         assert_eq!(unit(&n, "lamp.on"), Err(Miss::Off));
-        for name in ["exec.signal", "settings.set", "lamp.dim", "fs.raed"] {
-            assert_eq!(unit(&n, name), Err(Miss::Unknown), "{name}");
+        assert_eq!(unit(&n, "lamp.dim"), Err(Miss::Broken));
+        for name in ["exec.signal", "settings.set", "nope.nope"] {
+            assert_eq!(unit(&n, name), Err(Miss::Unknown { near: None }), "{name}");
         }
+        assert_eq!(
+            unit(&n, "fs.raed"),
+            Err(Miss::Unknown {
+                near: Some("fs.read".into())
+            })
+        );
         let mut off = box_node();
         off.disabled = true;
         assert_eq!(unit(&off, "fs.read"), Err(Miss::Disabled));
+    }
+
+    /// A slip of the keys gets the name it was meant to be; a name far
+    /// from all of them, a turned-off one or a hidden one gets none.
+    #[test]
+    fn a_misspelt_name_gets_the_one_it_was_meant_to_be() {
+        let names = ["exec.run", "fs.read", "fs.write", "box-1", "lab"];
+        for (given, want) in [
+            ("fs.raed", Some("fs.read")),
+            ("fs.reed", Some("fs.read")),
+            ("FS.READ", Some("fs.read")),
+            ("fs_read", Some("fs.read")),
+            ("fs.writ", Some("fs.write")),
+            ("exec.runn", Some("exec.run")),
+            ("box1", Some("box-1")),
+            ("lbx", None),
+            ("labs", Some("lab")),
+            // Two swapped letters are one slip, in reach of a short name.
+            ("lba", Some("lab")),
+            ("net.fetch", None),
+            ("", None),
+            ("x", None),
+        ] {
+            assert_eq!(near(given, names), want, "{given}");
+        }
+        assert_eq!(
+            near(&"a".repeat(ASKED_MAX + 1), [&*"a".repeat(ASKED_MAX)]),
+            None
+        );
+        // Only what the agent may call is suggested.
+        let n = box_node();
+        for (given, want) in [
+            ("lamp.of", None),
+            ("exec.signl", None),
+            ("fs.wirte", Some("fs.write")),
+        ] {
+            assert_eq!(
+                unit(&n, given),
+                Err(Miss::Unknown {
+                    near: want.map(str::to_string)
+                }),
+                "{given}"
+            );
+        }
     }
 
     #[test]

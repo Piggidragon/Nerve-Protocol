@@ -208,7 +208,8 @@ impl Engine {
     }
 
     /// `list`: it only reads the catalog, so it runs no checker, sets no
-    /// taint and counts in no statistics.
+    /// taint and counts in no statistics. The session notes the units it
+    /// gave the details of, which `execute` then accepts.
     fn list_call(&self, args: &Map<String, Value>) -> Value {
         let node = match args.get("node") {
             None | Some(Value::Null) => None,
@@ -232,15 +233,27 @@ impl Engine {
                 };
                 match asked {
                     None => listing::units(&offer),
-                    Some(asked) => listing::details(&offer, &asked),
+                    Some(asked) => {
+                        let answer = listing::details(&offer, &asked);
+                        // The offer is a copy: the state is not held while
+                        // the session's map is locked (see `Inner::store`).
+                        let sess = self.live_session();
+                        for u in offer.units.iter().filter(|u| asked.contains(&u.name)) {
+                            sess.listed(&offer.node.id, &u.name, u.hash());
+                        }
+                        answer
+                    }
                 }
             }
         };
         answer_result(answer)
     }
 
-    /// `execute`: the node and unit as `list` offers them, the arguments
-    /// checked against the unit's params, then the call.
+    /// `execute`, in this order: the node (by name or id) and the unit as
+    /// `list` offers them, that `list` gave this session the unit's details
+    /// as the unit is now, the arguments against its params, then the call.
+    /// Each refusal before the call says what to do instead, and nothing of
+    /// it reaches the node.
     async fn execute(&self, mut args: Map<String, Value>) -> Value {
         let node = match args.remove("node") {
             Some(Value::String(s)) => s,
@@ -259,22 +272,49 @@ impl Engine {
             Ok(Some(found)) => found,
             Ok(None) => return text_result(&unknown_node(&self.center, &node), true),
             Err((name, miss)) => {
+                let asked = util::clip(&unit, 64);
                 let text = match miss {
                     Miss::Disabled => format!(
                         "error unavailable: node {name} is disabled in the center: it offers nothing, and calls to it are refused."
                     ),
-                    Miss::Off => format!(
-                        "error forbidden: {:?} is turned off on node {name} by its owner.",
-                        util::clip(&unit, 64)
+                    Miss::Off => {
+                        format!(
+                            "error forbidden: {asked:?} is turned off on node {name} by its owner."
+                        )
+                    }
+                    Miss::Broken => format!(
+                        "error unknown_capability: node {name} offers no {asked:?}: the center left it out, because its description is not one the center can check (the node's owner sees why in the center). Call list with node {name:?} for its capabilities."
                     ),
-                    Miss::Unknown => format!(
-                        "error unknown_capability: node {name} offers no {:?}: call list with node {name:?} for its capabilities.",
-                        util::clip(&unit, 64)
+                    Miss::Unknown { near } => format!(
+                        "error unknown_capability: node {name} offers no {asked:?}{}: call list with node {name:?} for its capabilities.",
+                        meant(near.as_deref())
                     ),
                 };
                 return text_result(&text, true);
             }
         };
+        // The model runs only what it was shown, as it is now: a unit that
+        // changed since must be listed again, so its args fit the params it
+        // has. The hash is taken from the copy, outside the state's lock.
+        let sess = self.live_session();
+        let list = format!(
+            "call list with node {:?} and capability {:?}",
+            route.node_name, unit.name
+        );
+        let then = "then execute it with args that fit the params list gives.";
+        match sess.listed_hash(&route.node_id, &unit.name) {
+            None => return text_result(&format!("error list_first: {list} first, {then}"), true),
+            Some(h) if h != unit.hash() => {
+                return text_result(
+                    &format!(
+                        "error list_first: {:?} on node {} changed since list gave its details: {list} again, {then}",
+                        unit.name, route.node_name
+                    ),
+                    true,
+                );
+            }
+            Some(_) => {}
+        }
         // The arguments are checked against the unit's schema before
         // anything goes to the node, so a model that got them wrong learns
         // which field at once. The refusal is logged and counted as a failed
@@ -284,7 +324,6 @@ impl Engine {
         let Value::Object(call_args) = call_args else {
             unreachable!("the arguments are an object")
         };
-        let sess = self.live_session();
         let out = match fits {
             Ok(()) => self.center.call(&sess, &route, call_args).await,
             Err(e) => Err(self.center.refused(&sess, &route, RpcError::from(e))),
@@ -403,7 +442,7 @@ fn capability_names(v: Option<&Value>) -> Result<Option<Vec<String>>, String> {
 }
 
 /// The answer to a call that names a node that is not there, with the names
-/// of the ones that are.
+/// of the ones that are and the one it was likely meant to be.
 fn unknown_node(center: &Center, given: &str) -> String {
     let names = center.node_names();
     let known = if names.is_empty() {
@@ -411,10 +450,19 @@ fn unknown_node(center: &Center, given: &str) -> String {
     } else {
         format!("the nodes are {}", util::clip(&names.join(", "), 2000))
     };
+    let near = listing::near(given, names.iter().map(String::as_str));
     format!(
-        "error unknown_node: there is no node {:?}; {known}.",
-        util::clip(given, 64)
+        "error unknown_node: there is no node {:?}{}; {known}.",
+        util::clip(given, 64),
+        meant(near)
     )
+}
+
+/// ` (did you mean "x"?)` after a name that is not there, when `near` is
+/// the one it was likely meant to be.
+fn meant(near: Option<&str>) -> String {
+    near.map(|n| format!(" (did you mean {n:?}?)"))
+        .unwrap_or_default()
 }
 
 fn invalid(what: &str) -> Value {
@@ -710,27 +758,8 @@ mod tests {
         json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})
     }
 
-    /// Pairs an offline node `box-1` (id `n1`) with fs.read, exec.run and
-    /// exec.signal, a capability its owner turned off, and settings.
+    /// Pairs an offline node `box-1` (id `n1`) described by [`box_desc`].
     fn with_box(c: &Center) {
-        let mut lamp = cap("lamp", "", &[("on", Effect::Actuate, path())]);
-        lamp.exposure = Exposure::Off;
-        let d = desc(
-            "box-1",
-            vec![
-                cap("fs", "fs", &[("read", Effect::Read, path())]),
-                cap(
-                    "exec",
-                    "exec",
-                    &[
-                        ("run", Effect::Execute, path()),
-                        ("signal", Effect::Actuate, path()),
-                    ],
-                ),
-                lamp,
-                cap("settings", "settings", &[("set", Effect::Write, path())]),
-            ],
-        );
         let mut n = NodeRecord {
             id: "n1".into(),
             name: "box-1".into(),
@@ -746,8 +775,43 @@ mod tests {
             descriptor: None,
             catalog: Default::default(),
         };
-        n.set_descriptor(d);
+        n.set_descriptor(box_desc());
         c.update(|s| s.nodes.insert("n1".into(), n));
+    }
+
+    /// The node describes itself anew as `d`.
+    fn describe(c: &Center, d: nerve_proto::Descriptor) {
+        c.update(|s| s.nodes.get_mut("n1").unwrap().set_descriptor(d));
+    }
+
+    /// fs.read, exec.run and exec.signal, a capability its owner turned off
+    /// (lamp), one whose schema the center cannot check (fs.grep), and
+    /// settings.
+    fn box_desc() -> nerve_proto::Descriptor {
+        let mut lamp = cap("lamp", "", &[("on", Effect::Actuate, path())]);
+        lamp.exposure = Exposure::Off;
+        let grep =
+            json!({"type": "object", "properties": {"p": {"type": "string", "pattern": "a"}}});
+        desc(
+            "box-1",
+            vec![
+                cap(
+                    "fs",
+                    "fs",
+                    &[("read", Effect::Read, path()), ("grep", Effect::Read, grep)],
+                ),
+                cap(
+                    "exec",
+                    "exec",
+                    &[
+                        ("run", Effect::Execute, path()),
+                        ("signal", Effect::Actuate, path()),
+                    ],
+                ),
+                lamp,
+                cap("settings", "settings", &[("set", Effect::Write, path())]),
+            ],
+        )
     }
 
     async fn rpc(e: &Engine, method: &str, params: Value) -> Value {
@@ -967,6 +1031,12 @@ mod tests {
         let c = open(dir.path());
         with_box(&c);
         let e = Engine::new(&c, "test");
+        call(
+            &e,
+            "list",
+            json!({"node": "box-1", "capability": "fs.read"}),
+        )
+        .await;
         for (args, want) in [
             (
                 json!({"node": "nope", "capability": "fs.read", "args": {}}),
@@ -1017,6 +1087,248 @@ mod tests {
             text(&r),
             "error unavailable: node box-1 is disabled in the center: it offers nothing, and calls to it are refused."
         );
+    }
+
+    /// What `execute` of fs.read on box-1 answers through `e`.
+    async fn read_box(e: &Engine, node: &str) -> String {
+        let r = call(
+            e,
+            "execute",
+            json!({"node": node, "capability": "fs.read", "args": {"path": "/x"}}),
+        )
+        .await;
+        assert_eq!(r["isError"], true, "box-1 is offline: {r}");
+        text(&r).to_string()
+    }
+
+    const FIRST: &str = "error list_first: call list with node \"box-1\" and capability \"fs.read\" first, then execute it with args that fit the params list gives.";
+    const AGAIN: &str = "error list_first: \"fs.read\" on node box-1 changed since list gave its details: call list with node \"box-1\" and capability \"fs.read\" again, then execute it with args that fit the params list gives.";
+    /// Past every check of `execute`: a call, and box-1 is offline.
+    const CALLED: &str = "error unavailable: the node box-1 is offline";
+
+    /// `execute` runs a unit only after `list` gave this session its
+    /// details, by name or id, and again after the unit changed; a change of
+    /// the node that leaves the unit alone needs no new list.
+    #[tokio::test]
+    async fn execute_runs_only_what_list_gave_this_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path());
+        with_box(&c);
+        let e = Engine::new(&c, "test");
+        let stats = c.stats_json();
+        assert_eq!(read_box(&e, "box-1").await, FIRST);
+        // Its line in list(node) is not its details; nor is another's.
+        call(&e, "list", json!({"node": "box-1"})).await;
+        call(
+            &e,
+            "list",
+            json!({"node": "box-1", "capability": "exec.run"}),
+        )
+        .await;
+        assert_eq!(read_box(&e, "box-1").await, FIRST);
+        // Bad args are not checked before the list, which gives the params.
+        let r = call(
+            &e,
+            "execute",
+            json!({"node": "box-1", "capability": "fs.read", "args": {"path": 5}}),
+        )
+        .await;
+        assert_eq!(text(&r), FIRST);
+        // The refusals counted nowhere, as `list` does not.
+        assert_eq!(c.stats_json(), stats);
+        assert_eq!(e.session().calls.load(Ordering::SeqCst), 0);
+
+        // Listed by id, executed by name; once is enough for many calls.
+        let listed = call(
+            &e,
+            "list",
+            json!({"node": "n1", "capability": ["fs.read", "nope.nope"]}),
+        )
+        .await;
+        assert_eq!(listed["isError"], false, "{listed}");
+        assert_eq!(read_box(&e, "box-1").await, CALLED);
+        assert_eq!(read_box(&e, "n1").await, CALLED);
+
+        // A rule, mode or other unit's change leaves fs.read alone.
+        let mut d = box_desc();
+        d.rev = 9;
+        d.summary = "Now in folder mode.".into();
+        d.capabilities[1].actions.get_mut("run").unwrap().params = json!({"type": "object"});
+        describe(&c, d);
+        assert_eq!(read_box(&e, "box-1").await, CALLED);
+
+        // A new param of fs.read needs a new list, which takes it.
+        let mut d = box_desc();
+        d.capabilities[0].actions.get_mut("read").unwrap().params = json!({"type": "object",
+            "properties": {"path": {"type": "string"}, "max": {"type": "integer"}},
+            "required": ["path", "max"]});
+        describe(&c, d.clone());
+        assert_eq!(read_box(&e, "box-1").await, AGAIN);
+        call(
+            &e,
+            "list",
+            json!({"node": "box-1", "capability": "fs.read"}),
+        )
+        .await;
+        assert_eq!(
+            read_box(&e, "box-1").await,
+            "error invalid_args: max: expected an integer (required)"
+        );
+        // And back to the old one: changed again, so listed again.
+        describe(&c, box_desc());
+        assert_eq!(read_box(&e, "box-1").await, AGAIN);
+
+        // What one session was shown, another was not.
+        call(
+            &e,
+            "list",
+            json!({"node": "box-1", "capability": "fs.read"}),
+        )
+        .await;
+        assert_eq!(read_box(&e, "box-1").await, CALLED);
+        let other = Engine::new(&c, "test");
+        assert_eq!(read_box(&other, "box-1").await, FIRST);
+
+        // A session ended in the web UI goes on as a new one, shown nothing.
+        let ended = e.session().id.clone();
+        assert!(c.end_session(&ended).await);
+        assert_eq!(read_box(&e, "box-1").await, FIRST);
+        assert_ne!(e.session().id, ended);
+        call(
+            &e,
+            "list",
+            json!({"node": "box-1", "capability": "fs.read"}),
+        )
+        .await;
+        assert_eq!(read_box(&e, "box-1").await, CALLED);
+    }
+
+    /// A misspelt node or capability gets the one it was likely meant to
+    /// be; a left-out one is named as left out, and a hidden one is unknown.
+    #[tokio::test]
+    async fn execute_says_what_a_wrong_name_was_meant_to_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path());
+        with_box(&c);
+        let e = Engine::new(&c, "test");
+        for (node, unit, want) in [
+            (
+                "box1",
+                "fs.read",
+                "error unknown_node: there is no node \"box1\" (did you mean \"box-1\"?); the nodes are box-1.",
+            ),
+            (
+                "box-1",
+                "fs.raed",
+                "error unknown_capability: node box-1 offers no \"fs.raed\" (did you mean \"fs.read\"?): call list with node \"box-1\" for its capabilities.",
+            ),
+            (
+                "box-1",
+                "fs_read",
+                "error unknown_capability: node box-1 offers no \"fs_read\" (did you mean \"fs.read\"?): call list with node \"box-1\" for its capabilities.",
+            ),
+            (
+                "box-1",
+                "fs.grep",
+                "error unknown_capability: node box-1 offers no \"fs.grep\": the center left it out, because its description is not one the center can check (the node's owner sees why in the center). Call list with node \"box-1\" for its capabilities.",
+            ),
+            // Never a hidden or turned-off one, however close.
+            (
+                "box-1",
+                "settings.sat",
+                "error unknown_capability: node box-1 offers no \"settings.sat\": call list with node \"box-1\" for its capabilities.",
+            ),
+            (
+                "box-1",
+                "lamp.of",
+                "error unknown_capability: node box-1 offers no \"lamp.of\": call list with node \"box-1\" for its capabilities.",
+            ),
+        ] {
+            let r = call(
+                &e,
+                "execute",
+                json!({"node": node, "capability": unit, "args": {}}),
+            )
+            .await;
+            assert_eq!(r["isError"], true, "{unit}");
+            assert_eq!(text(&r), want, "{unit}");
+        }
+        // list names a misspelt node the same way.
+        let r = call(&e, "list", json!({"node": "box-2"})).await;
+        assert_eq!(
+            text(&r),
+            "error unknown_node: there is no node \"box-2\" (did you mean \"box-1\"?); the nodes are box-1."
+        );
+    }
+
+    /// `list` and `execute` on shared sessions, the web UI's node and
+    /// session lists and new descriptors, all at once, do not deadlock: the
+    /// session's map of shown units is never locked while the state is held,
+    /// and the state never while the map is (issue #150).
+    #[test]
+    fn list_and_execute_with_the_lists_and_new_descriptors_do_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path());
+        with_box(&c);
+        let engines: Vec<Arc<Engine>> = (0..2).map(|_| Arc::new(Engine::new(&c, "test"))).collect();
+        let (done, finished) = std::sync::mpsc::channel();
+        for i in 0..8 {
+            let (c, done) = (c.clone(), done.clone());
+            // Each engine has a thread that lists and one that executes.
+            let e = engines[i / 4].clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                for k in 0..200 {
+                    match i % 4 {
+                        0 => {
+                            rt.block_on(call(
+                                &e,
+                                "list",
+                                json!({"node": "box-1", "capability": ["fs.read", "exec.run"]}),
+                            ));
+                        }
+                        1 => {
+                            rt.block_on(call(
+                                &e,
+                                "execute",
+                                json!({"node": "box-1", "capability": "fs.read", "args": {"path": "/"}}),
+                            ));
+                        }
+                        2 => {
+                            c.nodes_json();
+                            c.sessions_json();
+                        }
+                        _ => {
+                            let mut d = box_desc();
+                            d.capabilities[0].summary = format!("files {}", k % 2);
+                            describe(&c, d);
+                        }
+                    }
+                }
+                let _ = done.send(());
+            });
+        }
+        for _ in 0..8 {
+            finished
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("list, execute and the lists deadlocked");
+        }
+        // Both sessions still list and run.
+        for e in &engines {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(call(
+                e,
+                "list",
+                json!({"node": "box-1", "capability": "fs.read"}),
+            ));
+            assert_eq!(rt.block_on(read_box(e, "box-1")), CALLED);
+        }
     }
 
     #[test]

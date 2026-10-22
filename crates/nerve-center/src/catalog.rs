@@ -40,6 +40,35 @@ pub struct Unit {
     pub provider: String,
 }
 
+impl Unit {
+    /// What the model was told of this unit, as one number: SHA-256 over
+    /// its name, effect, summaries, params and result, cut to 53 bits so it
+    /// is exact as a JSON number. `execute` compares it with the one `list`
+    /// gave the session: a unit that changed must be listed again, while a
+    /// rule, mode or `until` change on the node leaves it alone.
+    pub fn hash(&self) -> u64 {
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        // Each part with its length first, so no two units run together
+        // into the same bytes. The schemas' keys are sorted (serde_json's
+        // map), so the same schema gives the same text.
+        for part in [
+            self.name.clone(),
+            self.effect.as_str().to_string(),
+            self.cap_summary.clone(),
+            self.summary.clone(),
+            self.params.to_string(),
+            self.result.to_string(),
+        ] {
+            ctx.update(&(part.len() as u64).to_be_bytes());
+            ctx.update(part.as_bytes());
+        }
+        let d = ctx.finish();
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&d.as_ref()[..8]);
+        u64::from_be_bytes(first) & ((1 << 53) - 1)
+    }
+}
+
 /// A unit the center leaves out, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Broken {
@@ -120,23 +149,28 @@ impl Catalog {
             .map(|i| &self.units[i])
     }
 
+    /// Why `name` (`cap.action`) is left out, when it is.
+    pub fn broken(&self, name: &str) -> Option<&Broken> {
+        self.broken.iter().find(|b| b.name == name)
+    }
+
     /// Whether `cap.action` is a unit, so it may be offered to the agent.
     pub fn offers(&self, cap: &str, action: &str) -> bool {
         self.unit(&format!("{cap}.{action}")).is_some()
     }
 }
 
-/// Names hold letters, digits and `-`: `.` joins a unit's name and `_` a
-/// tool's, so a name with either could not be split again.
+/// Names hold letters, digits, `-` and `_`: `.` joins a unit's name, so a
+/// name with one could not be split again.
 fn bad_name(cap: &str, action: &str) -> Option<String> {
     if !valid_member_name(cap) {
         return Some(format!(
-            "capability name {cap:?}: letters, digits and - only, no _"
+            "capability name {cap:?}: letters, digits, - and _ only"
         ));
     }
     if !valid_member_name(action) {
         return Some(format!(
-            "action name {action:?}: letters, digits and - only, no _"
+            "action name {action:?}: letters, digits, - and _ only"
         ));
     }
     None
@@ -232,6 +266,8 @@ mod tests {
         assert!(c.unit("settings.set").is_none());
     }
 
+    /// A name with `.` could not be split again, so it leaves out its own
+    /// units only; `_` is a letter like the others.
     #[test]
     fn a_bad_name_leaves_out_that_capability_only() {
         let d = desc(
@@ -242,7 +278,7 @@ mod tests {
                     "fs",
                     &[
                         ("read", Effect::Read, path()),
-                        ("list", Effect::Read, path()),
+                        ("list_all", Effect::Read, path()),
                     ],
                 ),
                 cap(
@@ -250,7 +286,7 @@ mod tests {
                     "exec",
                     &[
                         ("run", Effect::Execute, path()),
-                        ("run_all", Effect::Execute, path()),
+                        ("run.all", Effect::Execute, path()),
                     ],
                 ),
                 cap("a.b", "", &[("go", Effect::Read, path())]),
@@ -260,19 +296,78 @@ mod tests {
         assert_eq!(
             names(&c),
             (
-                vec!["exec.run"],
-                vec!["a.b.go", "exec.run_all", "my_fs.list", "my_fs.read"]
+                vec!["exec.run", "my_fs.list_all", "my_fs.read"],
+                vec!["a.b.go", "exec.run.all"]
             )
         );
         assert_eq!(
-            c.broken[2].reason,
-            "capability name \"my_fs\": letters, digits and - only, no _"
+            c.broken[0].reason,
+            "capability name \"a.b\": letters, digits, - and _ only"
         );
         assert_eq!(
             c.broken[1].reason,
-            "action name \"run_all\": letters, digits and - only, no _"
+            "action name \"run.all\": letters, digits, - and _ only"
         );
-        assert!(!c.offers("my_fs", "read"));
+        assert_eq!(c.broken("exec.run.all"), Some(&c.broken[1]));
+        assert_eq!(c.broken("exec.run"), None);
+        assert!(c.offers("my_fs", "read"));
+    }
+
+    /// A unit's hash follows what `list` tells of it, and only that: the
+    /// node's rules, its mode and the other units leave it alone.
+    #[test]
+    fn a_units_hash_changes_with_what_list_tells_of_it() {
+        let d = desc(
+            "box",
+            vec![
+                cap("fs", "fs", &[("read", Effect::Read, path())]),
+                cap("exec", "exec", &[("run", Effect::Execute, path())]),
+            ],
+        );
+        let hash = |d: &Descriptor| Catalog::build(d).unit("fs.read").unwrap().hash();
+        let h = hash(&d);
+        assert!(h < 1 << 53, "{h}");
+        assert_eq!(hash(&d), h, "the same unit, the same hash");
+
+        // A new revision of the descriptor (a rule edit, a mode change) and
+        // a change of another unit are not this unit's business.
+        let mut same = d.clone();
+        same.rev = 7;
+        same.summary = "now in folder mode".into();
+        same.capabilities[1].actions.get_mut("run").unwrap().params = json!({"type": "object"});
+        assert_eq!(hash(&same), h);
+
+        // Each thing `list` tells of it is.
+        type Edit = fn(&mut Descriptor);
+        let edits: [(&str, Edit); 6] = [
+            ("params", |d| {
+                d.capabilities[0].actions.get_mut("read").unwrap().params = json!({
+                    "type": "object", "properties": {"path": {"type": "string"},
+                    "max": {"type": "integer"}}, "required": ["path"]})
+            }),
+            ("result", |d| {
+                d.capabilities[0].actions.get_mut("read").unwrap().result =
+                    json!({"type": "string"})
+            }),
+            ("effect", |d| {
+                d.capabilities[0].actions.get_mut("read").unwrap().effect = Effect::Write
+            }),
+            ("summary", |d| {
+                d.capabilities[0].actions.get_mut("read").unwrap().summary = "Read.".into()
+            }),
+            ("capability summary", |d| {
+                d.capabilities[0].summary = "Files.".into()
+            }),
+            ("summaries run together", |d| {
+                d.capabilities[0].summary = "fs summaryread".into();
+                d.capabilities[0].actions.get_mut("read").unwrap().summary = " it".into()
+            }),
+        ];
+        for (what, edit) in edits {
+            let mut changed = d.clone();
+            edit(&mut changed);
+            assert_ne!(hash(&changed), h, "{what}");
+        }
     }
 
     #[test]

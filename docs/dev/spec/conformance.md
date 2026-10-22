@@ -133,12 +133,12 @@ JSON is a failure of the check, not an empty result.
 | 4 | a call of another tool is the JSON-RPC error -32602 |
 | 4 | `list(node)` gives each node's capabilities, exactly the offered ones, one per line |
 | 4 | the tools stay the same when nodes pair |
-| 4 | `list()` gives every node with its state |
+| 4 | `list()` gives every node with its state, in `structuredContent` in the envelope of all the nodes |
 | 4 | `list(node, capability)` gives the details of one capability or of a list of them: effect and `params` in `structuredContent`, the name in the text |
-| 4 | what a node wrote stands inside device content in a listing |
+| 4 | what a node wrote stands inside device content and the envelope in a listing: in the text inside the framing, in `structuredContent` only in `result` of `{source: "node <name> (id <id>)", note, result}` |
 | 4 | the units of `node`, `settings` and `audit` are never listed, and `execute` of one is refused and never reaches the node |
 | 4 | `execute` of a capability the session was not given the details of is `error list_first` and never reaches the node (in a second session, and for the other node in the first) |
-| 4 | a result is device content with the object as `structuredContent` |
+| 4 | a result is device content, in the text and in the envelope of `structuredContent`: the object is its `result` |
 | 4 | arguments that do not fit (one missing, of another type, one too many) are `error invalid_args` naming the field, and never reach the node |
 | 4 | a misspelt capability or node is answered with the name it was likely meant to be |
 | 4 | a failure on the node is `error <code>: <message>` |

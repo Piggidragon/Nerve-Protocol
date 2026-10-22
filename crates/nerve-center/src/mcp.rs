@@ -849,8 +849,9 @@ mod tests {
         assert_eq!(init["result"]["capabilities"], json!({"tools": {}}));
         let instructions = init["result"]["instructions"].as_str().unwrap();
         assert!(instructions.contains("`list`") && instructions.contains("`execute`"));
-        // A harness may show a model only `structuredContent`, without the
-        // framing of the text: the tool itself says its result is data. And
+        // A harness may show a model only `structuredContent`, never the
+        // text: besides the envelope there, the tool itself says its result
+        // is data. And
         // the list-first rule stands in the tool, for harnesses that leave
         // the instructions out.
         let execute = tools()[1]["description"].as_str().unwrap().to_string();

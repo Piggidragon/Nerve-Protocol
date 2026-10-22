@@ -131,10 +131,11 @@ statistics. It has three levels:
   characters), then the units that are `off`. `structuredContent`:
   `{node, described, capabilities: [{name, summary}], off}`.
 - `list(node, capability)`: `capability` is one name or a list of at most 32.
-  For each offered unit: its name, description (the capability's summary and
-  the action's), effect, `params` (the JSON schema, compact) and its result
-  (in words; the schema in `structuredContent`). Names that are not offered,
-  or off, are named after them. When none of the names is offered, the result
+  For each offered unit: its name, description (the action's summary, else
+  the capability's), effect, `params` (the JSON schema, compact) and its
+  result (in words; the schema in `structuredContent`). Names that are not
+  offered, or off, are named after them, a misspelt one with the offered unit
+  it was likely meant to be (as in `execute`, below). When none of the names is offered, the result
   is `isError` with `error unknown_capability` (`error forbidden` when all are
   off, `error unavailable` for a disabled node). `structuredContent`:
   `{node, capabilities: [{name, description, effect, params, result,
@@ -160,7 +161,8 @@ and sends nothing to the node.
    one left out is `error unknown_capability` and says the center left it
    out; any other name (a reserved one too) is `error unknown_capability`
    with the offered unit it was likely meant to be (`fs.raed` gives
-   `did you mean "fs.read"?`). The likely name is the closest by edit
+   `did you mean "fs.read"?`) and the `list` call for that unit's details,
+   since `execute` refuses it until then (step 4). The likely name is the closest by edit
    distance, ignoring case, within a third of the name's length (1 to 3
    edits).
 4. List first: `list(node, capability)` must have given this session the

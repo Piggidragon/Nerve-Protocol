@@ -28,3 +28,5 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The paused clock, for the time limits of the small HTTP (no new crate).
+tokio = { workspace = true, features = ["test-util"] }

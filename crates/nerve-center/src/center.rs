@@ -78,8 +78,29 @@ pub struct Inner {
     /// The end of a rotation failed and said so; it says so again once it
     /// worked.
     rotation_failed: AtomicBool,
+    /// The stored state. Code that holds it takes no other lock of the
+    /// center or of a session, only ones that never take it (a link's
+    /// `status` and `wire`, the log's, `saves` and `writing`): everything
+    /// else is copied out before it is locked. A lock taken under it that is
+    /// also held while the state is taken would deadlock two requests, and
+    /// with them every runtime worker (issue #150).
     store: Mutex<Store>,
     dirty: AtomicBool,
+    /// The number of the last snapshot of the state taken for its file,
+    /// counted under the state's lock, so the numbers follow the changes.
+    snapshots: AtomicU64,
+    /// The state file's snapshots: the newest one waiting to be written and
+    /// the number of the one the file holds.
+    saves: Mutex<Saves>,
+    /// Held while the state file is written, so writes go one at a time.
+    writing: Mutex<()>,
+    /// How long each write of the state file waits first, for the test of a
+    /// slow disk.
+    #[cfg(test)]
+    save_delay_ms: AtomicU64,
+    /// The writes of the state file, for the test of merged saves.
+    #[cfg(test)]
+    file_writes: AtomicU64,
     codes: Mutex<Codes>,
     links: Mutex<BTreeMap<String, Arc<Link>>>,
     changes: broadcast::Sender<Change>,
@@ -115,6 +136,35 @@ pub struct Inner {
     /// them, so no config change starts the server from them meanwhile.
     /// `manage_local_model` holds this lock for its whole run.
     files_held: Mutex<bool>,
+}
+
+/// The state file's text as it was at one moment, numbered in the order
+/// of the changes (see [`Center::update`]).
+struct Snapshot {
+    n: u64,
+    text: std::io::Result<Vec<u8>>,
+}
+
+/// The saves of the state file (see [`Center::write_snapshot`]).
+#[derive(Default)]
+struct Saves {
+    /// The newest snapshot not written yet, with its number.
+    waiting: Option<(u64, Vec<u8>)>,
+    /// The number of the snapshot the file holds.
+    written: u64,
+    /// Why the last write failed.
+    failed: String,
+}
+
+/// Runs `f`, which blocks, so that it holds no worker of a multi-thread
+/// runtime: the worker's other tasks move to another thread meanwhile.
+fn off_the_workers<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /// A one-click install running in the background.
@@ -355,6 +405,13 @@ impl Center {
             rotation_failed: AtomicBool::new(false),
             store: Mutex::new(store),
             dirty: AtomicBool::new(false),
+            snapshots: AtomicU64::new(0),
+            saves: Mutex::new(Saves::default()),
+            writing: Mutex::new(()),
+            #[cfg(test)]
+            save_delay_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            file_writes: AtomicU64::new(0),
             codes: Mutex::new(Codes::default()),
             links: Mutex::new(BTreeMap::new()),
             changes,
@@ -538,19 +595,83 @@ impl Center {
         let _ = self.changes.send(c);
     }
 
-    /// Runs `f` on the stored state and saves it.
+    /// Runs `f` on the stored state and saves it. The file is written with
+    /// the state unlocked, so a slow disk holds up no reader (issue #150);
+    /// it holds this change, or a later one, when this returns.
     pub fn update<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
-        let mut s = self.store.lock().unwrap();
-        let out = f(&mut s);
-        if let Err(e) = s.save(&self.dir) {
+        let (out, snap) = {
+            let mut s = self.store.lock().unwrap();
+            let out = f(&mut s);
+            self.dirty.store(false, Ordering::SeqCst);
+            (out, self.snapshot(&s))
+        };
+        if let Err(e) = self.write_snapshot(snap) {
             self.log.record(
                 Level::Error,
                 None,
                 &format!("cannot write the state file: {e}"),
             );
         }
-        self.dirty.store(false, Ordering::SeqCst);
         out
+    }
+
+    /// The state file's text for the state `s`, locked by the caller, with
+    /// its number among the snapshots.
+    fn snapshot(&self, s: &Store) -> Snapshot {
+        Snapshot {
+            n: self.snapshots.fetch_add(1, Ordering::SeqCst) + 1,
+            text: s.file_bytes(),
+        }
+    }
+
+    /// Returns once the state file holds `snap` or a newer snapshot, which
+    /// has every change of this one. Saves that come together are merged:
+    /// each write takes the newest snapshot waiting, so a burst of changes
+    /// costs about two writes, not one each. The wait is taken off the
+    /// runtime's workers, so a slow disk stops no other request (issue
+    /// #150).
+    fn write_snapshot(&self, snap: Snapshot) -> std::io::Result<()> {
+        let text = snap.text?;
+        {
+            let mut w = self.saves.lock().unwrap();
+            if w.written >= snap.n {
+                return Ok(());
+            }
+            if w.waiting.as_ref().is_none_or(|(n, _)| *n < snap.n) {
+                w.waiting = Some((snap.n, text));
+            }
+        }
+        off_the_workers(|| {
+            let _one = self.writing.lock().unwrap();
+            // Only a snapshot at least as new as this one is written here, so
+            // Ok always means the file holds this change. When none waits, a
+            // write that took this one away has ended, and failed (else it
+            // covered it). An older one that waits is left to its own save.
+            let (n, text) = {
+                let mut w = self.saves.lock().unwrap();
+                if w.written >= snap.n {
+                    return Ok(());
+                }
+                match w.waiting.take_if(|(n, _)| *n >= snap.n) {
+                    Some(next) => next,
+                    None => return Err(std::io::Error::other(w.failed.clone())),
+                }
+            };
+            #[cfg(test)]
+            {
+                self.file_writes.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(
+                    self.save_delay_ms.load(Ordering::SeqCst),
+                ));
+            }
+            let r = Store::write_file(&self.dir, &text);
+            let mut w = self.saves.lock().unwrap();
+            match &r {
+                Ok(()) => w.written = w.written.max(n),
+                Err(e) => w.failed = e.to_string(),
+            }
+            r
+        })
     }
 
     /// Runs `f` on the stored state and saves it, all or nothing: when `f`
@@ -569,7 +690,8 @@ impl Center {
                 return Err(e);
             }
         };
-        if let Err(e) = s.save(&self.dir) {
+        // Written under the lock: nobody sees the change before it is kept.
+        if let Err(e) = self.write_snapshot(self.snapshot(&s)) {
             *s = before;
             return Err(format!("the center cannot write its state file: {e}"));
         }
@@ -615,9 +737,12 @@ impl Center {
     /// Writes pending statistics. Called on a timer and on shutdown.
     pub fn flush(&self) {
         if self.dirty.swap(false, Ordering::SeqCst) {
-            let mut s = self.store.lock().unwrap();
-            s.prune_stats(now_ms());
-            if let Err(e) = s.save(&self.dir) {
+            let snap = {
+                let mut s = self.store.lock().unwrap();
+                s.prune_stats(now_ms());
+                self.snapshot(&s)
+            };
+            if let Err(e) = self.write_snapshot(snap) {
                 self.log.record(
                     Level::Error,
                     None,
@@ -916,7 +1041,7 @@ impl Center {
             let mut st = self.store.lock().unwrap();
             let before = st.key_rotation.replace(record);
             st.key_rotations += 1;
-            let r = st.save(&self.dir);
+            let r = self.write_snapshot(self.snapshot(&st));
             if r.is_err() {
                 st.key_rotation = before;
                 st.key_rotations -= 1;
@@ -1821,7 +1946,16 @@ impl Center {
     /// The nodes as the web UI and `nodes` show them.
     pub fn nodes_json(&self) -> Value {
         let links: BTreeMap<String, Arc<Link>> = self.links.lock().unwrap().clone();
+        // Which sessions use each node, read before the state is locked (see
+        // `Inner::store`): `sessions_json` holds a session's node set while
+        // it names the nodes.
         let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let mut used: HashMap<String, Vec<String>> = HashMap::new();
+        for x in &sessions {
+            for n in x.nodes.lock().unwrap().iter() {
+                used.entry(n.clone()).or_default().push(x.id.clone());
+            }
+        }
         let nodes: Vec<Value> = self.read(|s| {
             s.nodes
                 .values()
@@ -1836,11 +1970,7 @@ impl Center {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let used_by: Vec<&str> = sessions
-                        .iter()
-                        .filter(|x| x.nodes.lock().unwrap().contains(&n.id))
-                        .map(|x| x.id.as_str())
-                        .collect();
+                    let used_by = used.get(&n.id).cloned().unwrap_or_default();
                     json!({
                         "id": n.id,
                         "name": n.name,
@@ -1945,19 +2075,14 @@ impl Center {
     }
 
     pub fn sessions_json(&self) -> Value {
-        let list: Vec<Value> = self
-            .sessions
-            .lock()
-            .unwrap()
-            .values()
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let list: Vec<Value> = sessions
+            .iter()
             .map(|s| {
-                let nodes: Vec<String> = s
-                    .nodes
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|n| self.node_name(n))
-                    .collect();
+                // Copied out before the names are read: the state is never
+                // locked under a session's lock (see `Inner::store`).
+                let ids: Vec<String> = s.nodes.lock().unwrap().iter().cloned().collect();
+                let nodes: Vec<String> = ids.iter().map(|n| self.node_name(n)).collect();
                 json!({
                     "id": s.id,
                     "transport": s.transport,
@@ -3007,6 +3132,271 @@ mod tests {
             profile: "exec".into(),
             effect: nerve_proto::Effect::Execute,
         }
+    }
+
+    /// A slow write of the state file holds up no reader: the file is
+    /// written with the state unlocked, so a disk that takes seconds (an
+    /// fsync under load) does not stop the web UI from answering (issue
+    /// #150). The file still has the change once the save returns.
+    #[test]
+    fn a_slow_save_holds_up_no_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.save_delay_ms.store(3000, Ordering::SeqCst);
+        let saving = {
+            let c = c.clone();
+            std::thread::spawn(move || c.update(|s| s.center_name = "after".into()))
+        };
+        // The save is under way.
+        std::thread::sleep(Duration::from_millis(300));
+        let t = Instant::now();
+        let name = c.name();
+        let nodes = c.nodes_json();
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "a read waited {:?} for the save",
+            t.elapsed()
+        );
+        assert_eq!(name, "after");
+        assert_eq!(nodes, json!([]));
+        saving.join().unwrap();
+        let back = Store::load(dir.path()).unwrap().unwrap();
+        assert_eq!(back.center_name, "after");
+    }
+
+    /// Saves that come together are merged: eight changes at once with a
+    /// disk that takes 500 ms a write are on disk in about two writes (1 s),
+    /// not eight one after the other (4 s), and a read meanwhile does not
+    /// wait.
+    #[test]
+    fn saves_that_come_together_are_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.save_delay_ms.store(500, Ordering::SeqCst);
+        let go = Arc::new(std::sync::Barrier::new(8));
+        let t = Instant::now();
+        let savers: Vec<_> = (0..8)
+            .map(|i| {
+                let (c, go) = (c.clone(), go.clone());
+                std::thread::spawn(move || {
+                    go.wait();
+                    c.update(|s| s.pair_code_minutes = 10 + i);
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(200));
+        let r = Instant::now();
+        c.name();
+        assert!(
+            r.elapsed() < Duration::from_millis(200),
+            "a read waited {:?}",
+            r.elapsed()
+        );
+        for s in savers {
+            s.join().unwrap();
+        }
+        // Two writes when the threads come at once; one more is allowed
+        // for a thread that starts late on a busy machine.
+        let writes = c.file_writes.load(Ordering::SeqCst);
+        assert!(writes <= 3, "eight saves wrote the file {writes} times");
+        assert!(
+            t.elapsed() < Duration::from_millis(2500),
+            "eight saves took {:?}",
+            t.elapsed()
+        );
+        let now = c.read(|s| s.pair_code_minutes);
+        assert_eq!(
+            Store::load(dir.path()).unwrap().unwrap().pair_code_minutes,
+            now
+        );
+    }
+
+    /// A save that waits for a slow disk holds no worker of the runtime: a
+    /// task queued on the saving worker runs at once, not after the save,
+    /// so the ports keep answering while the disk is slow (issue #150).
+    #[test]
+    fn a_slow_save_holds_no_runtime_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.save_delay_ms.store(500, Ordering::SeqCst);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let saver = rt.spawn(async move {
+            let t = Instant::now();
+            // Queued on this worker, which then saves.
+            let other = tokio::spawn(async move { t.elapsed() });
+            c.update(|s| s.pair_code_minutes = 11);
+            other.await.unwrap()
+        });
+        let waited = rt.block_on(saver).unwrap();
+        assert!(
+            waited < Duration::from_millis(250),
+            "a task waited {waited:?} for the save's worker"
+        );
+    }
+
+    /// Runs the race of a covering write that fails (review round 2 of
+    /// #150): `one` is being written (500 ms a write); `two` waits behind
+    /// it; `four`, the newest, is saved by `save`; `two`'s write takes
+    /// `four` and fails, as the folder is closed for it; an older snapshot
+    /// (`three`, taken before `four`) reaches the queue only then. The save
+    /// of `four` may not write `three` and report `four` as kept. Returns
+    /// what that save returned and the name in the file.
+    #[cfg(unix)]
+    fn a_failed_covering_write(
+        save: impl FnOnce(&Center) -> Result<(), String> + Send + 'static,
+    ) -> (Result<(), String>, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.save_delay_ms.store(500, Ordering::SeqCst);
+        let t0 = Instant::now();
+        let at = move |ms: u64| {
+            std::thread::sleep(Duration::from_millis(ms).saturating_sub(t0.elapsed()))
+        };
+        let update = |name: &'static str| {
+            let c = c.clone();
+            std::thread::spawn(move || c.update(|s| s.center_name = name.into()))
+        };
+        let one = update("one");
+        at(50);
+        // Taken under the lock, and not at the queue yet.
+        let late = {
+            let mut s = c.store.lock().unwrap();
+            s.center_name = "three".into();
+            c.snapshot(&s)
+        };
+        at(100);
+        let two = update("two");
+        at(200);
+        let q = {
+            let c = c.clone();
+            std::thread::spawn(move || save(&c))
+        };
+        at(700);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        at(800);
+        let older = {
+            let c = c.clone();
+            std::thread::spawn(move || c.write_snapshot(late))
+        };
+        at(1200);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        one.join().unwrap();
+        two.join().unwrap();
+        let r = q.join().unwrap();
+        let _ = older.join().unwrap();
+        let on_disk = Store::load(dir.path()).unwrap().unwrap().center_name;
+        (r, on_disk)
+    }
+
+    /// A save is only Ok when the file holds its snapshot or a newer one:
+    /// after the write that took it away failed, it does not write an older
+    /// snapshot in its place and report success.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_whose_covering_write_failed_does_not_write_an_older_one() {
+        let (r, on_disk) = a_failed_covering_write(|c| {
+            let mut s = c.store.lock().unwrap();
+            s.center_name = "four".into();
+            let snap = c.snapshot(&s);
+            drop(s);
+            c.write_snapshot(snap).map_err(|e| e.to_string())
+        });
+        assert!(
+            r.is_err() || on_disk == "four",
+            "the save of four returned Ok, but the file holds {on_disk:?}"
+        );
+    }
+
+    /// The same race through `update_saved`: a change it reports as kept
+    /// (a node's new key, say) is in the file, or it fails and is undone.
+    #[cfg(unix)]
+    #[test]
+    fn update_saved_is_kept_before_it_is_told() {
+        let (r, on_disk) = a_failed_covering_write(|c| {
+            c.update_saved(|s| {
+                s.center_name = "four".into();
+                Ok(())
+            })
+        });
+        assert!(
+            r.is_err() || on_disk == "four",
+            "update_saved returned Ok, but the file holds {on_disk:?}"
+        );
+    }
+
+    /// Saves that finish out of order leave the newest state in the file:
+    /// an older snapshot that comes to be written after a newer one is not.
+    #[test]
+    fn an_older_snapshot_never_replaces_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let snap = |name: &str| {
+            let mut s = c.store.lock().unwrap();
+            s.center_name = name.into();
+            c.snapshot(&s)
+        };
+        let (older, newer) = (snap("older"), snap("newer"));
+        c.write_snapshot(newer).unwrap();
+        c.write_snapshot(older).unwrap();
+        let back = Store::load(dir.path()).unwrap().unwrap();
+        assert_eq!(back.center_name, "newer");
+        // A change after them is written as usual.
+        c.update(|s| s.center_name = "latest".into());
+        assert_eq!(
+            Store::load(dir.path()).unwrap().unwrap().center_name,
+            "latest"
+        );
+    }
+
+    /// The web UI's node and session lists read at the same time (two
+    /// overview polls) do not deadlock: the session list held a session's
+    /// node set while it named the nodes from the state, the node list held
+    /// the state while it read every session's node set, and two requests
+    /// that met that way stopped every runtime worker for good (issue #150).
+    /// Both lists still say who uses what.
+    #[test]
+    fn the_node_and_session_lists_read_together_do_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let ids: Vec<String> = (0..16).map(|i| format!("n{i}")).collect();
+        c.update(|s| {
+            for id in &ids {
+                s.nodes.insert(id.clone(), node_record(id, "linux"));
+            }
+        });
+        let sessions: Vec<Arc<Session>> = (0..16).map(|_| c.new_session("test")).collect();
+        for s in &sessions {
+            s.nodes.lock().unwrap().extend(ids.iter().cloned());
+        }
+        let (done, finished) = std::sync::mpsc::channel();
+        for i in 0..4 {
+            let (c, done) = (c.clone(), done.clone());
+            std::thread::spawn(move || {
+                for _ in 0..300 {
+                    if i % 2 == 0 {
+                        c.nodes_json();
+                    } else {
+                        c.sessions_json();
+                    }
+                }
+                let _ = done.send(());
+            });
+        }
+        for _ in 0..4 {
+            finished
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the node and session lists deadlocked");
+        }
+        let nodes = c.nodes_json();
+        assert_eq!(nodes[0]["sessions"].as_array().unwrap().len(), 16);
+        let list = c.sessions_json();
+        assert_eq!(list[0]["nodes"].as_array().unwrap().len(), 16);
+        assert_eq!(list[0]["nodes"][0], "n0");
     }
 
     /// The checker gate refuses a blocklisted command before the node, with a

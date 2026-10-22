@@ -548,6 +548,38 @@ mod tests {
         assert!(t.elapsed() >= HEAD_TIMEOUT, "{:?}", t.elapsed());
     }
 
+    /// A peer that reads all the time, but too slowly, is dropped after
+    /// [`time_for`] the answer, though it takes every part within
+    /// [`HEAD_TIMEOUT`]: 1 KiB every 0.9 s would hold a 10 MiB answer for
+    /// hours.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_reads_too_slowly_is_dropped() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let reader = tokio::spawn(async move {
+            let mut got = 0usize;
+            let mut buf = [0u8; 1024];
+            loop {
+                match a.read(&mut buf).await {
+                    Ok(0) | Err(_) => return got,
+                    Ok(n) => got += n,
+                }
+                tokio::time::sleep(Duration::from_millis(900)).await;
+            }
+        });
+        let len = 256 * 1024;
+        let resp = Response::new(200, "text/plain", vec![b'x'; len]);
+        let t = tokio::time::Instant::now();
+        let r = resp.write(&mut b).await;
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        let took = t.elapsed();
+        assert!(
+            took >= time_for(len) && took < time_for(len) + Duration::from_secs(2),
+            "{took:?}"
+        );
+        drop(b);
+        assert!(reader.await.unwrap() < len);
+    }
+
     /// A request body sent a byte now and then is dropped after
     /// [`time_for`] its length, though each byte comes within
     /// [`HEAD_TIMEOUT`] of the last (issue #150).

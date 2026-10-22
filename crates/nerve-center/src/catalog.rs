@@ -417,6 +417,7 @@ mod tests {
                 cap(&bad, "", &actions),
                 cap(&edge, "", &[("go", Effect::Read, Value::Null)]),
                 cap(&over, "", &[("go", Effect::Read, Value::Null)]),
+                cap("q\nr", "", &[("go", Effect::Read, Value::Null)]),
                 cap(
                     "fs",
                     "fs",
@@ -429,14 +430,14 @@ mod tests {
             ],
         );
         // A long provider name is shared by its units, not copied.
-        d.capabilities[4].provider = "p".repeat(16 * 1024);
+        d.capabilities[5].provider = "p".repeat(16 * 1024);
         let c = Catalog::build(&d);
         assert_eq!(
             c.units.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
             [format!("{edge}.go"), format!("fs.{edge}"), "fs.read".into()]
         );
         assert!(Arc::ptr_eq(&c.units[1].provider, &c.units[2].provider));
-        assert_eq!(c.broken.len(), 4, "{:?}", names(&c).1);
+        assert_eq!(c.broken.len(), 5, "{:?}", names(&c).1);
         let reasons: Vec<&str> = c.broken.iter().map(|b| b.reason.as_str()).collect();
         assert!(
             reasons.contains(&"capability name of 16384 bytes: at most 64"),
@@ -465,6 +466,7 @@ mod tests {
             "{shown:?}"
         );
         assert!(shown.contains(&format!("fs.{}…", &long_action[..NAME_MAX]).as_str()));
+        assert!(shown.contains(&"q r"), "{shown:?}");
         assert!(footprint(&c) < 4096, "{}", footprint(&c));
     }
 

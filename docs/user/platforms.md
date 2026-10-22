@@ -13,7 +13,7 @@ Fedora 36 and later) and fontconfig.
 | `folder` mode runs commands | Yes, confined by Landlock; on the installed node as `nerve-run`, also where Landlock is missing | Yes, confined by an AppContainer; not yet on the [installed service](service.md#windows) |
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
 | Sudo switch | Yes | On the [installed service](service.md#windows), with the administrator token of the account commands run as ([sudo on Windows](sudo.md#sudo-on-windows)) |
-| Control socket | Yes | A control pipe that takes folder changes only |
+| Control socket | Yes | A control pipe: `status`, `center rotate-key` and folder changes, no other change |
 | Install as a service | Yes, with systemd, the node and the [center](center.md#run-it-as-a-service) | The node |
 | The center's [action checker](action-checker.md) | Yes. Its local model on x86_64 and aarch64, on the CPU or a Vulkan GPU; the installed center service runs it on the CPU only | Yes. Its local model on x86_64, on the CPU or a Vulkan GPU |
 | Config folder | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` |
@@ -137,9 +137,11 @@ them to their folders.
 
 ### The control pipe
 
-A running node on Windows takes `folder add`, `folder set` and `folder rm`
-from the CLI at once, over a named pipe, and brings the folders' permission
-entries in line before it answers. Only the administrators (in a terminal
+A running node on Windows answers `nerve-node status` and `relay ls` (with the
+relay's live tunnels) over a named pipe, and takes `center rotate-key`,
+`folder add`, `folder set` and `folder rm` from the CLI at once. For a folder
+change it brings the folders' permission entries in line before it answers.
+Only the administrators (in a terminal
 opened with "Run as administrator"), SYSTEM and the node's own account can
 open the pipe, and the node refuses every request from a process of a
 command it runs. The pipe takes no other change yet: for those the CLI

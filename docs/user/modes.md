@@ -530,9 +530,10 @@ folders.
   --no-hardlinks`. Or remove them (delete `node_modules` or `.venv`) before
   you add, change or remove the folder.
 
-`nerve-node status` does not ask the running node on Windows yet
-([platforms](platforms.md#the-control-pipe)). The node names its
-confinement when it starts, in its output and its [log](logs.md):
+`nerve-node status` shows a running node's confinement (`daemon: running
+(confinement appcontainer)`): on Windows it asks the node over its
+[control pipe](platforms.md#the-control-pipe). The node also names it when it
+starts, in its output and its [log](logs.md):
 `node daemon running (…, confinement appcontainer, …)`. The center sees it in
 the node's `exec` state, `confinement appcontainer`, or `none` on the
 installed service.

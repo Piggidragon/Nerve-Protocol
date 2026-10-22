@@ -658,9 +658,8 @@ the keyring, and changes nothing (`node.toml`, the keyring); a proxy without
 either works, and its `proxy set` deletes the entry of an earlier call, as it
 does anywhere. Reading is as consistent: with headers named in `node.toml`
 (set before the install) the link stops with `bad proxy:` and the same reason
-(in the center's status and in the log; on Windows `status` does not ask the
-node, whose pipe takes folder changes only, so it shows no link status there
-and the log is the only place), and
+(in the center's status and in the log; on Windows `status` asks the node over
+its pipe, as on Linux), and
 `proxy ls` shows it, both without asking the keyring: an entry may be in the
 administrator's Credential Manager, but the service does not find it, so
 `proxy ls` must not call the values good.

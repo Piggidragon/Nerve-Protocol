@@ -166,8 +166,7 @@ installed Linux node (issue #142), so a few commands went or changed:
 
 | Before | Now |
 |---|---|
-| `setup --create-user <name> [--account-only]`, and setup's question for the account of the commands | gone: commands run as `nerve-run`, or as the owner |
+| `setup --create-user <name>`, and setup's question for the account of the commands | gone: commands run as `nerve-run`, or as the owner |
 | `config set machine.user <name>` (Linux) | refused: Windows only |
-| an owner added with `sudo usermod -aG nerve-admin <name>` | gone: the owner is the account that ran `install` |
 | `mode set …` | `mode set allowlist --as-owner` added |
 | after `install`: `sudo nerve-node setup` | `nerve-node center add '<link>'`, then `nerve-node folder add <folder> +r +w +x`; setup is optional |

@@ -287,7 +287,7 @@ impl Session {
     }
 }
 
-/// Why a tool call did not produce a result.
+/// Why a call of a unit (an `execute`) did not produce a result.
 #[derive(Debug)]
 pub enum CallError {
     Rpc(RpcError),
@@ -2361,7 +2361,7 @@ impl Center {
 
     // ---- Calls ----
 
-    /// Runs a tool call on its node: the node's policy decides.
+    /// Runs a call of a unit (an `execute`) on its node: the node's policy decides.
     pub async fn call(
         &self,
         sess: &Arc<Session>,

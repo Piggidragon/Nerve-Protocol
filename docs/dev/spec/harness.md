@@ -135,7 +135,9 @@ the `result` of the envelope described below.
   summary (its description cut at 200 characters), then the units that are
   `off`. `structuredContent`:
   `{node, described, capabilities: [{name, summary}], off}`.
-- `list(node, capability)`: `capability` is one name or a list of at most 32.
+- `list(node, capability)`: `capability` is a list of at most 32 names (a
+  single name as a string is accepted too, though the schema declares the
+  array).
   For each offered unit: its name, description (the action's summary, else
   the capability's, on one line and cut at 2 KiB), effect, `params` (the JSON
   schema, compact) and its result (in words; the schema in
@@ -194,7 +196,7 @@ and sends nothing to the node.
    length differs by more than that are not compared.
 4. List first: `list(node, capability)` must have given this session the
    unit's details, and the unit must be the same now. Otherwise the result is
-   `error list_first: call list with node "box-1" and capability "fs.read"
+   `error list_first: call list with node "box-1" and capability ["fs.read"]
    first, …` (or `… changed since list gave its details …`), with no schema
    in it. "The same" compares a per-unit hash: SHA-256 over the unit's name,
    effect, description (as `list` shows it), `params` and `result`, cut to

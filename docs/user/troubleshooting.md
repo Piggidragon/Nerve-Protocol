@@ -61,7 +61,7 @@ in the machine's audit log. The model can mostly fix them by itself.
 
 | Message | Cause | Fix |
 |---|---|---|
-| `list_first: call list with node "…" and capability "…" first` | The model ran a capability without asking `list` for its details in this session | The model calls `list` with that node and capability, then runs it again |
+| `list_first: call list with node "…" and capability ["…"] first` | The model ran a capability without asking `list` for its details in this session | The model calls `list` with that node and capability, then runs it again |
 | `list_first: "…" on node … changed since list gave its details` | The capability's arguments or description changed since, for example after a change of the machine's limits | The model lists it again |
 | `invalid_args: <field>: expected …` | The arguments do not fit the capability's schema | The model fixes that field |
 | `unknown_capability: node … offers no "…"` | The machine offers no capability of that name, maybe with `(did you mean "…"?)`. Or the center left it out: then the Overview names it under **Not offered to the agent** ([web UI](web-ui.md#overview)) | Check the name with `list`. If it should be offered, allow it on the machine |

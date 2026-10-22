@@ -1052,14 +1052,14 @@ async fn execute_only(e: &Engine, node: &str, unit: &str, args: Value) -> Value 
 /// the session the details of.
 fn list_first(unit: &str) -> String {
     format!(
-        "error list_first: call list with node \"box-1\" and capability {unit:?} first, then execute it with args that fit the params list gives."
+        "error list_first: call list with node \"box-1\" and capability [{unit:?}] first, then execute it with args that fit the params list gives."
     )
 }
 
 /// The refusal of an `execute` of `unit` on box-1 that changed since.
 fn list_again(unit: &str) -> String {
     format!(
-        "error list_first: {unit:?} on node box-1 changed since list gave its details: call list with node \"box-1\" and capability {unit:?} again, then execute it with args that fit the params list gives."
+        "error list_first: {unit:?} on node box-1 changed since list gave its details: call list with node \"box-1\" and capability [{unit:?}] again, then execute it with args that fit the params list gives."
     )
 }
 

@@ -655,7 +655,7 @@ mod tests {
     }
 
     /// The node's own descriptor, in every mode, is whole in the catalog: a
-    /// unit the center left out of its own node would be a tool lost.
+    /// unit the center left out of its own node would be a capability lost.
     #[test]
     fn the_nodes_own_descriptor_has_no_broken_unit() {
         use nerve_policy::{CenterEntry, NodeConfig};

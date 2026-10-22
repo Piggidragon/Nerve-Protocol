@@ -312,7 +312,7 @@ impl Engine {
                     // details: a model told only "did you mean" executed
                     // that name at once and ran into list_first.
                     Miss::Unknown { near: Some(n) } => format!(
-                        "error unknown_capability: node {name} offers no {asked:?}{}. Call list with node {name:?} and capability {n:?} first: execute refuses it until list has given its details.",
+                        "error unknown_capability: node {name} offers no {asked:?}{}. Call list with node {name:?} and capability [{n:?}] first: execute refuses it until list has given its details.",
                         meant(Some(&n))
                     ),
                     Miss::Unknown { near: None } => format!(
@@ -327,7 +327,7 @@ impl Engine {
         // has. The hash is taken from the copy, outside the state's lock.
         let sess = self.live_session();
         let list = format!(
-            "call list with node {:?} and capability {:?}",
+            "call list with node {:?} and capability [{:?}]",
             route.node_name, unit.name
         );
         let then = "then execute it with args that fit the params list gives.";
@@ -1220,8 +1220,8 @@ mod tests {
         text(&r).to_string()
     }
 
-    const FIRST: &str = "error list_first: call list with node \"box-1\" and capability \"fs.read\" first, then execute it with args that fit the params list gives.";
-    const AGAIN: &str = "error list_first: \"fs.read\" on node box-1 changed since list gave its details: call list with node \"box-1\" and capability \"fs.read\" again, then execute it with args that fit the params list gives.";
+    const FIRST: &str = "error list_first: call list with node \"box-1\" and capability [\"fs.read\"] first, then execute it with args that fit the params list gives.";
+    const AGAIN: &str = "error list_first: \"fs.read\" on node box-1 changed since list gave its details: call list with node \"box-1\" and capability [\"fs.read\"] again, then execute it with args that fit the params list gives.";
     /// Past every check of `execute`: a call, and box-1 is offline.
     const CALLED: &str = "error unavailable: the node box-1 is offline";
 
@@ -1339,12 +1339,12 @@ mod tests {
             (
                 "box-1",
                 "fs.raed",
-                "error unknown_capability: node box-1 offers no \"fs.raed\" (did you mean \"fs.read\"?). Call list with node \"box-1\" and capability \"fs.read\" first: execute refuses it until list has given its details.",
+                "error unknown_capability: node box-1 offers no \"fs.raed\" (did you mean \"fs.read\"?). Call list with node \"box-1\" and capability [\"fs.read\"] first: execute refuses it until list has given its details.",
             ),
             (
                 "box-1",
                 "fs_read",
-                "error unknown_capability: node box-1 offers no \"fs_read\" (did you mean \"fs.read\"?). Call list with node \"box-1\" and capability \"fs.read\" first: execute refuses it until list has given its details.",
+                "error unknown_capability: node box-1 offers no \"fs_read\" (did you mean \"fs.read\"?). Call list with node \"box-1\" and capability [\"fs.read\"] first: execute refuses it until list has given its details.",
             ),
             (
                 "box-1",

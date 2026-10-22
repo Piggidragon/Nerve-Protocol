@@ -131,7 +131,7 @@ what to do:
 
 | Error | When |
 |---|---|
-| `error list_first: call list with node "box-1" and capability "fs.read" first, …` | The model did not ask `list` for the details in this session, or the capability changed since |
+| `error list_first: call list with node "box-1" and capability ["fs.read"] first, …` | The model did not ask `list` for the details in this session, or the capability changed since |
 | `error invalid_args: timeout_ms: expected an integer of 0 or more, or null` | The arguments do not fit the capability's schema; the error names the field and what it expected. An argument put beside `args` instead of in it is refused the same way |
 | `error unknown_capability: node box-1 offers no "fs.raed" (did you mean "fs.read"?). Call list …` | The machine offers no capability of that name. A likely misspelling gets the name it was meant to be and the `list` call to make for it |
 | `error unknown_node: there is no node "box1" (did you mean "box-1"?); the nodes are …` | No paired machine has that name or id |

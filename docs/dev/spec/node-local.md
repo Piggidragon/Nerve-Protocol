@@ -1436,7 +1436,8 @@ The node refuses it, with nothing attached, when:
   program replaced since it started is not);
 - a provider of that name is attached already;
 - the fragment is not 1 to 16 capabilities of 1 to 64 actions each, with
-  names of letters, digits, `-` and `_`; a capability is named twice, takes the
+  names of 1 to 64 letters, digits, `-` and `_` (a center would leave out a
+  longer name); a capability is named twice, takes the
   name or the profile of one of the node's own (`node`, `fs`, `exec`,
   `settings`, `audit`), or is added by another attached provider; or a
   capability declares anything but `id`, `profile`, `summary` and `actions`

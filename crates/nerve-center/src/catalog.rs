@@ -16,7 +16,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use nerve_proto::descriptor::valid_member_name;
+use nerve_proto::descriptor::bad_member_name;
 use nerve_proto::schema::{self, Role};
 use nerve_proto::{Descriptor, Effect};
 
@@ -28,11 +28,9 @@ use crate::util;
 /// sentences, and a node's long text is not copied into every unit.
 pub const DESCRIPTION_MAX: usize = 2048;
 
-/// The longest capability or action name the center offers, in bytes. The
-/// protocol sets no bound, but a unit's name is copied into the unit, every
-/// listing and the session's memory, and a model has to type it: a longer
-/// name leaves out its capability or action.
-pub const NAME_MAX: usize = 64;
+/// The longest capability or action name, in bytes: a node refuses a
+/// longer one, and the center leaves out its capability or action.
+pub use nerve_proto::descriptor::NAME_MAX;
 
 /// One action a node offers, with schemas that passed the subset check.
 #[derive(Debug, Clone, PartialEq)]
@@ -224,18 +222,7 @@ fn described(summary: &str) -> Arc<str> {
 /// name with one could not be split again. The reason never repeats a long
 /// name whole.
 fn bad_name(what: &str, name: &str) -> Option<String> {
-    if name.len() > NAME_MAX {
-        return Some(format!(
-            "{what} name of {} bytes: at most {NAME_MAX}",
-            name.len()
-        ));
-    }
-    if !valid_member_name(name) {
-        return Some(format!(
-            "{what} name {name:?}: letters, digits, - and _ only"
-        ));
-    }
-    None
+    bad_member_name(name).map(|why| format!("{what} {why}"))
 }
 
 /// A name left out as the owner sees it: on one line and cut.

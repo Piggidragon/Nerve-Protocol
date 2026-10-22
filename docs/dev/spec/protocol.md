@@ -583,10 +583,12 @@ over the center's message limit: the call fails with `too_large` instead.
     "events": {}, "state": null, "streams": {}}]}
 ```
 
-- Capability ids and action names use ASCII letters, digits, `-` and `_`,
-  never `.`: the harness side names an action `<cap>.<action>`
-  (`docs/dev/spec/harness.md` §4.1), and a `.` inside a part would make that
-  name ambiguous. Ids are unique within a descriptor. A center leaves out every
+- Capability ids and action names are 1 to 64 bytes of ASCII letters,
+  digits, `-` and `_`, never `.`: the harness side names an action
+  `<cap>.<action>` (`docs/dev/spec/harness.md` §4.1), and a `.` inside a part
+  would make that name ambiguous. Ids are unique within a descriptor. A node
+  refuses a provider that declares another name (node-local.md §7), and
+  `schemas/descriptor.schema.json` says the same. A center leaves out every
   action of a capability whose id is outside that set, is longer than 64
   bytes or is given twice, and an action whose name is outside that set or
   longer than 64 bytes; it keeps the rest of the descriptor.

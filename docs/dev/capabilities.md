@@ -54,9 +54,10 @@ and state included) and `validate` before every call it sends.
   `node/descriptor_changed` and the center asks again.
 - `describe` has three levels of detail: `summary` (no schemas), `capability`
   (one capability in full) and `full`.
-- Capability ids and action names use letters, digits, `-` and `_`, never
-  `.`. The harness side names an action `<cap>.<action>`, and a `.` inside a
-  name would make that name ambiguous. A center leaves out the actions of a
+- Capability ids and action names are 1 to 64 bytes of letters, digits, `-`
+  and `_`, never `.`. The harness side names an action `<cap>.<action>`, and
+  a `.` inside a name would make that name ambiguous. A node refuses a
+  provider with another name. A center leaves out the actions of a
   capability with another character in its id, an id over 64 bytes or an id
   the descriptor gives twice, and an action with another character in its
   name or a name over 64 bytes, and keeps the rest.

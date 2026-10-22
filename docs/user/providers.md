@@ -66,6 +66,14 @@ such an update, check `nerve-node rule ls allow` and `nerve-node cap ls`.
 When the program exits, its capabilities leave what `list` shows the centers,
 and a call that was waiting for it fails with `unavailable`.
 
+## What it may name
+
+Each capability and action has a name of 1 to 64 letters, digits, `-` and
+`_`, such as `lamp` and `set_level`; the agent sees them joined, `lamp.set_level`.
+The node refuses a program that gives another name, or a capability that is
+the node's own (`fs`, `exec`, …) or another provider's already, and the
+program's attach fails with the reason.
+
 ## What its schemas may say
 
 Each action describes its arguments and its result with a JSON Schema. The

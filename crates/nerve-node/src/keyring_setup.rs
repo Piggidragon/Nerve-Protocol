@@ -905,6 +905,8 @@ pub(crate) mod tests {
     #[test]
     fn a_callers_session_does_not_reach_the_keyrings_probe() {
         use std::os::unix::fs::PermissionsExt;
+        // In no real path, user name or id of any host.
+        const POISON: &str = "poisoned-session-4711";
         const NAME: &str =
             "keyring_setup::tests::a_callers_session_does_not_reach_the_keyrings_probe";
         let d = tempfile::tempdir().unwrap();
@@ -929,10 +931,13 @@ pub(crate) mod tests {
             .env(crate::owner::OWNER_ENV, "alice")
             .env_remove("SUDO_UID")
             // ... with the session of someone else in its environment.
-            .env("XDG_RUNTIME_DIR", "/run/user/4711")
-            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/4711/bus")
-            .env("XDG_CONFIG_HOME", "/home/runner/.config")
-            .env("XDG_DATA_HOME", "/home/runner/.local/share")
+            .env("XDG_RUNTIME_DIR", format!("/run/user/{POISON}"))
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path=/run/user/{POISON}/bus"),
+            )
+            .env("XDG_CONFIG_HOME", format!("/home/{POISON}/.config"))
+            .env("XDG_DATA_HOME", format!("/home/{POISON}/.local/share"))
             .env("DISPLAY", ":7")
             .env("LEAKED_SENTINEL", "1")
             .stdin(std::process::Stdio::null());
@@ -959,14 +964,10 @@ pub(crate) mod tests {
             .collect();
         want.sort();
         assert_eq!(got, want, "{text}");
-        if cfg!(target_os = "linux") {
-            assert!(
-                text.contains(&format!("XDG_RUNTIME_DIR=/run/user/{}\n", who.uid)),
-                "{text}"
-            );
-        }
-        assert!(!text.contains("4711"), "{text}");
-        assert!(!text.contains("/home/runner"), "{text}");
+        // Said of the variables the probe got, not of the text: the
+        // probe's `env` also prints the folder the test runs in, which may
+        // be anything (a runner's `/home/runner/work/...`).
+        assert!(got.iter().all(|l| !l.contains(POISON)), "{text}");
     }
 
     /// The service manager of a session that began with another user's

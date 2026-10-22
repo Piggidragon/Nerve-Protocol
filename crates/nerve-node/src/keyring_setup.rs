@@ -579,35 +579,85 @@ pub fn wrong_session_vars(environment: &str, who: &Account) -> Vec<String> {
         .collect()
 }
 
-/// Puts the variables of the session of `who` right in its service manager
-/// ([`wrong_session_vars`]) and starts its session bus and keyring again,
-/// which began with the wrong ones. `Ok(true)` when it had to.
+/// The per-user folders the XDG specification names, which a program
+/// looks in before it looks in its home.
+const XDG_USER_DIRS: [&str; 4] = [
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+];
+
+/// The variables of [`XDG_USER_DIRS`] that the `show-environment` text
+/// `environment` sets to a folder outside the home of `who` (the same
+/// system-wide environment as in [`wrong_session_vars`] can name another
+/// user's `~/.config`): to unset, so that the defaults in the home of `who`
+/// apply.
+pub fn foreign_user_dirs(environment: &str, who: &Account) -> Vec<&'static str> {
+    XDG_USER_DIRS
+        .into_iter()
+        .filter(|k| {
+            environment.lines().any(|l| {
+                l.strip_prefix(k)
+                    .and_then(|r| r.strip_prefix('='))
+                    .is_some_and(|v| !v.is_empty() && !Path::new(v).starts_with(&who.home))
+            })
+        })
+        .collect()
+}
+
+/// The units of a session that start with its environment and are started
+/// again when it changes, those of them that `exists`: the session bus and
+/// GNOME Keyring, which has one name in version 40 (Ubuntu 22.04) and
+/// another since 41.
+fn units_to_restart(exists: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    [
+        "dbus.service",
+        "gnome-keyring-daemon.service",
+        "gnome-keyring.service",
+    ]
+    .into_iter()
+    .filter(|u| exists(u))
+    .collect()
+}
+
+/// Puts the environment of the session of `who` right in its service
+/// manager ([`wrong_session_vars`], [`foreign_user_dirs`]) and starts its
+/// session bus and keyring again, which began with the wrong one.
+/// `Ok(true)` when it had to.
 fn repair_session(who: &Account) -> Result<bool, String> {
     let Ok(environment) = user_systemctl(who, &["show-environment"]) else {
         return Ok(false);
     };
     let wrong = wrong_session_vars(&environment, who);
-    if wrong.is_empty() {
+    let foreign = foreign_user_dirs(&environment, who);
+    if wrong.is_empty() && foreign.is_empty() {
         return Ok(false);
     }
     let fail = |what: &str, e: Option<String>| {
         format!("{what} for {} failed: {}", who.name, e.unwrap_or_default())
     };
-    let mut set = vec!["set-environment"];
-    set.extend(wrong.iter().map(String::as_str));
-    user_systemctl(who, &set).map_err(|e| fail("systemctl --user set-environment", e))?;
+    if !wrong.is_empty() {
+        let mut set = vec!["set-environment"];
+        set.extend(wrong.iter().map(String::as_str));
+        user_systemctl(who, &set).map_err(|e| fail("systemctl --user set-environment", e))?;
+    }
+    if !foreign.is_empty() {
+        let mut unset = vec!["unset-environment"];
+        unset.extend(foreign);
+        user_systemctl(who, &unset).map_err(|e| fail("systemctl --user unset-environment", e))?;
+    }
     // The bus starts at the first program that asks, and the keyring at the
     // bus's: they may be up already. try-restart leaves a unit that does
-    // not run alone.
-    user_systemctl(
-        who,
-        &[
-            "try-restart",
-            "dbus.service",
-            "gnome-keyring-daemon.service",
-        ],
-    )
-    .map_err(|e| fail("systemctl --user try-restart", e))?;
+    // not run alone; one that does not exist is not asked for.
+    let mut restart = vec!["try-restart"];
+    restart.extend(units_to_restart(|u| {
+        user_systemctl(who, &["show", "--property=LoadState", "--value", u])
+            .is_ok_and(|s| s.trim() == "loaded")
+    }));
+    if restart.len() > 1 {
+        user_systemctl(who, &restart).map_err(|e| fail("systemctl --user try-restart", e))?;
+    }
     Ok(true)
 }
 
@@ -881,6 +931,8 @@ pub(crate) mod tests {
             // ... with the session of someone else in its environment.
             .env("XDG_RUNTIME_DIR", "/run/user/4711")
             .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/4711/bus")
+            .env("XDG_CONFIG_HOME", "/home/runner/.config")
+            .env("XDG_DATA_HOME", "/home/runner/.local/share")
             .env("DISPLAY", ":7")
             .env("LEAKED_SENTINEL", "1")
             .stdin(std::process::Stdio::null());
@@ -914,6 +966,7 @@ pub(crate) mod tests {
             );
         }
         assert!(!text.contains("4711"), "{text}");
+        assert!(!text.contains("/home/runner"), "{text}");
     }
 
     /// The service manager of a session that began with another user's
@@ -948,6 +1001,40 @@ pub(crate) mod tests {
         );
         // None of them is set: nothing to correct.
         assert!(wrong_session_vars("PATH=/usr/bin\n", &who).is_empty());
+    }
+
+    /// Another user's `~/.config` in the session manager's environment (a
+    /// runner image's `/etc/environment`) is unset; the user's own folders
+    /// and the unset ones are left.
+    #[test]
+    fn a_session_manager_with_anothers_config_folder_is_unset() {
+        let who = Account {
+            uid: 999,
+            ..nerve(Path::new("/var/lib/nerve"))
+        };
+        let env = "PATH=/usr/bin\nXDG_CONFIG_HOME=/home/runner/.config\nXDG_DATA_HOME=/var/lib/nerve/.local/share\nXDG_CACHE_HOME=\nXDG_STATE_HOME=/home/runner/.local/state\nXDG_DATA_DIRS=/usr/share\n";
+        assert_eq!(
+            foreign_user_dirs(env, &who),
+            ["XDG_CONFIG_HOME", "XDG_STATE_HOME"]
+        );
+        assert!(foreign_user_dirs("XDG_DATA_HOME=/var/lib/nerve/.local/share\n", &who).is_empty());
+        // A folder that only starts like the home is another's.
+        assert_eq!(
+            foreign_user_dirs("XDG_CONFIG_HOME=/var/lib/nerve-run/.config\n", &who),
+            ["XDG_CONFIG_HOME"]
+        );
+        assert!(foreign_user_dirs("PATH=/usr/bin\n", &who).is_empty());
+    }
+
+    /// GNOME Keyring 40 (Ubuntu 22.04) has `gnome-keyring.service` and no
+    /// `gnome-keyring-daemon.service`: only what exists is restarted.
+    #[test]
+    fn only_the_units_that_exist_are_restarted() {
+        let old = units_to_restart(|u| u != "gnome-keyring-daemon.service");
+        assert_eq!(old, ["dbus.service", "gnome-keyring.service"]);
+        let new = units_to_restart(|u| u != "gnome-keyring.service");
+        assert_eq!(new, ["dbus.service", "gnome-keyring-daemon.service"]);
+        assert!(units_to_restart(|_| false).is_empty());
     }
 
     #[test]

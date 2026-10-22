@@ -62,6 +62,9 @@ sees only `nodes`.
   marked as disabled.
 - A paired machine that is offline keeps its tools. A call to it fails with
   `unavailable`.
+- An action whose name or argument schema the center cannot handle is not a
+  tool, even with an allow rule. The center's web UI lists it with the reason
+  on the Overview, under **Not offered to the agent** ([web UI](web-ui.md#overview)).
 
 ## What a result looks like
 
@@ -82,6 +85,13 @@ error forbidden: no allow rule matches /etc/hostname
 
 The message says what is missing. The model can pass it on, and you add the
 rule on the machine ([rules](rules.md)).
+
+Arguments that do not fit the tool's schema are refused by the center before
+the machine gets them, with the field and what it expected:
+
+```
+error invalid_args: timeout_ms: expected an integer of 0 or more, or null
+```
 
 The center's [action checker](action-checker.md) can refuse a call before the
 machine gets it. That refusal is `forbidden` too, and says so:

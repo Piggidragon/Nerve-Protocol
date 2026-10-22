@@ -633,8 +633,8 @@ in the subset when:
   levels deep, a result, event data or state at most 4: the root is level 1,
   and a property's or an array's items schema is one level below its
   parent's.
-- One object names at most 32 properties, and the schema takes at most
-  16 KiB as compact JSON.
+- One object names at most 32 properties, one `enum` lists at most 256
+  values, and the schema takes at most 16 KiB as compact JSON.
 
 Everything else is refused, among it `$ref` and `$defs`, `oneOf`, `anyOf`,
 `allOf` and `not`, `if`, `then` and `else`, `patternProperties`, `pattern`
@@ -653,8 +653,10 @@ Arguments fit a schema when their value has its type, takes a value of
 `enum` or the `const`, keeps to its bounds, has every `required` field, and,
 with `additionalProperties: false`, no field `properties` does not name; the
 same holds for each field and item. An `integer` is a number without a
-fraction or an exponent, so `5.0` is not one. `default` is a hint for the
-caller; neither end fills it in. An argument that may be left out and whose
+fraction or an exponent, so `5.0` is not one. `enum` and `const` compare
+numbers by value, as JSON Schema does: `1.0` is one of `[0.5, 1, 2]` (but
+still not an `integer`). `default` is a hint for the caller; neither end
+fills it in. An argument that may be left out and whose
 `null` the node reads as left out says so with `null` in its type
 (`["integer", "null"]`), as the node's own do. Arguments that do not fit are refused with
 `invalid_args` whose `data` holds `field`, the dotted path to what does not

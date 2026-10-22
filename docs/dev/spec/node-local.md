@@ -524,10 +524,11 @@ cut to it, and so is the default when the maximum is lower. Both are at least
 and are left out of the file while they are the defaults. They are read when a
 call starts: a running command keeps its limit. The `timeout` error names the
 limit that ended the command, and the descriptor states both numbers in
-`exec.run`'s text and as `maximum` and `default` (milliseconds) of its
+`exec.run`'s text and in the `default` and `description` (milliseconds) of its
 `timeout_ms` parameter, so a change of either changes the descriptor's rev, and
 nodes with other limits have other params (a center merges the tools of nodes
-with equal params).
+with equal params). The parameter has no `maximum`: a larger value is cut to
+the most, not refused, so a center that checks the arguments lets it through.
 A command is killed with its process group when its call ends: on
 `timeout_ms`, `cancel`, `session.end` of the session that started it, a
 link that ended without being resumed (protocol §4.9), and when the call

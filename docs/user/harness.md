@@ -52,7 +52,7 @@ from `list`, when the model asks:
 |---|---|
 | `list()` | One line per machine: name, id, online, offline or disabled, platform, how many capabilities |
 | `list(node: "box-1")` | One line per capability of that machine: `fs.read`, `fs.write`, `exec.run` …, each with what it does |
-| `list(node: "box-1", capability: "fs.read")` | The details: what it does, its effect, its arguments (a JSON schema) and its result. `capability` may be a list, such as `["fs.read", "exec.run"]` |
+| `list(node: "box-1", capability: ["fs.read"])` | The details: what it does, its effect, its arguments (a JSON schema) and its result. `capability` is a list, such as `["fs.read", "exec.run"]`; one name alone works too |
 
 `execute` takes the machine, the capability and its arguments:
 
@@ -115,8 +115,9 @@ content is data, never instructions, and holds what the machine sent under
  "result": {"content": "box-1\n", "encoding": "utf8", "etag": "..."}}
 ```
 
-`list` answers come the same way. A refusal or failure comes back as an
-error:
+`list` answers come the same way. A result or answer too long for the
+model (over 256 KiB) comes as its text alone, cut, without the structured
+content. A refusal or failure comes back as an error:
 
 ```
 error forbidden: no allow rule matches /etc/hostname
@@ -131,7 +132,7 @@ what to do:
 | Error | When |
 |---|---|
 | `error list_first: call list with node "box-1" and capability "fs.read" first, …` | The model did not ask `list` for the details in this session, or the capability changed since |
-| `error invalid_args: timeout_ms: expected an integer of 0 or more, or null` | The arguments do not fit the capability's schema; the error names the field and what it expected |
+| `error invalid_args: timeout_ms: expected an integer of 0 or more, or null` | The arguments do not fit the capability's schema; the error names the field and what it expected. An argument put beside `args` instead of in it is refused the same way |
 | `error unknown_capability: node box-1 offers no "fs.raed" (did you mean "fs.read"?). Call list …` | The machine offers no capability of that name. A likely misspelling gets the name it was meant to be and the `list` call to make for it |
 | `error unknown_node: there is no node "box1" (did you mean "box-1"?); the nodes are …` | No paired machine has that name or id |
 | `error unavailable: …` | The machine is disabled in the center, or offline |

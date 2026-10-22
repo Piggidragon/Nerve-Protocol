@@ -1210,6 +1210,17 @@ impl Daemon {
                 then,
             ));
         }
+        // Keys in the keyring of the node's own session: the system-wide
+        // environment of the login can have given that session another
+        // user's folders again since `setup` put it right (a reboot).
+        #[cfg(target_os = "linux")]
+        if crate::secrets::stated_storage(&paths) == SecretStorage::Keyring {
+            match tokio::task::spawn_blocking(crate::keyring_setup::repair_for_start).await {
+                Ok(Ok(true)) => tracing::info!("set the session of the keyring right again"),
+                Ok(Err(e)) => tracing::warn!("the session of the keyring: {e}"),
+                _ => {}
+            }
+        }
         let keys = match crate::secrets::KeysLock::try_take(&paths)? {
             Some(l) => l,
             None => {

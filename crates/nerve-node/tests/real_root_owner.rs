@@ -33,6 +33,13 @@ const UNIT: &str = "/etc/systemd/system/nerve-node.service";
 /// `SUDO_USER`: as root runs it itself.
 fn typing(cmd: &mut Command, input: &str) -> (bool, String) {
     use std::io::Write;
+    // The test installs again and again within seconds, faster than
+    // systemd's start limit (5 in 10 s) lets a unit start; a person who
+    // installs does not.
+    let _ = Command::new("systemctl")
+        .args(["reset-failed", "nerve-node.service"])
+        .stderr(Stdio::null())
+        .status();
     let mut child = cmd
         .env_remove("SUDO_USER")
         .env_remove("PKEXEC_UID")
@@ -129,14 +136,19 @@ fn out(v: &Value) -> String {
     )
 }
 
-/// The node's next link to `center`, once the handshake is through.
+/// The running node's link to `center`, once the handshake is through.
+/// Each node an install started and stopped meanwhile dialled too: its link
+/// waits in the queue, closed, and is passed over.
 async fn linked(center: &mut FakeCenter) -> Conn<TcpStream> {
     let paired = center.paired().expect("paired");
-    let mut inc = center.next_link(WAIT).await.expect("the node dials");
-    fake_center::handshake(&mut inc.conn, &center.center_id, &paired)
-        .await
-        .expect("handshake");
-    inc.conn
+    for _ in 0..20 {
+        let mut inc = center.next_link(WAIT).await.expect("the node dials");
+        match fake_center::handshake(&mut inc.conn, &center.center_id, &paired).await {
+            Ok(_) => return inc.conn,
+            Err(e) => eprintln!("passed over a link of a node that stopped: {e:?}"),
+        }
+    }
+    panic!("no link of the running node");
 }
 
 #[tokio::test(flavor = "multi_thread")]

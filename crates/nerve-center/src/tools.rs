@@ -543,10 +543,10 @@ mod tests {
         assert_eq!(names(&t), ["build_exec_run", "lab_exec_run"]);
         assert!(t[0].description.contains("never runs longer than 1 h"));
         assert!(t[1].description.contains("never runs longer than 24 h"));
-        assert_eq!(
-            t[1].input_schema["properties"]["timeout_ms"]["maximum"],
-            86_400_000
-        );
+        let timeout = t[1].input_schema["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(timeout.contains("at most 86400000"), "{timeout}");
         // Equal limits stay one tool.
         assert_eq!(names(&exec(&build_node, &same)), ["exec_run"]);
     }

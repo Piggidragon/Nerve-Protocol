@@ -1487,15 +1487,18 @@ impl Link {
         }
         // A provider's action (crate::provider) is decided and audited here
         // like any other, with `cap.action` as its rule target; only an
-        // allowed call reaches the provider.
+        // allowed call reaches the provider. Its arguments are checked first
+        // against the schema it published, so it never sees ones that do
+        // not fit, and the center learns which field is wrong.
         if cap.provider != "node" {
             let provider = cap.provider.clone();
+            nerve_proto::schema::validate(&action.params, &Value::Object(inv.args.clone()))?;
             let target = format!("{}.{}", inv.cap, inv.action);
             self.gate(&entry, &inv, effect, &[], None, None, target, None, None)?;
             return self
                 .shared
                 .providers
-                .invoke(&provider, &inv.cap, &inv.action, inv.args.clone())
+                .invoke(&provider, &inv.cap, &inv.action, inv.args)
                 .await;
         }
         match (inv.cap.as_str(), inv.action.as_str()) {
@@ -1797,8 +1800,7 @@ impl Link {
         let s: SignalArgs = params(args)?;
         let sig = Sig::parse(&s.signal)
             .ok_or_else(|| RpcError::invalid_args("signal must be term, kill or int"))?;
-        let id: Id = serde_json::from_value(s.call)
-            .map_err(|_| RpcError::invalid_args("call must be a request id"))?;
+        let id = Id::Num(s.call);
         let ender = lock(&self.commands)
             .get(&id)
             .cloned()

@@ -94,6 +94,17 @@ impl fmt::Display for ArgError {
 
 impl std::error::Error for ArgError {}
 
+/// The `invalid_args` error of arguments that do not fit, with the field and
+/// what was expected there in its `data`, so a caller can tell them apart
+/// from the text.
+impl From<ArgError> for crate::RpcError {
+    fn from(e: ArgError) -> crate::RpcError {
+        crate::RpcError::invalid_args(e.to_string())
+            .with("field", Value::String(e.field))
+            .with("expected", Value::String(e.expected))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ty {
     Null,
@@ -1289,5 +1300,20 @@ mod tests {
             reason: "the schema is over 16 KiB".into(),
         };
         assert_eq!(e.to_string(), "the schema is over 16 KiB");
+    }
+
+    #[test]
+    fn an_arg_error_is_invalid_args_with_field_and_expected() {
+        let e = crate::RpcError::from(ArgError {
+            field: "count".into(),
+            expected: "an integer from 1 to 600".into(),
+        });
+        assert_eq!(e.kind(), crate::ErrorCode::InvalidArgs);
+        assert_eq!(e.message, "count: expected an integer from 1 to 600");
+        assert_eq!(
+            e.data,
+            Some(json!({"code": "invalid_args", "field": "count",
+                        "expected": "an integer from 1 to 600"}))
+        );
     }
 }

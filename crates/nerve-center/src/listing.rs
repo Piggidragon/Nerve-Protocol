@@ -261,8 +261,8 @@ pub fn near<'a>(given: &str, names: impl IntoIterator<Item = &'a str>) -> Option
 /// The edit distance of `a` and `b`, with two swapped neighbours as one
 /// edit (optimal string alignment), or `most + 1` for anything over `most`.
 /// Only the cells within `most` of the diagonal are worked out, since the
-/// others are over it anyway: a node may offer many units, and this runs
-/// for each of them.
+/// others are over it anyway, and the work stops at a row that is all over
+/// it: a node may offer many units, and this runs for each of them.
 fn distance(a: &[char], b: &[char], most: usize) -> usize {
     let over = most + 1;
     let mut before: Vec<usize> = Vec::new();
@@ -270,6 +270,7 @@ fn distance(a: &[char], b: &[char], most: usize) -> usize {
     for i in 1..=a.len() {
         let mut row = vec![over; b.len() + 1];
         row[0] = i.min(over);
+        let mut low = row[0];
         for j in i.saturating_sub(most).max(1)..=(i + most).min(b.len()) {
             let cost = usize::from(a[i - 1] != b[j - 1]);
             let mut d = (last[j] + 1).min(row[j - 1] + 1).min(last[j - 1] + cost);
@@ -277,6 +278,13 @@ fn distance(a: &[char], b: &[char], most: usize) -> usize {
                 d = d.min(before[j - 2] + 1);
             }
             row[j] = d.min(over);
+            low = low.min(row[j]);
+        }
+        // Every cell of the next row comes from one of this row's by an
+        // edit, or by a swap from a cell two rows up that is one edit from
+        // one of this row's: none can be in reach again.
+        if low > most {
+            return over;
         }
         before = std::mem::replace(&mut last, row);
     }

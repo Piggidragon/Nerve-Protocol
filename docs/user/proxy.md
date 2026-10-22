@@ -85,11 +85,12 @@ nerve-node proxy set http://proxy.example:3128
 refused there and changes nothing. If the proxy needs a login, the installed
 node on Windows cannot use it.
 
-A header set before the node was installed (or by an older version) is not read
-by the service: the link stays down. `proxy ls` says so under the header's
-name, with the reason. `nerve-node status` cannot show it: the
+A header set before the node was installed is not read by the service: the link
+stays down. `proxy ls` says so under the header's name, with the reason.
+`nerve-node status` cannot show it: the
 [control pipe](platforms.md#the-control-pipe) on Windows takes folder changes
-only, and `status` does not ask the node there, so it shows no link status. The service's
+only, and `status` does not ask the node there, so it shows no link status.
+The service's
 [log](logs.md) has the reason as an `error` line with `bad proxy:`, in
 `C:\ProgramData\Nerve\state\log.jsonl`. Set the proxy again without the header,
 or remove it with `proxy rm`; either deletes the old entry from the Credential

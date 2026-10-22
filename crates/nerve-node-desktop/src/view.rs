@@ -394,14 +394,15 @@ pub fn rights(read: bool, write: bool, execute: bool) -> String {
     r
 }
 
-/// One list of `rule ls --json`.
+/// One list of `rule ls --json`, each rule as `rule ls` prints it: a tab or
+/// line break of a rule written `\t`, `\n`, so a row stays one line.
 pub fn rule_list_of(v: &Value, list: &str) -> Vec<SharedString> {
     v[list]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(SharedString::from)
+        .map(|r| SharedString::from(nerve_policy::rules::escape_controls(r)))
         .collect()
 }
 
@@ -1329,6 +1330,18 @@ pub fn rule_args(e: &Value, list: &str, wildcard: bool) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A rule with a line break is one row, written as `rule ls` prints it.
+    #[test]
+    fn a_rule_with_a_line_break_is_one_row() {
+        let v = json!({"deny": ["exec.run:a\n*", "exec.run:b\tc\r\n", "exec.run:C:\\new"]});
+        let rows = rule_list_of(&v, "deny");
+        let rows: Vec<&str> = rows.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            rows,
+            ["exec.run:a\\n*", "exec.run:b\\tc\\r\\n", "exec.run:C:\\new"]
+        );
+    }
+
     /// The relay's link in the app's words: where the other node pastes
     /// it, and the link itself to copy; no line sends the owner of this
     /// machine to a terminal.

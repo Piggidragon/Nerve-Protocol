@@ -117,8 +117,17 @@ impl Store {
     }
 
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
-        let text = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        nerve_transport::files::write_private(&dir.join(FILE), &text)
+        Store::write_file(dir, &self.file_bytes()?)
+    }
+
+    /// The text of the state file, without writing it.
+    pub fn file_bytes(&self) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec_pretty(self).map_err(std::io::Error::other)
+    }
+
+    /// Writes `text` from [`Store::file_bytes`] as the state file.
+    pub fn write_file(dir: &Path, text: &[u8]) -> std::io::Result<()> {
+        nerve_transport::files::write_private(&dir.join(FILE), text)
     }
 
     pub fn node_by_name(&self, name: &str) -> Option<&NodeRecord> {

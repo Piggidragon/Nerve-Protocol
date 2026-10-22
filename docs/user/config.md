@@ -183,12 +183,11 @@ older copies are refused in turn.
 
 `config.version` is a number, in the state folder beside `config.key`, so it
 holds as far as the key does: a `user` mode command can delete it, a `folder`
-mode command cannot reach it. A node that has none (one from before the
-node kept it, or a state folder made new) takes `node.toml` as it is and
-records its version. If the file is damaged, the node does not start and says
-so: delete it, or take `node.toml` with `config accept`. Take care of the two
-folders together when you back them up and restore them: a config folder
-older than its state folder is refused.
+mode command cannot reach it. A node that has none (a state folder made new)
+takes `node.toml` as it is and records its version. If the file is damaged, the
+node does not start and says so: delete it, or take `node.toml` with
+`config accept`. Take care of the two folders together when you back them up and
+restore them: a config folder older than its state folder is refused.
 
 ## Where the node keeps its keys
 
@@ -274,6 +273,7 @@ the settings say `keyring` and no keyring answers, setup asks:
 ```
 No system keyring answers for nerve: ….
 nerve-node can install GNOME Keyring: `/usr/bin/apt-get update`, `/usr/bin/apt-get install -y --no-install-recommends gnome-keyring dbus-user-session`, `/usr/bin/loginctl enable-linger nerve`, so that nerve keeps a session after a reboot, and a login keyring for nerve that opens without a password.
+Where this machine's /etc/environment names another user's runtime folder or XDG folders (as a CI runner's does), keyring and bus of nerve would start in those; then nerve-node also writes /etc/systemd/user-environment-generators/99-nerve-session, which gives nerve's session its own at every start.
 Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in /var/lib/nerve/.local/share/keyrings, readable by nerve as the key files are; the node keeps centers out of it as it does out of the key files, except a command you let a center run outside folder mode that asks the keyring itself (secret-tool and the like). It becomes the default keyring of nerve: any other program of nerve that keeps a secret in the system keyring keeps it there, unencrypted too.
 Install it now? [y/N]
 ```
@@ -283,7 +283,13 @@ keeps refusing, when the settings say `keyring`). `y` installs GNOME Keyring
 and what it needs (nothing it only recommends) with the system's package
 manager (apt, dnf or pacman), keeps a session for the node's user from boot
 on, makes a login keyring for it without a password, and checks that it
-answers. These steps run as root: the programs from the system's own
+answers. If this machine's `/etc/environment` names another user's runtime
+folder, bus or XDG folders (a CI runner's does), the session of the node's user
+would start GNOME Keyring in those: for the installed node's user `nerve`, setup sets them right and writes
+`/etc/systemd/user-environment-generators/99-nerve-session`, which keeps them
+right at every start of that session (`uninstall` removes it), and the installed node
+sets them right again when it starts. A node you run yourself, as your own user,
+leaves your session and your XDG folders alone. These steps run as root: the programs from the system's own
 folders, by their full path, with a fixed environment, in `/`, and without
 your input. `install` asks the same when an earlier install's settings say
 `keyring` and it runs in a terminal.

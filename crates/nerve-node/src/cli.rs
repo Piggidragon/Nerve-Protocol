@@ -1188,8 +1188,7 @@ impl List {
     /// The rule a command line stands for. The allow and deny lists hold
     /// `exec.run` rules; the sudo list holds the sudo command lines, and takes
     /// the command with or without the `sudo` in front. `rule rm` uses it
-    /// as it is, so the rules an older `rule add` made from the pattern form
-    /// can be removed with the arguments that made them.
+    /// as it is, so a rule is removed with the arguments that made it.
     fn command_rule(self, command: &str, wildcard: bool) -> Result<String, String> {
         match self {
             List::Allow if sudo_command(command).is_some() => {
@@ -1201,6 +1200,21 @@ impl List {
             }
             List::Sudo => rules::sudo_rule_for(&format!("sudo {}", command.trim()), wildcard),
         }
+    }
+}
+
+/// The entry of `list` that `text` names: `text` itself, or the entry that
+/// `rule ls` prints as `text` (its tab, carriage return and line feed written
+/// `\t`, `\r`, `\n`). Else `text`.
+fn shown_entry(list: &[String], text: &str) -> String {
+    if list.iter().any(|r| r == text) {
+        return text.to_string();
+    }
+    let raw = rules::unescape_controls(text);
+    if raw != text && list.contains(&raw) {
+        raw
+    } else {
+        text.to_string()
     }
 }
 
@@ -1238,8 +1252,10 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                 let name = e.name.clone();
                 let l = list.of(&mut e.policy);
                 // An entry copied from `ls` goes as it is, so rules for
-                // files and other actions can be removed too. The arguments
-                // of `add` stand for the command rule they made.
+                // files and other actions can be removed too (also one with
+                // a line break, which `ls` writes `\n`). The arguments of
+                // `add` stand for the command rule they made.
+                let command = shown_entry(l, &command);
                 let made = match &action {
                     Some(a) => list.action_rule(a, &command, wildcard),
                     None => list.command_rule(&command, wildcard),
@@ -1274,9 +1290,17 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             new,
             center,
         } => {
-            let rule = list.edited(&new)?;
+            let done = std::sync::Mutex::new((String::new(), String::new()));
             let name = edit_center(paths, &center, |e| {
                 let l = list.of(&mut e.policy);
+                // The entry as `ls` prints it, with its line breaks written
+                // `\n`: the new entry is written so too.
+                let (entry, new) = match shown_entry(l, &entry) {
+                    shown if shown == entry => (entry.clone(), new.clone()),
+                    shown => (shown, rules::unescape_controls(&new)),
+                };
+                let rule = list.edited(&new)?;
+                rules::check_not_a_listed_form(&rule, l)?;
                 let Some(at) = l.iter().position(|r| *r == entry) else {
                     return Err(format!("{entry:?} is not on the {}", list.label()));
                 };
@@ -1291,9 +1315,11 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                     i += 1;
                     i - 1 == at || *r != rule
                 });
+                *done.lock().unwrap() = (entry, rule);
                 Ok(())
             })
             .await?;
+            let (entry, rule) = done.into_inner().unwrap();
             let _ = writeln!(
                 out,
                 "{name}: the {} {entry:?} is {rule:?} now",
@@ -1301,26 +1327,38 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             );
         }
         RuleCmd::Guard { center } => {
-            let added = std::sync::Mutex::new(0usize);
+            let added = std::sync::Mutex::new((0usize, 0usize));
             let name = edit_center(paths, &center, |e| {
-                let missing = nerve_policy::rules::guard_missing(&e.policy.deny);
+                // The guard's older texts go: the new ones replace them.
+                let mut deny: Vec<String> = e
+                    .policy
+                    .deny
+                    .iter()
+                    .filter(|r| !nerve_policy::rules::GUARD_OLD.contains(&r.as_str()))
+                    .cloned()
+                    .collect();
+                let replaced = e.policy.deny.len() - deny.len();
+                let missing = nerve_policy::rules::guard_missing(&deny);
                 if missing.is_empty() {
                     return Err(format!(
                         "{} has every deny rule of the guard already",
                         e.name
                     ));
                 }
-                *added.lock().unwrap() = missing.len();
-                e.policy
-                    .deny
-                    .extend(missing.into_iter().map(str::to_string));
+                *added.lock().unwrap() = (missing.len(), replaced);
+                deny.extend(missing.into_iter().map(str::to_string));
+                e.policy.deny = deny;
                 Ok(())
             })
             .await?;
-            let added = added.into_inner().unwrap();
+            let (added, replaced) = added.into_inner().unwrap();
+            let replaced = match replaced {
+                0 => String::new(),
+                n => format!(" ({n} of an older text replaced)"),
+            };
             let _ = writeln!(
                 out,
-                "{name}: added {added} deny rules of the guard; commands that name this node's programs, service, socket or folders are forbidden"
+                "{name}: added {added} deny rules of the guard{replaced}; commands that name this node's programs, service, socket or folders are forbidden"
             );
         }
         RuleCmd::Ls { list, center } => {
@@ -1333,7 +1371,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                     let _ = writeln!(out, "{name}: nothing on the {}", list.label());
                 }
                 for r in entries.iter() {
-                    let _ = writeln!(out, "{r}");
+                    let _ = writeln!(out, "{}", rules::escape_controls(r));
                 }
             } else {
                 // All three: each line says which list it is on.
@@ -1341,7 +1379,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                 for list in [List::Allow, List::Deny, List::Sudo] {
                     for r in list.of(&mut policy).iter() {
                         any = true;
-                        let _ = writeln!(out, "{}  {r}", list.word());
+                        let _ = writeln!(out, "{}  {}", list.word(), rules::escape_controls(r));
                     }
                 }
                 if !any {
@@ -3601,6 +3639,19 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
                 let toml::Value::Array(a) = list else {
                     return Err(format!("{key} is not a list"));
                 };
+                // The text `rule ls` prints for a tab or line break is not
+                // one: the rule would look like the listed one and not be.
+                // Any other text is a rule as it stands (`C:\tools` too).
+                if ["allow", "deny", "sudo_allow"]
+                    .iter()
+                    .any(|l| key.starts_with("center.") && key.ends_with(&format!(".policy.{l}")))
+                {
+                    let listed: Vec<String> = a
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                    rules::check_not_a_listed_form(value, &listed)?;
+                }
                 a.push(literal(value));
             }
             ConfigCmd::Remove { key, value } => {
@@ -6736,15 +6787,6 @@ mod tests {
         // A colon in a command that is not a scope stays a command.
         run(&paths, &["rule", "add", "allow", "C:\\tools\\x.exe"]).unwrap();
         run(&paths, &["rule", "rm", "allow", "C:\\tools\\x.exe"]).unwrap();
-        // The rule an older `rule add` made of the pattern form goes with the
-        // arguments that made it.
-        let broken = "exec.run:exec.run:echo [*]";
-        run(
-            &paths,
-            &["config", "add", "center.home.policy.allow", broken],
-        )
-        .unwrap();
-        run(&paths, &["rule", "rm", "allow", "exec.run:echo *"]).unwrap();
         assert_eq!(
             load(&paths).centers[0].policy.allow,
             ["exec.run:git status"]
@@ -8384,6 +8426,132 @@ mod tests {
         }
         assert_eq!(policy(), now);
         assert_eq!(changes(), n);
+    }
+
+    /// A rule of the guard holds a line break; `rule ls` writes it `\n` so
+    /// a listing keeps a line a rule, and `rule rm` and `rule edit` take the
+    /// entry as `ls` printed it.
+    #[test]
+    fn rule_ls_writes_line_breaks_out_and_rm_and_edit_take_them_back() {
+        let (_d, paths) = setup(&["home"]);
+        let deny = || load(&paths).centers[0].policy.deny.clone();
+        let guard = nerve_policy::rules::GUARD;
+        assert!(guard.iter().any(|g| g.contains('\n')));
+        run(&paths, &["rule", "guard"]).unwrap();
+        let ls = run(&paths, &["rule", "ls", "deny"]).unwrap();
+        assert_eq!(ls.lines().count(), deny().len(), "{ls}");
+        for (line, rule) in ls.lines().zip(deny()) {
+            assert_eq!(line, nerve_policy::rules::escape_controls(&rule));
+            assert!(!line.contains(['\t', '\r']), "{line:?}");
+        }
+        assert!(ls.contains("\\r\\n"), "{ls}");
+        let all = run(&paths, &["rule", "ls"]).unwrap();
+        assert_eq!(all.lines().count(), deny().len(), "{all}");
+        assert!(all.lines().all(|l| l.starts_with("deny  ")), "{all}");
+        // The entry as `ls` printed it is removed; the raw one too.
+        let shown = nerve_policy::rules::escape_controls(guard[9]);
+        assert_ne!(shown, guard[9]);
+        let out = run(&paths, &["rule", "rm", "deny", &shown]).unwrap();
+        assert!(out.contains("removed"), "{out}");
+        assert!(!deny().iter().any(|r| r == guard[9]));
+        run(&paths, &["rule", "rm", "deny", guard[10]]).unwrap();
+        assert!(!deny().iter().any(|r| r == guard[10]));
+        // Edit: the entry and the new one both as `ls` prints them.
+        let shown = nerve_policy::rules::escape_controls(guard[11]);
+        let new = "exec.run:systemctl stop nerve-node\\n*";
+        let out = run(&paths, &["rule", "edit", "deny", &shown, new]).unwrap();
+        assert!(out.contains("now"), "{out}");
+        assert!(!deny().iter().any(|r| r == guard[11]));
+        assert!(
+            deny()
+                .iter()
+                .any(|r| r == "exec.run:systemctl stop nerve-node\n*"),
+            "{:?}",
+            deny()
+        );
+        // A Windows path rule has backslashes before t, r and n: a rule as
+        // it stands, added, listed, edited and removed on every OS.
+        let paths_rules = [
+            "exec.run:type C:\\tools\\x.exe",
+            "exec.run:*C:\\Users\\nina\\repos\\*",
+            "exec.run:\"C:\\Program Files\\nodejs\\node.exe\" --version",
+        ];
+        for own in paths_rules {
+            run(&paths, &["config", "add", "center.home.policy.deny", own]).unwrap();
+            let ls = run(&paths, &["rule", "ls", "deny"]).unwrap();
+            assert!(ls.lines().any(|l| l == own), "{ls}");
+        }
+        run(
+            &paths,
+            &[
+                "rule",
+                "edit",
+                "deny",
+                paths_rules[0],
+                "exec.run:type C:\\temp\\x.exe",
+            ],
+        )
+        .unwrap();
+        assert!(deny().iter().any(|r| r == "exec.run:type C:\\temp\\x.exe"));
+        for own in &paths_rules[1..] {
+            run(&paths, &["rule", "rm", "deny", own]).unwrap();
+            assert!(!deny().iter().any(|r| r == own));
+        }
+        run(
+            &paths,
+            &["rule", "rm", "deny", "exec.run:type C:\\temp\\x.exe"],
+        )
+        .unwrap();
+        // The listed text of a rule with a line break is not a rule: pasted
+        // so, its `\n` would be the letter. Refused for a guard rule and for
+        // an entry of the list, by `config add` and `rule edit`; nothing
+        // changes.
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.deny", "exec.run:a\nb*"],
+        )
+        .unwrap();
+        let before = deny();
+        for listed in [
+            nerve_policy::rules::escape_controls(guard[12]),
+            nerve_policy::rules::escape_controls(guard[13]),
+            "exec.run:a\\nb*".to_string(),
+        ] {
+            let e = run(
+                &paths,
+                &["config", "add", "center.home.policy.deny", &listed],
+            )
+            .unwrap_err();
+            assert!(e.contains("how `rule ls` writes a rule"), "{e}");
+            let e = run(&paths, &["rule", "edit", "deny", "exec.run:a\nb*", &listed]).unwrap_err();
+            assert!(e.contains("how `rule ls` writes a rule"), "{e}");
+        }
+        assert_eq!(deny(), before);
+        // Not there: refused, nothing changes.
+        let now = deny();
+        let e = run(&paths, &["rule", "rm", "deny", "exec.run:nope\\n"]).unwrap_err();
+        assert!(e.contains("is not on"), "{e}");
+        assert_eq!(deny(), now);
+    }
+
+    /// `rule guard` takes the guard's older texts off when it puts the new
+    /// ones on.
+    #[test]
+    fn rule_guard_replaces_the_older_texts() {
+        let (_d, paths) = setup(&["home"]);
+        let deny = || load(&paths).centers[0].policy.deny.clone();
+        for old in nerve_policy::rules::GUARD_OLD {
+            run(&paths, &["config", "add", "center.home.policy.deny", old]).unwrap();
+        }
+        let out = run(&paths, &["rule", "guard"]).unwrap();
+        assert!(out.contains("of an older text replaced"), "{out}");
+        let d = deny();
+        for old in nerve_policy::rules::GUARD_OLD {
+            assert!(!d.iter().any(|r| r == old), "{old}");
+        }
+        for g in nerve_policy::rules::GUARD {
+            assert_eq!(d.iter().filter(|r| r == g).count(), 1, "{g}");
+        }
     }
 
     /// `rule add --action` makes the rule an audit button makes for an entry

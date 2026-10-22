@@ -1212,6 +1212,17 @@ impl Daemon {
                 then,
             ));
         }
+        // Keys in the keyring of the node's own session: the system-wide
+        // environment of the login can have given that session another
+        // user's folders again since `setup` put it right (a reboot).
+        #[cfg(target_os = "linux")]
+        if crate::secrets::stated_storage(&paths) == SecretStorage::Keyring {
+            match tokio::task::spawn_blocking(crate::keyring_setup::repair_for_start).await {
+                Ok(Ok(true)) => tracing::info!("set the session of the keyring right again"),
+                Ok(Err(e)) => tracing::warn!("the session of the keyring: {e}"),
+                _ => {}
+            }
+        }
         let keys = match crate::secrets::KeysLock::try_take(&paths)? {
             Some(l) => l,
             None => {
@@ -1798,12 +1809,6 @@ async fn answer(
     peer: nerve_transport::ctl::Peer,
 ) -> nerve_transport::ctl::Reply {
     if !nerve_transport::ctl::token_ok(token, req.token.as_deref()) {
-        // `update` of 0.0.2 asks `status` without a token to wait for the
-        // restarted node, and puts the old program back when it does not
-        // answer `ok`. That a node runs tells nothing the socket does not.
-        if req.method == "status" {
-            return nerve_transport::ctl::Reply::Ok(json!({"running": true}));
-        }
         return nerve_transport::ctl::Reply::Err(NO_TOKEN.into());
     }
     match req.method.as_str() {
@@ -1992,7 +1997,8 @@ fn is_quiet_key(key: &str) -> bool {
 fn show_value(v: &Value) -> String {
     let text = match v {
         Value::Null => "unset".to_string(),
-        Value::String(s) => s.clone(),
+        // A rule of the guard holds tabs and line breaks; the log is lines.
+        Value::String(s) => nerve_policy::rules::escape_controls(s),
         other => other.to_string(),
     };
     clip(&text, 80)
@@ -3182,34 +3188,17 @@ mod tests {
     }
 
     /// What `install`, `update` and `setup` run to wait for the node they
-    /// restarted: with the token, and as `update` of 0.0.2 sent it, without.
-    /// A node that does not answer them makes `update` put the old program
-    /// back.
+    /// restarted, with the token. A node that does not answer it makes
+    /// `update` put the old program back.
     #[tokio::test]
     async fn the_installers_find_the_node_they_restarted() {
         use crate::service::System;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let (_d, daemon) = daemon().await;
-        let paths = daemon.paths().clone();
-        let p = paths.clone();
+        let p = daemon.paths().clone();
         tokio::task::spawn_blocking(move || crate::service::Host.wait_running(&p))
             .await
             .unwrap()
             .unwrap();
-        // 0.0.2 counts the node as running when the reply holds `"ok"`.
-        let stream = tokio::net::UnixStream::connect(paths.ctl_socket())
-            .await
-            .unwrap();
-        let (r, mut w) = stream.into_split();
-        w.write_all(b"{\"method\":\"status\",\"params\":{}}\n")
-            .await
-            .unwrap();
-        let mut line = String::new();
-        tokio::io::BufReader::new(r)
-            .read_line(&mut line)
-            .await
-            .unwrap();
-        assert!(line.contains("\"ok\""), "{line}");
         daemon.stop().await;
     }
 
@@ -3237,7 +3226,7 @@ mod tests {
         assert_eq!(v["locked"], false);
         // ... a request without it, or with another, is refused for every
         // method, though it comes from the node's own user and below no
-        // command. Only `status` is answered, with nothing of the config.
+        // command.
         let ask = |method: &'static str, given: Option<&'static str>| {
             let socket = socket.clone();
             async move {
@@ -3259,13 +3248,17 @@ mod tests {
             }
         };
         for given in [None, Some("wrong"), Some("short"), Some("")] {
-            for method in ["config.read", "config.write", "sudo.status", "owner.check"] {
+            for method in [
+                "status",
+                "config.read",
+                "config.write",
+                "sudo.status",
+                "owner.check",
+            ] {
                 let reply = ask(method, given).await;
                 let error = reply["error"].as_str().unwrap_or_default();
                 assert!(error.starts_with("refused"), "{method} {given:?}: {reply}");
             }
-            let reply = ask("status", given).await;
-            assert_eq!(reply, json!({"ok": {"running": true}}), "{given:?}");
         }
         // A new start makes a new token, and a stop takes the file away.
         let mut opts = NodeOptions::new(daemon.paths().clone());
@@ -3395,6 +3388,19 @@ node_id = "n1"
             text,
             "settings changed by local (version 7): relay.listen: 0.0.0.0:7490 -> 0.0.0.0:7491; relay.node changed"
         );
+    }
+
+    /// A guard rule holds tabs and line breaks; the log line keeps them
+    /// written out, so one change is one line.
+    #[test]
+    fn a_rule_with_line_breaks_is_one_log_line() {
+        let rule = nerve_policy::rules::GUARD[0];
+        assert!(rule.contains('\n'));
+        let list =
+            |v: &[&str]| Value::Array(v.iter().map(|s| Value::String(s.to_string())).collect());
+        let text = describe_leaf("center.lab.policy.deny", &list(&[]), &list(&[rule]));
+        assert!(!text.contains(['\n', '\r', '\t']), "{text:?}");
+        assert!(text.contains("\\r\\n"), "{text}");
     }
 
     #[test]

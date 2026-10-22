@@ -662,6 +662,29 @@ fn the_app_drives_the_cli_end_to_end() {
     assert!(perm.get_allow().iter().any(|r| r == "fs.read:~/notes/*"));
     perm.invoke_rule_remove(0, "fs.read:~/notes/*".into());
     assert!(!allowed("fs.read:~/notes/*"));
+    // The text `rule ls` writes for a line break is not one: refused, with
+    // the field kept. A Windows path with `\\t` or `\\n` in it is a rule.
+    let listed = nerve_policy::rules::escape_controls(nerve_policy::rules::GUARD[12]);
+    let before = config(&paths).centers[0].policy.deny.clone();
+    perm.set_deny_text(listed.clone().into());
+    perm.invoke_rule_add(1);
+    assert_eq!(config(&paths).centers[0].policy.deny, before);
+    assert!(
+        store.get_toast().contains("how `rule ls` writes a rule"),
+        "{}",
+        store.get_toast()
+    );
+    assert_eq!(perm.get_deny_text(), listed.as_str());
+    perm.set_deny_text("".into());
+    perm.set_allow_text("exec.run:type C:\\tools\\x.exe".into());
+    perm.invoke_rule_add(0);
+    assert!(
+        allowed("exec.run:type C:\\tools\\x.exe"),
+        "{}",
+        store.get_toast()
+    );
+    perm.invoke_rule_remove(0, "exec.run:type C:\\tools\\x.exe".into());
+    assert!(!allowed("exec.run:type C:\\tools\\x.exe"));
     perm.invoke_cap_set("exec.run".into(), 1);
     assert_eq!(
         config(&paths).centers[0].policy.caps.get("exec.run"),
@@ -674,8 +697,8 @@ fn the_app_drives_the_cli_end_to_end() {
     );
     perm.invoke_cap_set("exec.run".into(), 0);
 
-    // A pairing without the whole guard (from before it, or the owner took
-    // a rule off) is offered it, in one click.
+    // A pairing without the whole guard (the owner took a rule off) is
+    // offered it, in one click.
     assert!(!perm.get_guard_missing());
     perm.invoke_rule_remove(1, nerve_policy::rules::GUARD[3].into());
     assert!(perm.get_guard_missing());

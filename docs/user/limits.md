@@ -72,10 +72,7 @@ The node puts each command in a cgroup of its own. It needs a cgroup v2 that
 systemd hands to it:
 
 - **The installed service** has one. Its unit says `Delegate=cpu memory pids`
-  ([service](service.md)). A node installed before this version has a unit
-  without that line: run `sudo nerve-node install` again after the
-  [update](service.md#update). It writes the unit and restarts the node, and
-  keeps the config, the keys and the audit log.
+  ([service](service.md)).
 - **A node you start yourself** has one when you start it in a scope of its
   own:
 

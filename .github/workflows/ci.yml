@@ -1,7 +1,9 @@
 # The checks on every pull request, and on main after a merge: fmt, clippy and
-# the whole test suite, on Linux and on Windows, and the tests that differ on
-# musl, the C library of the released Linux programs. The release workflow runs the
-# same fmt, clippy and tests on Linux before it builds anything
+# the whole test suite, on Linux and on Windows, the tests that differ on
+# musl, the C library of the released Linux programs, and the installed node
+# with its keys in the system keyring on the Ubuntu 22.04 and 24.04 runners,
+# whose kernels are older than 7.1 (6.8 and 7.0). The release workflow runs
+# the same fmt, clippy and tests on Linux before it builds anything
 # (docs/dev/releasing.md), but nothing there runs the Windows tests: its
 # Windows job only builds.
 #
@@ -134,6 +136,76 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo test --locked --target x86_64-unknown-linux-musl -p nerve-node --lib -- service::tests::chown
+
+  # The node keeps its keys in the system keyring on every Linux kernel, and
+  # folder mode runs as the account `nerve-run` (issue #135). That used to be
+  # refused below Linux 7.1, so this job installs the node on the two Ubuntu
+  # runners and takes the whole path an owner takes: the real-account test,
+  # then `setup` in a terminal answering yes to the keyring, the keys moving
+  # out of their files, a restart of the keyring's session and of the node,
+  # `status`, a folder mode command as `nerve-run`, and `uninstall --purge`.
+  # The kernels are GitHub's Azure kernels, not the ones the distributions
+  # ship: 6.8 on ubuntu-22.04 and 7.0 on ubuntu-24.04 at the time of writing,
+  # both with Landlock. So the 5.15 kernel of a 22.04 install, and a kernel
+  # without Landlock, are not tested here (the second only on a test VM); the
+  # script fails when a runner gets a kernel of 7.1 or later, so the job
+  # cannot go on passing while it tests nothing below 7.1. The runner is a
+  # disposable virtual machine, so the script
+  # (.github/scripts/keyring-end-to-end.sh) may install the node, make
+  # accounts and a keyring, and break them; it sets up nothing a real machine
+  # would not have, except the owner it needs (a person who installs) and a
+  # system-wide environment that names another user's session, as the
+  # runner image's does. The node is built on the runner it runs on (the
+  # glibc differs), hence one cache each.
+  keyring:
+    name: Installed node, keyring and folder mode (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.os }}-keyring-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      # getfacl for the test, which reads the access lists the node wrote.
+      - name: Tools of the test
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends acl
+      # One build: the test program, and with it the node's own program, which
+      # cargo builds for the package's integration tests.
+      - name: Build the node and the test program
+        run: |
+          cargo test --locked -p nerve-node --test real_account --no-run --message-format=json \
+            | python3 -c 'import json,sys; print(*[m["executable"] for m in map(json.loads, sys.stdin) if m.get("executable") and m["target"]["name"] == "real_account"])' \
+            > "$RUNNER_TEMP/real_account.path"
+          cat "$RUNNER_TEMP/real_account.path"
+          test -x target/debug/nerve-node
+      # As root, as a person with sudo would run the installer; cargo is not
+      # run as root. The script prints the kernel and whether it has Landlock.
+      # Not `sudo -E`: the runner's session (XDG_RUNTIME_DIR, the session bus
+      # of its user) is not the script's, and the three variables it needs
+      # are named.
+      - name: Install, keyring, folder mode, uninstall
+        run: >-
+          sudo
+          GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY"
+          NERVE_NODE_REAL="$PWD/target/debug/nerve-node"
+          REAL_ACCOUNT_TEST="$(cat "$RUNNER_TEMP/real_account.path")"
+          .github/scripts/keyring-end-to-end.sh
 
   # Linux never compiles the Windows branches, so clippy and the tests must run
   # here too: nerve-node, nerve-sandbox and nerve-policy have Windows-only code

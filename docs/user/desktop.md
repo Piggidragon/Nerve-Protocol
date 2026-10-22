@@ -267,8 +267,8 @@ lies in it ([modes](modes.md#your-home-and-other-accounts)). With Landlock
 neither shows.
 
 On **Permissions**, a center that lacks the guard against changing the node
-(a pairing from before it, or one you took a rule off) shows **Add the
-guard**, which runs `rule guard` ([rules](rules.md#the-guard-against-changing-the-node)).
+(you took a rule of it off) shows **Add the guard**, which runs `rule guard`
+([rules](rules.md#the-guard-against-changing-the-node)).
 
 What stays with the terminal: restoring the keys straight into the keyring
 (`restore --secret-storage keyring`; restore, then switch **Keys** to the

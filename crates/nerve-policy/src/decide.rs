@@ -261,6 +261,9 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
     let deny = RuleSet::new(&policy.deny, env.home);
     for t in &targets {
         if let Some(rule) = deny.find(call.cap, call.action, t) {
+            // The rule as `rule ls` shows it: the guard's hold tabs and line
+            // breaks, and a reason is one line in the audit and the log.
+            let rule = crate::rules::escape_controls(rule);
             return Decision::Forbidden(format!("{} is denied ({rule})", name(call, t)));
         }
     }
@@ -516,6 +519,28 @@ mod tests {
         assert!(!folder_reach(&folders, Path::new("/w/a/b/x"), true));
         assert!(folder_reach(&folders, Path::new("/w/a/b/x"), false));
         assert!(folder_reach(&folders, Path::new("/w/a/c"), true));
+    }
+
+    /// A refusal by a guard rule is one line: the rule holds tabs and line
+    /// breaks, and the reason goes into the audit and the log as it is.
+    #[test]
+    fn a_refusal_by_the_guard_names_the_rule_on_one_line() {
+        let t = T::new();
+        let env = t.env(true);
+        let mut p = policy(Mode::User);
+        p.deny = crate::rules::GUARD.iter().map(|g| g.to_string()).collect();
+        for c in [
+            "systemctl stop nerve-node",
+            "nerve-node status",
+            "pkill nerve-node",
+        ] {
+            let Decision::Forbidden(why) = decide(&p, &env, &call(Effect::Execute, &[], Some(c)))
+            else {
+                panic!("{c} should be refused");
+            };
+            assert!(why.contains("is denied (exec.run:"), "{why}");
+            assert!(!why.contains(['\n', '\r', '\t']), "{why:?}");
+        }
     }
 
     /// An action that names no path (a provider's) lies in no folder:

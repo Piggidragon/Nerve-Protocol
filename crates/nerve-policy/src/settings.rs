@@ -339,8 +339,8 @@ impl SettingsStore {
         }
         let cfg = verified(&text, &s.key).map_err(|why| s.refuse(&why))?;
         not_older(s.secrets.as_ref(), cfg.version).map_err(|why| s.refuse(&why))?;
-        // A file saved by a node that did not record it (an earlier version
-        // of nerve-node, or a record that could not be written).
+        // A file saved without a record (a state folder made new, or a
+        // record that could not be written).
         s.remember(cfg.version);
         s.config = cfg;
         Ok(s)
@@ -1921,7 +1921,7 @@ mod tests {
     }
 
     /// The record follows every saved change, and a file the node did not
-    /// record (one from before it kept a record) is taken and recorded.
+    /// record (the record was deleted) is taken and recorded.
     #[test]
     fn the_version_is_recorded_with_every_save() {
         let d = tempfile::tempdir().unwrap();

@@ -71,6 +71,10 @@ diagnostics() {
   # system-wide one every login reads, and this script's own session.
   [ -z "$nuid" ] || runuser -u nerve -- env -i "XDG_RUNTIME_DIR=/run/user/$nuid" systemctl --user show-environment 2>&1 | grep -E 'XDG|DBUS' || true
   grep -E 'XDG|DBUS' /etc/environment 2>&1 || true
+  # The generator that keeps the session right at every start of its manager:
+  # there, readable for nerve, and what it prints for nerve.
+  ls -ld /etc/systemd /etc/systemd/user-environment-generators /etc/systemd/user-environment-generators/* 2>&1 || true
+  runuser -u nerve -- /etc/systemd/user-environment-generators/99-nerve-session 2>&1 || true
   env | grep -E '^(XDG|DBUS)' || true
   ls -la /etc/nerve /etc/nerve/keys /var/lib/nerve /var/lib/nerve/state 2>&1 || true
   [ -z "$nuid" ] || ls -la "/run/user/$nuid" 2>&1 || true
@@ -207,29 +211,55 @@ assert "folder_commands_off" not in status or status["folder_commands_off"] is N
 PY
 
 step "5b. The session of nerve starts again, as at a reboot"
-# Its service manager reads /etc/environment again; the keyring and the node
-# must find their folders as before.
-systemctl restart "user@$NERVE_UID.service"
-for _ in $(seq 1 60); do [ -S "/run/user/$NERVE_UID/bus" ] && break; sleep 1; done
-[ -S "/run/user/$NERVE_UID/bus" ] || fail "nerve has no session bus after its session started again"
-nerve_env systemctl --user show-environment | tee "$OUT/session-env2"
-grep -qx "XDG_RUNTIME_DIR=/run/user/$NERVE_UID" "$OUT/session-env2" || fail "the restarted session of nerve has another runtime folder"
-grep -qx "XDG_DATA_HOME=/var/lib/nerve/.local/share" "$OUT/session-env2" || fail "the restarted session of nerve has another data folder"
-systemctl restart nerve-node
-for _ in $(seq 1 60); do
-  as_owner status 2>/dev/null | grep -q 'daemon: running' && break
-  sleep 1
-done
-as_owner --json status | tee "$OUT/status-json2"
-python3 - "$OUT/status-json2" <<'PY' || fail "the node does not run with its keys in the keyring after the session started again"
+# Its service manager reads /etc/environment again. The generator setup wrote
+# gives the session its own folders again, and the keyring and the node find
+# them as before. The generator is the one thing this step may not get right
+# yet in every image: a failure is noted, the next step tests the node's own
+# repair, and the script fails at its end.
+GENERATOR_FAILED=
+restart_session() {
+  systemctl restart "user@$NERVE_UID.service"
+  for _ in $(seq 1 60); do [ -S "/run/user/$NERVE_UID/bus" ] && break; sleep 1; done
+  [ -S "/run/user/$NERVE_UID/bus" ] || fail "nerve has no session bus after its session started again"
+  nerve_env systemctl --user show-environment | tee "$1"
+}
+restart_session "$OUT/session-env2"
+if ! grep -qx "XDG_RUNTIME_DIR=/run/user/$NERVE_UID" "$OUT/session-env2" ||
+   ! grep -qx "XDG_DATA_HOME=/var/lib/nerve/.local/share" "$OUT/session-env2"; then
+  GENERATOR_FAILED=1
+  echo "::error::the generator did not give the restarted session of nerve its own folders"
+  ls -ld /etc/systemd /etc/systemd/user-environment-generators /etc/systemd/user-environment-generators/* 2>&1 || true
+  runuser -u nerve -- /etc/systemd/user-environment-generators/99-nerve-session 2>&1 || true
+fi
+node_runs_with_keys() {
+  systemctl restart nerve-node
+  for _ in $(seq 1 90); do
+    as_owner status 2>/dev/null | grep -q 'daemon: running' && break
+    sleep 1
+  done
+  as_owner --json status | tee "$OUT/status-json2"
+  python3 - "$OUT/status-json2" <<'PY' || fail "the node does not run with its keys in the keyring ($1)"
 import json, sys
 text = open(sys.argv[1]).read()
 status = json.loads(text[text.index("{"):])
 status = status.get("data", status)
 assert status["keyring_failed"] is False, status
 PY
-printf 'a secret' | nerve_env secret-tool store --label=nerve-ci nerve-ci probe || fail "secret-tool cannot store after the session started again"
-nerve_env secret-tool clear nerve-ci probe
+  nerve_env systemctl --user show-environment | tee "$OUT/session-env-node"
+  grep -qx "XDG_RUNTIME_DIR=/run/user/$NERVE_UID" "$OUT/session-env-node" || fail "the session of nerve has another runtime folder ($1)"
+  grep -qx "XDG_DATA_HOME=/var/lib/nerve/.local/share" "$OUT/session-env-node" || fail "the session of nerve has another data folder ($1)"
+  printf 'a secret' | nerve_env secret-tool store --label=nerve-ci nerve-ci probe || fail "secret-tool cannot store ($1)"
+  nerve_env secret-tool clear nerve-ci probe
+}
+node_runs_with_keys "after the session started again"
+
+step "5c. Without the generator the node sets the session right when it starts"
+rm -f /etc/systemd/user-environment-generators/99-nerve-session
+restart_session "$OUT/session-env3"
+# The test is a test only if the session is wrong now.
+grep -qx "XDG_DATA_HOME=/home/$OWNER/.local/share" "$OUT/session-env3" || fail "the session of nerve is not wrong without the generator, so this step tests nothing"
+node_runs_with_keys "the node's own repair"
+[ -z "$GENERATOR_FAILED" ] || fail "the generator did not keep the session of nerve right (see above)"
 
 step "6. real_account.rs: a center, a restart, a folder mode command as nerve-run"
 NERVE_REAL_KEYRING=1 NERVE_REAL_OWNER=$OWNER \

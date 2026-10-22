@@ -720,15 +720,21 @@ pub fn session_generator_text(who: &Account) -> String {
     text
 }
 
+/// What writes the generator: `sh -c` with this text, then the folder, the
+/// file and its text. The umask is set here because the node's own is 0077
+/// ([`crate::service::Layout::unit_text`]): a folder made with it would be
+/// closed to the user whose manager has to read it, and the generator would
+/// silently not run.
+const WRITE_GENERATOR: &str = r#"umask 022 && mkdir -p "$1" && printf '%s' "$3" > "$2.new" && chmod 755 "$2.new" && mv -f "$2.new" "$2""#;
+
 /// Writes [`SESSION_GENERATOR`] as root, so that the session of `who` is
 /// right again at every start of its manager.
 fn write_session_generator(who: &Account) -> Result<(), String> {
     let sh = system_program("sh").ok_or("there is no sh")?;
-    let script = r#"mkdir -p "$1" && printf '%s' "$3" > "$2.new" && chmod 755 "$2.new" && mv -f "$2.new" "$2""#;
     as_root(&[
         sh.display().to_string(),
         "-c".into(),
-        script.into(),
+        WRITE_GENERATOR.into(),
         "nerve-node".into(),
         GENERATORS.into(),
         SESSION_GENERATOR.into(),
@@ -1082,6 +1088,7 @@ pub(crate) mod tests {
     /// Another user's `~/.config` in the session manager's environment (a
     /// runner image's `/etc/environment`) is set to the user's own; the
     /// user's own folders and the unset ones are left.
+    #[cfg(unix)]
     #[test]
     fn a_session_manager_with_anothers_config_folder_is_set_right() {
         let who = Account {
@@ -1145,6 +1152,36 @@ pub(crate) mod tests {
         assert_eq!(lines, want, "{said}");
         // Every other user's manager runs it too, and gets nothing from it.
         assert_eq!(run(mine + 1), "");
+    }
+
+    /// The generator is written readable for the user whose manager runs it,
+    /// also by a process with the node's umask 0077 and into a folder that
+    /// does not exist yet.
+    #[cfg(unix)]
+    #[test]
+    fn the_session_generator_is_written_open_to_the_user_whose_manager_runs_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("etc/systemd/user-environment-generators");
+        let file = dir.join("99-nerve-session");
+        let sh = system_program("sh").unwrap();
+        let o = std::process::Command::new(sh)
+            .args(["-c", "umask 077 && exec sh -c \"$0\" nerve-node \"$@\""])
+            .arg(WRITE_GENERATOR)
+            .arg(&dir)
+            .arg(&file)
+            .arg("#!/bin/sh\necho x\n")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{o:?}");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o755);
+        assert_eq!(mode(&file), 0o755);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "#!/bin/sh\necho x\n"
+        );
+        assert!(!dir.join("99-nerve-session.new").exists());
     }
 
     /// GNOME Keyring 40 (Ubuntu 22.04) has `gnome-keyring.service` and no

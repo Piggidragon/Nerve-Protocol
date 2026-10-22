@@ -189,9 +189,13 @@ jobs:
           test -x target/debug/nerve-node
       # As root, as a person with sudo would run the installer; cargo is not
       # run as root. The script prints the kernel and whether it has Landlock.
+      # Not `sudo -E`: the runner's session (XDG_RUNTIME_DIR, the session bus
+      # of its user) is not the script's, and the three variables it needs
+      # are named.
       - name: Install, keyring, folder mode, uninstall
         run: >-
-          sudo -E
+          sudo
+          GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY"
           NERVE_NODE_REAL="$PWD/target/debug/nerve-node"
           REAL_ACCOUNT_TEST="$(cat "$RUNNER_TEMP/real_account.path")"
           .github/scripts/keyring-end-to-end.sh

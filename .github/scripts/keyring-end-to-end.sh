@@ -58,6 +58,11 @@ diagnostics() {
   loginctl list-users 2>&1 || true
   nuid=$(id -u nerve 2>/dev/null || true)
   [ -z "$nuid" ] || journalctl -u "user@$nuid" --no-pager -n 40 2>&1 || true
+  # What the session of nerve was given: its manager's environment, the
+  # system-wide one every login reads, and this script's own session.
+  [ -z "$nuid" ] || runuser -u nerve -- env -i "XDG_RUNTIME_DIR=/run/user/$nuid" systemctl --user show-environment 2>&1 | grep -E 'XDG|DBUS' || true
+  grep -E 'XDG|DBUS' /etc/environment 2>&1 || true
+  env | grep -E '^(XDG|DBUS)' || true
   ls -la /etc/nerve /etc/nerve/keys /var/lib/nerve /var/lib/nerve/state 2>&1 || true
   [ -z "$nuid" ] || ls -la "/run/user/$nuid" 2>&1 || true
 }

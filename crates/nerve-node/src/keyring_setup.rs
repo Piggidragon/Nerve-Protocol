@@ -265,22 +265,11 @@ impl HostKeyring {
 
 impl Keyring for HostKeyring {
     fn check(&self, who: &Account) -> Result<(), String> {
-        let mut c = std::process::Command::new(&self.exe);
+        // In the session of `who`, never in the caller's: `install` runs as
+        // root, and `setup` runs for its owner as the node's user, with
+        // whatever session variables came with either.
+        let mut c = as_account(&self.exe, who, !in_own_session(who));
         c.arg(PROBE_ARG);
-        #[cfg(unix)]
-        if nerve_transport::net::euid() == 0 && who.uid != 0 {
-            use std::os::unix::process::CommandExt;
-            // install runs as root: the probe runs as the node's user, in
-            // that user's session, never in root's.
-            // std drops root's other groups along with the ids.
-            c.uid(who.uid)
-                .gid(who.gid)
-                .env("HOME", &who.home)
-                .env_remove("DBUS_SESSION_BUS_ADDRESS")
-                .env_remove("XDG_RUNTIME_DIR");
-        }
-        #[cfg(not(unix))]
-        let _ = who;
         let o = c.output().map_err(|e| format!("the keyring probe: {e}"))?;
         if o.status.success() {
             return Ok(());
@@ -341,6 +330,13 @@ impl Keyring for HostKeyring {
         let _ = writeln!(out, "running {}", linger.join(" "));
         as_root(&linger)?;
         wait_for_session(who)?;
+        if repair_session(who)? {
+            let _ = writeln!(
+                out,
+                "set the session of {} to its own runtime folder and bus",
+                who.name
+            );
+        }
         if make_login_keyring(who)? {
             let _ = writeln!(
                 out,
@@ -443,20 +439,176 @@ fn as_root(cmd: &[String]) -> Result<(), String> {
     }
 }
 
-/// Waits until the session of `who`, which linger started, has its D-Bus.
+/// Waits until the session of `who`, which linger started, has its D-Bus
+/// and its service manager answers.
 fn wait_for_session(who: &Account) -> Result<(), String> {
     let bus = PathBuf::from(format!("/run/user/{}/bus", who.uid));
+    let mut manager = String::new();
     for _ in 0..80 {
         if bus.exists() {
-            return Ok(());
+            // The socket is there as soon as the manager listens; the
+            // manager answers a moment later.
+            match user_systemctl(who, &["show-environment"]) {
+                Ok(_) | Err(None) => return Ok(()),
+                Err(Some(why)) => manager = why,
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    if bus.exists() {
+        return Err(format!(
+            "the session of {} has a D-Bus at {}, but its service manager does not answer: {manager}",
+            who.name,
+            bus.display()
+        ));
     }
     Err(format!(
         "the session of {} has no D-Bus at {} (on Debian and Ubuntu it comes with dbus-user-session)",
         who.name,
         bus.display()
     ))
+}
+
+/// The variables that tell a program of `who` where its session is: the
+/// runtime folder and the bus in it.
+fn session_vars(who: &Account) -> Vec<(&'static str, String)> {
+    if !cfg!(target_os = "linux") {
+        return Vec::new();
+    }
+    let run = format!("/run/user/{}", who.uid);
+    vec![
+        ("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={run}/bus")),
+        ("XDG_RUNTIME_DIR", run),
+    ]
+}
+
+/// The whole environment of a program that asks the keyring of `who`: the
+/// session `who` has ([`session_vars`]), its home and name, the system's
+/// `PATH`, and nothing of the process that starts it.
+pub fn session_env(who: &Account) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("PATH", SYSTEM_PATH.to_string()),
+        ("HOME", who.home.display().to_string()),
+        ("USER", who.name.clone()),
+        ("LOGNAME", who.name.clone()),
+    ];
+    env.extend(session_vars(who));
+    env
+}
+
+/// Whether `who` is the one who started this process, in the session this
+/// process's environment names: not an account root switched to, and not the
+/// node's user running `setup` for its owner (crate::owner), whose
+/// environment is the node's, not the owner's.
+fn in_own_session(who: &Account) -> bool {
+    #[cfg(unix)]
+    {
+        who.uid == nerve_transport::net::euid()
+            && std::env::var_os("SUDO_UID").is_none()
+            && crate::owner::owner_running().is_none()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = who;
+        true
+    }
+}
+
+/// `program` as `who`. As root it runs as `who` (std drops root's other
+/// groups along with the ids), in `/`. With `clean` it gets
+/// [`session_env`] and nothing else: a session bus or runtime folder of the
+/// caller, which is another user's (the owner's `/run/user/<uid>`), never
+/// reaches the keyring of `who`.
+fn as_account(
+    program: impl AsRef<std::ffi::OsStr>,
+    who: &Account,
+    clean: bool,
+) -> std::process::Command {
+    let mut c = std::process::Command::new(program);
+    #[cfg(unix)]
+    if nerve_transport::net::euid() == 0 && who.uid != 0 {
+        use std::os::unix::process::CommandExt;
+        c.uid(who.uid).gid(who.gid).current_dir("/");
+    }
+    if clean {
+        c.env_clear().envs(session_env(who));
+    }
+    c
+}
+
+/// `systemctl --user args` in the session of `who`, with the environment of
+/// that session ([`as_account`]): its output, or the reason it failed;
+/// `Err(None)` where there is no `systemctl`.
+fn user_systemctl(who: &Account, args: &[&str]) -> Result<String, Option<String>> {
+    let systemctl = system_program("systemctl").ok_or(None)?;
+    let o = as_account(&systemctl, who, true)
+        .arg("--user")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| Some(format!("systemctl: {e}")))?;
+    if o.status.success() {
+        return Ok(String::from_utf8_lossy(&o.stdout).into_owned());
+    }
+    Err(Some(format!(
+        "{}: {}",
+        o.status,
+        String::from_utf8_lossy(&o.stderr).trim()
+    )))
+}
+
+/// What the service manager of a session has wrong, in the
+/// `show-environment` text `environment`: the variables of
+/// [`session_vars`] of `who` that name another runtime folder or bus, as
+/// `NAME=value` to set. The manager hands its environment to everything it
+/// starts, the session bus and the keyring behind it. It can get another
+/// user's from the system-wide environment of the login (`/etc/environment`
+/// through PAM, as on a CI runner whose image names its own user's), and
+/// still listens on its own sockets.
+pub fn wrong_session_vars(environment: &str, who: &Account) -> Vec<String> {
+    session_vars(who)
+        .into_iter()
+        .filter(|(k, v)| {
+            environment.lines().any(|l| {
+                l.strip_prefix(k)
+                    .and_then(|r| r.strip_prefix('='))
+                    .is_some_and(|x| x != v)
+            })
+        })
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect()
+}
+
+/// Puts the variables of the session of `who` right in its service manager
+/// ([`wrong_session_vars`]) and starts its session bus and keyring again,
+/// which began with the wrong ones. `Ok(true)` when it had to.
+fn repair_session(who: &Account) -> Result<bool, String> {
+    let Ok(environment) = user_systemctl(who, &["show-environment"]) else {
+        return Ok(false);
+    };
+    let wrong = wrong_session_vars(&environment, who);
+    if wrong.is_empty() {
+        return Ok(false);
+    }
+    let fail = |what: &str, e: Option<String>| {
+        format!("{what} for {} failed: {}", who.name, e.unwrap_or_default())
+    };
+    let mut set = vec!["set-environment"];
+    set.extend(wrong.iter().map(String::as_str));
+    user_systemctl(who, &set).map_err(|e| fail("systemctl --user set-environment", e))?;
+    // The bus starts at the first program that asks, and the keyring at the
+    // bus's: they may be up already. try-restart leaves a unit that does
+    // not run alone.
+    user_systemctl(
+        who,
+        &[
+            "try-restart",
+            "dbus.service",
+            "gnome-keyring-daemon.service",
+        ],
+    )
+    .map_err(|e| fail("systemctl --user try-restart", e))?;
+    Ok(true)
 }
 
 /// The login keyring GNOME Keyring opens without a password: its plain text
@@ -670,6 +822,132 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(pinned(&["sh".into()]).is_err(), "a bare name is refused");
+    }
+
+    /// The environment a program that asks the keyring of `who` gets is
+    /// made from `who`, not from the process that starts it.
+    #[test]
+    fn the_environment_of_the_keyring_is_the_users_own() {
+        let who = Account {
+            uid: 1234,
+            ..nerve(Path::new("/var/lib/nerve"))
+        };
+        let env = session_env(&who);
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("HOME"), Some("/var/lib/nerve"));
+        assert_eq!(get("USER"), Some("nerve"));
+        assert_eq!(get("LOGNAME"), Some("nerve"));
+        assert_eq!(get("PATH"), Some(SYSTEM_PATH));
+        if cfg!(target_os = "linux") {
+            assert_eq!(get("XDG_RUNTIME_DIR"), Some("/run/user/1234"));
+            assert_eq!(
+                get("DBUS_SESSION_BUS_ADDRESS"),
+                Some("unix:path=/run/user/1234/bus")
+            );
+        }
+    }
+
+    /// The probe of the node's keyring, started for the owner's `setup` by a
+    /// node whose own environment (or the caller's, through `sudo -E`) names
+    /// another user's session, gets the node user's session and nothing
+    /// else. Run again in a process of its own with that environment.
+    #[cfg(unix)]
+    #[test]
+    fn a_callers_session_does_not_reach_the_keyrings_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        const NAME: &str =
+            "keyring_setup::tests::a_callers_session_does_not_reach_the_keyrings_probe";
+        let d = tempfile::tempdir().unwrap();
+        let who = Account {
+            uid: nerve_transport::net::euid(),
+            ..nerve(Path::new("/var/lib/nerve"))
+        };
+        let exe = d.path().join("probe");
+        if std::env::var_os("NERVE_TEST_PROBE_ENV").is_some() {
+            // The probe prints what it was given and refuses, so that the
+            // text comes back as the reason.
+            std::fs::write(&exe, "#!/bin/sh\nenv >&2\nexit 1\n").unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let why = HostKeyring { exe }.check(&who).unwrap_err();
+            println!("probe-env-begin\n{why}\nprobe-env-end");
+            return;
+        }
+        let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+        c.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env("NERVE_TEST_PROBE_ENV", "1")
+            // The node runs `setup` for an owner (crate::owner) ...
+            .env(crate::owner::OWNER_ENV, "alice")
+            .env_remove("SUDO_UID")
+            // ... with the session of someone else in its environment.
+            .env("XDG_RUNTIME_DIR", "/run/user/4711")
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/4711/bus")
+            .env("DISPLAY", ":7")
+            .env("LEAKED_SENTINEL", "1")
+            .stdin(std::process::Stdio::null());
+        let o = c.output().unwrap();
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success(), "{out}");
+        let text = out
+            .split("probe-env-begin\n")
+            .nth(1)
+            .and_then(|t| t.split("\nprobe-env-end").next())
+            .unwrap_or_else(|| panic!("{out}"));
+        let mut got: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                !["PWD=", "SHLVL=", "_=", "OLDPWD="]
+                    .iter()
+                    .any(|p| l.starts_with(p))
+            })
+            .collect();
+        got.sort();
+        let mut want: Vec<String> = session_env(&who)
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "{text}");
+        if cfg!(target_os = "linux") {
+            assert!(
+                text.contains(&format!("XDG_RUNTIME_DIR=/run/user/{}\n", who.uid)),
+                "{text}"
+            );
+        }
+        assert!(!text.contains("4711"), "{text}");
+    }
+
+    /// The service manager of a session that began with another user's
+    /// runtime folder (the system-wide environment of the login) is told its
+    /// own.
+    #[test]
+    fn a_session_manager_with_anothers_runtime_folder_is_set_right() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let who = Account {
+            uid: 999,
+            ..nerve(Path::new("/var/lib/nerve"))
+        };
+        let right = "PATH=/usr/bin\nXDG_RUNTIME_DIR=/run/user/999\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/999/bus\n";
+        assert!(wrong_session_vars(right, &who).is_empty());
+        let wrong = "PATH=/usr/bin\nXDG_RUNTIME_DIR=/run/user/1001\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus\n";
+        let mut set = wrong_session_vars(wrong, &who);
+        set.sort();
+        assert_eq!(
+            set,
+            [
+                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/999/bus",
+                "XDG_RUNTIME_DIR=/run/user/999"
+            ]
+        );
+        // One of them, and a variable that only starts with the name.
+        let one = "XDG_RUNTIME_DIR=/run/user/1001\nXDG_RUNTIME_DIR_OTHER=x\n";
+        assert_eq!(
+            wrong_session_vars(one, &who),
+            ["XDG_RUNTIME_DIR=/run/user/999"]
+        );
+        // None of them is set: nothing to correct.
+        assert!(wrong_session_vars("PATH=/usr/bin\n", &who).is_empty());
     }
 
     #[test]

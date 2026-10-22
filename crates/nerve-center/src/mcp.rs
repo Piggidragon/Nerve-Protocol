@@ -234,6 +234,27 @@ impl Engine {
                 .cloned()
                 .ok_or((-32603, "a tool without a node".to_string()))?
         };
+        // The arguments are checked against the unit's schema before
+        // anything goes to the node, so a model that got them wrong learns
+        // which field at once. A unit gone since the tool list was read is
+        // refused here as well.
+        let unit = format!("{}.{}", route.cap, route.action);
+        let Some(unit) = self.center.unit(&route.node_id, &unit) else {
+            return Ok(text_result(
+                &format!(
+                    "error unavailable: the node {} no longer offers {unit}; list the tools again",
+                    route.node_name
+                ),
+                true,
+            ));
+        };
+        let args = Value::Object(args);
+        if let Err(e) = nerve_proto::schema::validate(&unit.params, &args) {
+            return Ok(text_result(&format!("error invalid_args: {e}"), true));
+        }
+        let Value::Object(args) = args else {
+            unreachable!("the arguments are an object")
+        };
         let sess = self.live_session();
         match self.center.call(&sess, &route, args).await {
             Ok(v) => {

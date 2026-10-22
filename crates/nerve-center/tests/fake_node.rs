@@ -244,6 +244,27 @@ async fn rpc(e: &Engine, id: u64, method: &str, params: Value) -> Value {
         .expect("a reply")
 }
 
+/// The `tools/call` params that run `unit` (`cap.action`) on `node` with the
+/// arguments `args`. The tests name units, never tools: this is the one place
+/// that knows how a unit is called. Today the fake node's units are the
+/// profiled tools `<cap>_<action>`, which pick the node by their `node`
+/// argument.
+fn run_params(node: &str, unit: &str, args: Value) -> Value {
+    let (cap, action) = unit.split_once('.').expect("a unit is cap.action");
+    let mut arguments = json!({"node": node});
+    for (k, v) in args.as_object().expect("the arguments are an object") {
+        arguments[k] = v.clone();
+    }
+    json!({"name": format!("{cap}_{action}"), "arguments": arguments})
+}
+
+/// Runs `unit` on `node` through `e` as a harness would; the JSON-RPC reply.
+async fn run(e: &Engine, node: &str, unit: &str, args: Value) -> Value {
+    static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+    let id = ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    rpc(e, id, "tools/call", run_params(node, unit, args)).await
+}
+
 #[tokio::test]
 async fn pair_connect_describe_and_call() {
     let dir = tempfile::tempdir().unwrap();
@@ -298,13 +319,7 @@ async fn pair_connect_describe_and_call() {
     assert_eq!(names, ["nodes", "exec_run", "fs_read"]);
 
     // A read goes straight through and is marked as device content.
-    let call = rpc(
-        &e,
-        3,
-        "tools/call",
-        json!({"name": "fs_read", "arguments": {"node": "box-1", "path": "/etc/hostname"}}),
-    )
-    .await;
+    let call = run(&e, "box-1", "fs.read", json!({"path": "/etc/hostname"})).await;
     let out = call["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
         out.starts_with("[device content from node \"box-1\""),
@@ -321,13 +336,7 @@ async fn pair_connect_describe_and_call() {
     let session = inv["ctx"]["session"].as_str().unwrap().to_string();
 
     // An unknown node name is refused with the names that exist.
-    let bad = rpc(
-        &e,
-        4,
-        "tools/call",
-        json!({"name": "fs_read", "arguments": {"node": "nope", "path": "/"}}),
-    )
-    .await;
+    let bad = run(&e, "nope", "fs.read", json!({"path": "/"})).await;
     assert_eq!(bad["result"]["isError"], true);
     assert!(
         bad["result"]["content"][0]["text"]
@@ -338,13 +347,7 @@ async fn pair_connect_describe_and_call() {
 
     // The center holds no call back: execute goes straight to the node,
     // which decides.
-    let done = rpc(
-        &e,
-        5,
-        "tools/call",
-        json!({"name": "exec_run", "arguments": {"node": "box-1", "command": "uname"}}),
-    )
-    .await;
+    let done = run(&e, "box-1", "exec.run", json!({"command": "uname"})).await;
     assert_ne!(done["result"]["isError"], true, "{done}");
     let Some(Seen::Invoke(inv)) = seen.recv().await else {
         panic!("no invoke")
@@ -388,7 +391,7 @@ async fn a_cancelled_mcp_call_is_cancelled_on_the_node() {
         async move {
             e.handle(
                 json!({"jsonrpc": "2.0", "id": "run-1", "method": "tools/call",
-                "params": {"name": "exec_run", "arguments": {"node": "box-1", "command": "hang"}}}),
+                "params": run_params("box-1", "exec.run", json!({"command": "hang"}))}),
             )
             .await
         }
@@ -489,8 +492,33 @@ async fn a_second_link_while_the_first_answers_is_a_duplicate() {
     r.stop().await;
 }
 
+/// `/api/overview` as the web UI's page reads it.
+async fn overview(r: &Running) -> Value {
+    let ui = nerve_center::ui::Ui::new(&r.center, None, false, false);
+    let mut req = http("GET", &[("host", "127.0.0.1:1")], Value::Null);
+    req.path = "/api/session".into();
+    let resp = ui.request(req).await;
+    let (_, cookie) = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k == "Set-Cookie")
+        .expect("a session cookie");
+    let cookie = cookie.split(';').next().unwrap();
+    let mut req = http(
+        "GET",
+        &[("host", "127.0.0.1:1"), ("cookie", cookie)],
+        Value::Null,
+    );
+    req.path = "/api/overview".into();
+    let resp = ui.request(req).await;
+    assert_eq!(resp.status, 200);
+    serde_json::from_slice(&resp.body).unwrap()
+}
+
+/// A capability whose name a tool could not carry is left out on its own:
+/// the node's other capabilities stay tools, and the owner sees why.
 #[tokio::test]
-async fn a_descriptor_with_an_underscore_in_a_name_is_ignored() {
+async fn only_the_capability_with_a_bad_name_is_left_out() {
     let dir = tempfile::tempdir().unwrap();
     let r = center(dir.path()).await;
     let key = NodeKey::generate().unwrap();
@@ -500,11 +528,98 @@ async fn a_descriptor_with_an_underscore_in_a_name_is_ignored() {
     d["capabilities"][0]["id"] = json!("my_fs");
     let _seen = serve(ws, d);
     let c = r.center.clone();
-    let id = key.node_id();
-    wait_for(|| c.link(&id).map(|_| ())).await;
-    // The describe call has long been answered when this passes.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(r.center.tools().is_empty(), "{:?}", r.center.tools().len());
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    let names: Vec<String> = c.tools().into_iter().map(|t| t.name).collect();
+    assert_eq!(names, ["exec_run"]);
+    let ov = overview(&r).await;
+    assert_eq!(
+        ov["nodes"][0]["broken"],
+        json!([{"name": "my_fs.read",
+                "reason": "capability name \"my_fs\": letters, digits and - only, no _"}])
+    );
+    r.stop().await;
+}
+
+/// An action whose schema is outside the subset is no tool, and the
+/// overview names it with the reason; its capability's other actions stay.
+#[tokio::test]
+async fn a_broken_schema_is_not_a_tool_and_shows_in_the_overview() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(&r, &key).await;
+    let mut d = descriptor(&key, "box-1");
+    d["capabilities"][0]["actions"]["grep"] = json!({"effect": "read", "summary": "Search.",
+        "params": {"type": "object", "properties": {"pattern": {"type": "string", "pattern": "^a"}}}});
+    let _seen = serve(ws, d);
+    let c = r.center.clone();
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    let names: Vec<String> = c.tools().into_iter().map(|t| t.name).collect();
+    assert_eq!(names, ["exec_run", "fs_read"]);
+    let ov = overview(&r).await;
+    let broken = ov["nodes"][0]["broken"].as_array().unwrap();
+    assert_eq!(broken.len(), 1, "{broken:?}");
+    assert_eq!(broken[0]["name"], "fs.grep");
+    let reason = broken[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("params: /properties/pattern") && reason.contains("pattern"),
+        "{reason}"
+    );
+    // The overview still lists the capability itself.
+    assert_eq!(ov["nodes"][0]["capabilities"][0]["id"], "fs");
+    // And `tools/call` of the left-out unit is an unknown tool.
+    let e = Engine::new(&r.center, "test");
+    let call = run(&e, "box-1", "fs.grep", json!({"pattern": "a"})).await;
+    assert!(call.get("error").is_some(), "{call}");
+    r.stop().await;
+}
+
+/// Arguments that do not fit the unit's schema are refused by the center,
+/// naming the field and what it expected; the node sees nothing of them.
+#[tokio::test]
+async fn wrong_args_are_refused_before_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(&r, &key).await;
+    let mut seen = serve(ws, descriptor(&key, "box-1"));
+    let c = r.center.clone();
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    let e = Engine::new(&r.center, "test");
+    for (args, want) in [
+        (
+            json!({"path": 5}),
+            "error invalid_args: path: expected a string",
+        ),
+        (
+            json!({}),
+            "error invalid_args: path: expected a string (required)",
+        ),
+        (
+            json!({"path": null}),
+            "error invalid_args: path: expected a string",
+        ),
+    ] {
+        let call = run(&e, "box-1", "fs.read", args.clone()).await;
+        assert_eq!(call["result"]["isError"], true, "{args}: {call}");
+        let text = call["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, want, "{args}");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), seen.recv())
+            .await
+            .is_err(),
+        "the node received something"
+    );
+    // Fitting arguments go through.
+    let done = run(&e, "box-1", "fs.read", json!({"path": "/x"})).await;
+    assert_ne!(done["result"]["isError"], true, "{done}");
+    let Some(Seen::Invoke(inv)) = seen.recv().await else {
+        panic!("no invoke")
+    };
+    assert_eq!(inv["args"], json!({"path": "/x"}));
     r.stop().await;
 }
 
@@ -622,7 +737,6 @@ async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect()
     };
-    let read = json!({"name": "fs_read", "arguments": {"node": "box-1", "path": "/x"}});
     let id = key.node_id();
 
     // Switched off: the tools are gone, `nodes` still lists the node and
@@ -662,7 +776,7 @@ async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
     let nerve_center::center::CallError::Rpc(err) = err;
     assert_eq!(err.message, "the node box-1 is disabled in the center");
     // By name through MCP it is an unknown tool.
-    let by_name = rpc(&e, 3, "tools/call", read.clone()).await;
+    let by_name = run(&e, "box-1", "fs.read", json!({"path": "/x"})).await;
     assert!(by_name.get("error").is_some(), "{by_name}");
     assert!(
         tokio::time::timeout(Duration::from_millis(300), seen.recv())
@@ -677,7 +791,7 @@ async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
         names(&rpc(&e, 4, "tools/list", json!({})).await),
         ["nodes", "exec_run", "fs_read"]
     );
-    let done = rpc(&e, 5, "tools/call", read).await;
+    let done = run(&e, "box-1", "fs.read", json!({"path": "/x"})).await;
     assert_ne!(done["result"]["isError"], true, "{done}");
     let Some(Seen::Invoke(inv)) = seen.recv().await else {
         panic!("no invoke")
@@ -857,14 +971,8 @@ async fn a_node_that_drops_and_comes_back_is_in_the_log() {
                "clientInfo": {"name": "test", "version": "1"}}),
     )
     .await;
-    for (n, command) in [(2, "refuse"), (3, "boom")] {
-        let call = rpc(
-            &e,
-            n,
-            "tools/call",
-            json!({"name": "exec_run", "arguments": {"node": "box-1", "command": command}}),
-        )
-        .await;
+    for command in ["refuse", "boom"] {
+        let call = run(&e, "box-1", "exec.run", json!({"command": command})).await;
         assert_eq!(call["result"]["isError"], true, "{call}");
     }
 
@@ -1213,7 +1321,7 @@ async fn a_call_in_flight_on_a_dropped_link(
         let e = e.clone();
         async move {
             e.handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": "exec_run", "arguments": {"node": "box-1", "command": "make"}}}))
+                "params": run_params("box-1", "exec.run", json!({"command": "make"}))}))
                 .await
         }
     });
@@ -1414,7 +1522,7 @@ async fn a_node_resumes_its_link_over_a_held_connection() {
         let e = e.clone();
         async move {
             e.handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": "exec_run", "arguments": {"node": "box-1", "command": "make"}}}))
+                "params": run_params("box-1", "exec.run", json!({"command": "make"}))}))
                 .await
         }
     });
@@ -1529,7 +1637,7 @@ async fn a_frame_over_the_limit_ends_a_resumable_link() {
         let e = e.clone();
         async move {
             e.handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": "exec_run", "arguments": {"node": "box-1", "command": "make"}}}))
+                "params": run_params("box-1", "exec.run", json!({"command": "make"}))}))
                 .await
         }
     });

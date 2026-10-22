@@ -18,6 +18,7 @@ use nerve_transport::log::{Level, Log, Query, call_line};
 use nerve_transport::tls::ServerIdentity;
 
 use crate::audit::AuditFeed;
+use crate::catalog;
 use crate::checker::blocklist::Rule;
 use crate::checker::server::LocalServer;
 use crate::checker::{
@@ -944,6 +945,7 @@ impl Center {
                     last_seen_ms: 0,
                     going_away: None,
                     descriptor: None,
+                    catalog: Default::default(),
                     disabled: false,
                 },
             );
@@ -1831,20 +1833,25 @@ impl Center {
             .await
         {
             Ok(v) => match serde_json::from_value::<Descriptor>(v) {
-                Ok(d) if d.check_names().is_err() => {
-                    let e = d.check_names().unwrap_err();
-                    self.note(
-                        Level::Warn,
-                        Some(&link.node_id),
-                        format!("the node sent a description with a bad name, so the center ignores it: {e}"),
-                    );
-                }
+                // A unit with a bad name or a schema the center cannot check
+                // is left out on its own (`Catalog`); the rest stays usable.
                 Ok(d) => {
-                    self.update(|s| {
-                        if let Some(n) = s.nodes.get_mut(&link.node_id) {
-                            n.descriptor = Some(d);
-                        }
+                    let broken = self.update(|s| {
+                        s.nodes.get_mut(&link.node_id).map(|n| {
+                            n.set_descriptor(d);
+                            n.catalog.broken.clone()
+                        })
                     });
+                    for b in broken.unwrap_or_default() {
+                        self.note(
+                            Level::Warn,
+                            Some(&link.node_id),
+                            format!(
+                                "the center leaves out {} of the node's description: {}",
+                                b.name, b.reason
+                            ),
+                        );
+                    }
                     self.changed(Change::Tools);
                     self.changed(Change::Nodes);
                 }
@@ -1987,6 +1994,9 @@ impl Center {
                         "summary": d.map(|d| d.summary.clone()).unwrap_or_default(),
                         "software": d.map(|d| d.node.software.version.clone()),
                         "capabilities": caps,
+                        // Units the center leaves out, with the reason, for
+                        // the owner: the agent is not offered them.
+                        "broken": n.catalog.broken,
                         "sessions": used_by,
                         "settings_write": d.is_some_and(settings_write),
                     })
@@ -2010,11 +2020,18 @@ impl Center {
                         id: &n.id,
                         name: &n.name,
                         descriptor: d,
+                        catalog: &n.catalog,
                     })
                 })
                 .collect();
             tools::build(&views)
         })
+    }
+
+    /// The unit `name` (`cap.action`) of a node as the center checked it;
+    /// none when the node has no such unit or it is left out.
+    pub fn unit(&self, node_id: &str, name: &str) -> Option<catalog::Unit> {
+        self.read(|s| s.nodes.get(node_id)?.catalog.unit(name).cloned())
     }
 
     // ---- Sessions ----
@@ -3111,6 +3128,7 @@ mod tests {
             last_seen_ms: 0,
             going_away: None,
             descriptor: None,
+            catalog: Default::default(),
         }
     }
 

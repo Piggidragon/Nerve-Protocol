@@ -5,7 +5,8 @@ use std::path::Path;
 
 /// Writes `data` to `path` through a temporary file in the same folder and a
 /// rename, so a reader never sees half a file. On Unix the file is created
-/// 0600; the folder is created 0700 when missing.
+/// 0600; the folder is created 0700 when missing, and synced after the
+/// rename, so the new file is there after a power cut.
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     create_private_dir(dir)?;
@@ -26,6 +27,12 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+    }
+    // Some file systems cannot sync a folder; the file is written all the
+    // same.
+    #[cfg(unix)]
+    if result.is_ok() {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
     }
     result
 }

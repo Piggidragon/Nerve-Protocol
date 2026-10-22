@@ -246,6 +246,11 @@ its scroll bar beside it, so the page stays short.
 On **Permissions**, the **Mode** names who runs the commands: in folder
 mode `nerve-run`, in user mode you; in allowlist mode **Run them as you**
 switches between `nerve-run` and you (`mode set allowlist --as-owner`).
+Where root is the node's owner ([service](service.md#root-as-the-owner)),
+the Overview says so, user mode and the chip say **as root**, and the mode
+shows **Its commands run as root** while they do. On **Centers**, a center's
+settings grant says **Up to user mode, which runs as root on this node**, and
+giving it says that the center can now make itself root.
 Under **Folders**, the line **Always** names what `nerve-run` has besides
 the folders you give it: `/tmp`, `/var/tmp` and its home. A folder that
 `nerve-run` could not be given (a file system without ACLs, a folder of

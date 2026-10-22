@@ -42,8 +42,23 @@ called, `install` puts it in place as `/usr/local/bin/nerve-node`.
    install left behind are given to the new user.
 4. Takes the account that ran `sudo` (or polkit's `pkexec`, with which the
    [desktop app](desktop.md) asks) as the node's owner. Run by root without
-   `sudo`, it keeps the owner an earlier install named, or has none: then
-   only root changes the node and `user` mode runs no command.
+   `sudo` (or with `sudo` from root), it keeps root where an earlier install
+   made root the owner. Otherwise it asks at a terminal whether root is to
+   be the owner, and says what that means and what a yes and a no do; the
+   answer is no unless you type `y` or `yes`
+   ([root as the owner](#root-as-the-owner)). On a no it keeps the owner an
+   earlier install named, or has none: then only root changes the node and
+   `user` mode runs no command. Where the owner changes, `install`, once
+   the steps that can refuse are through (right before step 6), stops the
+   service and takes `nerve-run`'s entries off every folder the earlier
+   owner gave it, as `uninstall` does; the node gives the folders again for
+   the new owner when it starts. Without a new owner it gives `nerve-run`
+   no folders: `folder ls` still lists them, but `folder` mode and
+   `allowlist` mode reach only what every account may. Where not all
+   entries come off, the owner stays as it was, its node walks every
+   folder again when it starts, the service runs again where it ran, and
+   `install` says what failed. A later step that fails starts the stopped
+   service again too.
 5. Copies the program to `/usr/local/bin/nerve-node`.
 6. Writes the polkit files that let the owner start and stop the service
    ([below](#start-and-stop)).
@@ -53,6 +68,64 @@ called, `install` puts it in place as `/usr/local/bin/nerve-node`.
    pids`), so each command runs held to its [limits](limits.md), and keeps
    the node running when one of them is killed for its memory
    (`OOMPolicy=continue`).
+
+### Root as the owner
+
+On a server where you log in as root, there is no other account to be the
+owner, and without one `user` mode and `allowlist` mode as the owner run no
+command. Root may be the owner, as your own decision:
+
+```sh
+./nerve-node-x86_64-linux install          # at a terminal: answer y
+./nerve-node-x86_64-linux install --owner=root --accept-root-owner   # no terminal
+nerve-node install --owner=none            # root is the owner no longer
+```
+
+At a terminal `install` asks `Make root the owner of this node? [y/N]`, and
+says before it what a yes and a no do on this node, and which centers have
+the [settings grant](settings-grant.md) already: with root as the owner they
+can run commands as root. The flags' install says the same. It asks only where both
+its input and its output are a terminal, and not with `--json`. Elsewhere (a
+script, piped input, output to a file, the desktop app) nothing is asked and
+the answer is no at once, unless you give both flags; `install` then says on
+stderr which flags make root the owner. `--owner=root` or
+`--accept-root-owner` alone is refused, and so are the flags from `sudo` by
+another account, which makes that account the owner.
+
+Once root is the owner, it stays the owner at every later `install` by root,
+at a terminal or not, and is not asked again. `install --owner=none` takes
+it back and leaves the node without an owner (it does so for any owner);
+the node then gives `nerve-run` none of the folders you gave, so `folder`
+mode reaches them no more (step 4 above);
+`sudo nerve-node install` from another account makes that account the owner.
+`update` keeps the owner.
+
+With root as the owner, commands of `user` mode and of `allowlist` mode as
+the owner run as root (`HOME=/root`, root's groups). They can do everything
+on this machine, and change and read Nerve itself, its keys included.
+Nothing in Nerve holds them back: the [guard](rules.md#the-guard-against-changing-the-node)
+and the center's [action checker](action-checker.md) only catch mistakes.
+`folder` mode and `allowlist` mode run as `nerve-run`, as on any node, and
+get the folders root gives them. `~` in folders and rules is `/root`.
+`status` says `owner: root is the owner: …` (`"owner_is_root": true` with
+`--json`), and so does the [desktop app](desktop.md). Root needs no polkit
+files to start and stop the service, so `install` writes none. No center can
+turn [sudo](sudo.md) on, since sudo checks no password of root's: root does,
+with `nerve-node sudo on` on the machine. The node's own file actions (`fs`)
+for a center in `user` mode, or in `allowlist` mode as the owner, run as
+root without root's extra rights (the service holds only `CAP_SETUID` and
+`CAP_SETGID`): they reach what root owns and what the modes let in; the
+commands have all of root's rights. For a center in `folder` mode or plain
+`allowlist` mode they run as `nerve-run`, as its commands do.
+
+A center with the [settings grant](settings-grant.md) may set its own mode,
+and so may switch itself to `user` mode: where root is the owner, its
+commands then run as root, and no password is asked. Giving that grant here
+gives the center root. `center grant settings write` warns of it, and so does
+the desktop app when you give the grant.
+
+`nerve` and `nerve-run` are never the owner, nor another account with uid 0,
+nor an account that can open the node's folders.
 
 When the settings of an earlier install keep the keys in the system keyring
 ([keys](config.md#where-the-node-keeps-its-keys)), `install` first checks
@@ -108,7 +181,7 @@ A center's commands run as one of two accounts:
 |---|---|
 | `folder` | `nerve-run` |
 | `allowlist` | `nerve-run`, or the owner with `mode set allowlist --as-owner` |
-| `user` | the owner |
+| `user` | the owner (root, where [root is the owner](#root-as-the-owner)) |
 | an allowed [sudo](sudo.md) command | root: through the owner's sudo where the pairing runs as the owner, started by the node itself where it runs as `nerve-run` |
 
 There is no other account to choose. A command gets the account's groups,
@@ -119,8 +192,10 @@ account. `~` in [folders](modes.md), [rules](rules.md) and the
 [protected paths](protected-paths.md) is the owner's home.
 
 The node's keys are private to `nerve`, and no command of `nerve-run` or
-the owner can read them. Before a command starts, the node checks that its
-account cannot open the node's folders, and refuses to run it if it can.
+the owner can read them, except where [root is the owner](#root-as-the-owner):
+root's commands read them. Before a command starts, the node checks that its
+account cannot open the node's folders, and refuses to run it if it can;
+root as the owner is let through.
 `nerve-run` is in no group and has no sudo of its own: only a command on the
 [sudo list](sudo.md), with sudo on, runs as root, started by the node, and
 as root it can read what root can, the node's keys included. Put on the
@@ -136,7 +211,8 @@ capabilities, `CAP_SETUID` and `CAP_SETGID` (`AmbientCapabilities=` in the
 unit). This is the one privilege it has beyond what `nerve` may do. The node
 uses it to switch to the account, and to give `nerve-run` its folders as the
 owner, who owns them. Every command it starts drops both capabilities before
-it runs, in every mode, so no command keeps them.
+it runs, in every mode, so no command keeps them; a command of root as the
+[owner](#root-as-the-owner) keeps all of root's rights instead.
 
 ## Setup
 
@@ -185,7 +261,8 @@ a password from their own local session: by the rule
 `/etc/polkit-1/rules.d/50-nerve-node.rules` (which also lets the owner use
 `systemctl` for this service), or on polkit 0.105 (Ubuntu 22.04), which takes
 no rules, by `/etc/polkit-1/localauthority/50-local.d/50-nerve-node.pkla`.
-No file lets the owner manage other units. Over SSH it needs `sudo`. A
+No file lets the owner manage other units. Over SSH it needs `sudo`. Root
+as the owner needs none of these files, and `install` writes none for it. A
 stopped service starts again with the machine. `service status` says whether
 the node is installed as a service, whether it runs, whether it starts with
 the machine, and the installed program with its version.

@@ -119,7 +119,14 @@ pub enum Cmd {
     /// Let the node work again after `panic`.
     Unlock,
     /// Install the node as a service that starts with the machine and runs under a user of its own, make the account nerve-run for its commands and take you as the owner (Linux with sudo from your own account, Windows as administrator).
-    Install,
+    Install {
+        /// Run by root itself (Linux): `root` makes root the owner, so that user mode, and allowlist mode as the owner, run commands as root, with every right on the machine and over Nerve; needs --accept-root-owner. At a terminal install asks instead, and an owner root confirmed before stays. `none` leaves the node without an owner, root or another.
+        #[arg(long, value_name = "ACCOUNT", value_parser = ["root", "none"])]
+        owner: Option<String>,
+        /// Confirms --owner=root: you accept that nothing in Nerve holds those commands back.
+        #[arg(long)]
+        accept_root_owner: bool,
+    },
     /// Name the node, choose where it keeps its keys, pair the first center and choose its mode and folder, one question at a time.
     Setup,
     /// Replace the installed program with the latest release and restart the service; config, keys and audit log stay.
@@ -1477,7 +1484,7 @@ impl Cmd {
     pub(crate) fn is_service(&self) -> bool {
         matches!(
             self,
-            Cmd::Install | Cmd::Update { .. } | Cmd::Uninstall { .. } | Cmd::Service(_)
+            Cmd::Install { .. } | Cmd::Update { .. } | Cmd::Uninstall { .. } | Cmd::Service(_)
         )
     }
 }
@@ -1891,18 +1898,23 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             value,
             center,
         }) => {
-            let name = match what.as_str() {
+            let (name, g) = match what.as_str() {
                 "settings" => {
                     let g: SettingsGrant = parse_enum(&value, "off or write")?;
-                    edit_center(&paths, &center, |e| {
+                    let name = edit_center(&paths, &center, |e| {
                         e.settings = g;
                         Ok(())
                     })
-                    .await?
+                    .await?;
+                    (name, g)
                 }
                 other => return Err(format!("unknown grant {other} (settings)")),
             };
             w(out, format!("{name}: {what} {value}"));
+            let root = crate::owner::is_root(crate::service::owner_of(&paths).as_deref());
+            if let Some(warning) = settings_grant_warning(&name, g, root) {
+                w(out, warning);
+            }
             Ok(())
         }
         Cmd::Status => {
@@ -1917,20 +1929,9 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 &paths.config_file(),
                 &crate::secrets::NodeSecrets::for_cli(&paths),
             )?;
-            w(out, "daemon: not running".into());
-            let limits =
-                crate::cgroup::status(&cfg.limits.command, &Err("the node does not run".into()));
-            if let Some(line) = limits_lines(&limits).first() {
-                w(out, line.clone());
-            }
-            if cfg.locked {
-                w(
-                    out,
-                    "LOCKED (panic): nothing runs until `nerve-node unlock`".into(),
-                );
-            }
-            for c in &cfg.centers {
-                w(out, format!("{}  {}", c.name, c.url));
+            let owner = crate::service::owner_of(&paths);
+            for line in stopped_lines(&cfg, owner.as_deref()) {
+                w(out, line);
             }
             Ok(())
         }
@@ -2147,10 +2148,16 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             json::also("restored", crate::backup::restore_data(&r, &parsed));
             Ok(())
         }
-        Cmd::Install => {
+        Cmd::Install {
+            owner,
+            accept_root_owner,
+        } => {
+            let root = root_owner(owner.as_deref(), accept_root_owner, cfg!(windows))?;
             let layout = Layout::system();
             owner_check(&[&paths, &layout.paths]).await?;
             let exe = std::env::current_exe().map_err(|e| format!("this program: {e}"))?;
+            #[cfg(windows)]
+            let _ = root;
             #[cfg(windows)]
             return crate::winsvc::install(
                 &layout,
@@ -2161,12 +2168,18 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             );
             #[cfg(not(windows))]
             {
-                // Asked only in a terminal: a script that installs gets the
-                // refusal instead of a question.
                 use std::io::IsTerminal;
                 let stdin = std::io::stdin();
                 let mut input = std::io::BufReader::new(stdin.lock());
-                let terminal = stdin.is_terminal();
+                let terminal = at_terminal(
+                    stdin.is_terminal(),
+                    std::io::stdout().is_terminal(),
+                    json::active(),
+                );
+                let invoker = invoker();
+                if !terminal && crate::service::root_question_due(&layout, &invoker, root) {
+                    eprintln!("{}", crate::service::NO_QUESTION);
+                }
                 let keyring = crate::keyring_setup::HostKeyring {
                     exe: layout.bin.clone(),
                 };
@@ -2174,9 +2187,10 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                     &layout,
                     &Host,
                     &keyring,
-                    terminal.then_some(&mut input as &mut dyn BufRead),
+                    terminal_input(terminal, &mut input),
+                    root,
                     &exe,
-                    &invoker(),
+                    &invoker,
                     out,
                 )
             }
@@ -2282,6 +2296,94 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
     }
 }
 
+/// Whether `install` may ask its questions (the keyring, root as the
+/// owner): only where its input (`stdin`) and its output (`stdout`) are a
+/// terminal, and not with `--json` (`json`), whose output is printed only at
+/// the end. Elsewhere nobody would see the question while install waits.
+#[cfg_attr(windows, allow(dead_code))]
+fn at_terminal(stdin: bool, stdout: bool, json: bool) -> bool {
+    stdin && stdout && !json
+}
+
+/// The input `install` asks its questions on: the terminal's, and none
+/// where it may not ask ([`at_terminal`]), as where the input is piped or
+/// closed. A script that installs gets each question's no, or the refusal,
+/// instead of a question that its input would answer.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn terminal_input(terminal: bool, input: &mut dyn BufRead) -> Option<&mut dyn BufRead> {
+    terminal.then_some(input)
+}
+
+/// What `install`'s flags choose for the owner (crate::service::RootOwner):
+/// root with `--owner=root` and `--accept-root-owner` together, none with
+/// `--owner=none`, else install asks at a terminal. `--owner=root` or
+/// `--accept-root-owner` alone is refused, with what the pair means. On
+/// Windows (`windows`), where the account that installs is the owner, both
+/// are refused first.
+fn root_owner(
+    owner: Option<&str>,
+    accepted: bool,
+    windows: bool,
+) -> Result<crate::service::RootOwner, String> {
+    use crate::service::RootOwner;
+    if windows && (owner.is_some() || accepted) {
+        return Err(
+            "--owner and --accept-root-owner are for Linux: on Windows the account that installs is the owner".into(),
+        );
+    }
+    match (owner, accepted) {
+        (Some("root"), true) => Ok(RootOwner::Accepted),
+        (Some("none"), false) => Ok(RootOwner::NoOwner),
+        (Some("none"), true) => {
+            Err("--accept-root-owner goes with --owner=root only, not with --owner=none".into())
+        }
+        (None, false) => Ok(RootOwner::Ask),
+        _ => Err(format!(
+            "--owner=root and --accept-root-owner go together: with both, root is the owner of the node, and {}",
+            crate::service::ROOT_OWNER_MEANS
+        )),
+    }
+}
+
+/// The line of `status` on the node's owner, which says plainly what root
+/// as the owner means.
+fn owner_line(owner: Option<&str>, root: bool) -> Option<String> {
+    match (owner, root) {
+        (Some(_), true) => Some(format!("owner: {}", crate::owner::ROOT_OWNER_NOTE)),
+        (Some(o), false) => Some(format!("owner: {o}")),
+        (None, _) => None,
+    }
+}
+
+/// What `center grant settings write` warns of where root is the owner
+/// (`root`): the center may then set its own mode to user, whose commands
+/// run as root, with no password asked.
+fn settings_grant_warning(name: &str, g: SettingsGrant, root: bool) -> Option<String> {
+    (root && g == SettingsGrant::Write).then(|| {
+        format!(
+            "Warning: root is the owner of this node, so {name} can now set its own mode to user, and its commands then run as root: anything on this machine, Nerve and its keys included"
+        )
+    })
+}
+
+/// What `status` says of a node that does not run, with the config `cfg`
+/// and the `owner` the unit names, a line each.
+fn stopped_lines(cfg: &NodeConfig, owner: Option<&str>) -> Vec<String> {
+    let mut lines = vec!["daemon: not running".to_string()];
+    lines.extend(owner_line(owner, crate::owner::is_root(owner)));
+    let limits = crate::cgroup::status(&cfg.limits.command, &Err("the node does not run".into()));
+    if let Some(line) = limits_lines(&limits).first() {
+        lines.push(line.clone());
+    }
+    if cfg.locked {
+        lines.push("LOCKED (panic): nothing runs until `nerve-node unlock`".into());
+    }
+    for c in &cfg.centers {
+        lines.push(format!("{}  {}", c.name, c.url));
+    }
+    lines
+}
+
 /// What `status` says of a running node, from its `status` answer `v`, a
 /// line each.
 fn status_lines(v: &Value) -> Vec<String> {
@@ -2296,9 +2398,7 @@ fn status_lines(v: &Value) -> Vec<String> {
     if v["locked"] == true {
         lines.push("LOCKED (panic): nothing runs until `nerve-node unlock`".into());
     }
-    if let Some(o) = v["owner"].as_str() {
-        lines.push(format!("owner: {o}"));
-    }
+    lines.extend(owner_line(v["owner"].as_str(), v["owner_is_root"] == true));
     if let Some(h) = v["home_warning"]["warning"].as_str() {
         lines.push(format!("warning: {h}"));
     }
@@ -5732,6 +5832,30 @@ mod tests {
             1,
             "{lines:#?}"
         );
+        // Root as the owner is said plainly.
+        let root = status_lines(&json!({"owner": "root", "owner_is_root": true}));
+        assert!(
+            root.iter()
+                .any(|l| *l == format!("owner: {}", crate::owner::ROOT_OWNER_NOTE)),
+            "{root:#?}"
+        );
+        assert!(crate::owner::ROOT_OWNER_NOTE.contains("run as root"));
+        assert_eq!(owner_line(None, false), None);
+        // So does a stopped node's.
+        let cfg = NodeConfig::default();
+        let root_line = format!("owner: {}", crate::owner::ROOT_OWNER_NOTE);
+        let stopped = stopped_lines(&cfg, Some("root"));
+        assert_eq!(stopped[0], "daemon: not running");
+        assert_eq!(stopped.contains(&root_line), !cfg!(windows), "{stopped:#?}");
+        let alice = stopped_lines(&cfg, Some("alice"));
+        assert!(alice.contains(&"owner: alice".to_string()), "{alice:#?}");
+        assert!(!alice.contains(&root_line), "{alice:#?}");
+        assert!(
+            !stopped_lines(&cfg, None)
+                .iter()
+                .any(|l| l.starts_with("owner:")),
+            "no owner, no line"
+        );
         // Nothing of the kind on a node that has none of it.
         let plain = status_lines(&json!({"confinement": "landlock abi 6"})).join("\n");
         assert!(
@@ -5800,6 +5924,104 @@ mod tests {
         assert!(k.installed.borrow().is_empty());
         assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
         crate::secrets::store::set_unreachable(false);
+    }
+
+    /// `install --owner=root --accept-root-owner` makes root the owner;
+    /// either flag alone is refused with what the pair means, and no other
+    /// account can be named.
+    #[test]
+    fn install_takes_root_as_the_owner_only_with_both_flags() {
+        use crate::service::RootOwner;
+        let flags = |args: &[&str]| -> Result<RootOwner, String> {
+            let argv = ["nerve-node", "install"].iter().chain(args).copied();
+            match Cli::try_parse_from(argv).map_err(|e| e.to_string())?.cmd {
+                Cmd::Install {
+                    owner,
+                    accept_root_owner,
+                } => root_owner(owner.as_deref(), accept_root_owner, false),
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(flags(&[]).unwrap(), RootOwner::Ask);
+        assert_eq!(
+            flags(&["--owner=root", "--accept-root-owner"]).unwrap(),
+            RootOwner::Accepted
+        );
+        for alone in [&["--owner=root"][..], &["--accept-root-owner"]] {
+            let e = flags(alone).unwrap_err();
+            assert!(e.contains("go together"), "{e}");
+            assert!(e.contains(crate::service::ROOT_OWNER_MEANS), "{e}");
+        }
+        // No owner, root or another, is chosen with --owner=none alone.
+        assert_eq!(flags(&["--owner=none"]).unwrap(), RootOwner::NoOwner);
+        let e = flags(&["--owner=none", "--accept-root-owner"]).unwrap_err();
+        assert!(e.contains("--owner=root only"), "{e}");
+        let e = flags(&["--owner=alice", "--accept-root-owner"]).unwrap_err();
+        assert!(e.contains("invalid value"), "{e}");
+        // Input that is no terminal's answers no question.
+        let mut piped = std::io::Cursor::new(b"y\n".to_vec());
+        assert!(terminal_input(false, &mut piped).is_none());
+        assert!(terminal_input(true, &mut piped).is_some());
+    }
+
+    /// `center grant settings write` warns where root is the owner: the
+    /// center can make itself root by setting its own mode to user.
+    #[test]
+    fn the_settings_grant_warns_where_root_is_the_owner() {
+        let w = settings_grant_warning("home", SettingsGrant::Write, true).unwrap();
+        assert!(
+            w.starts_with("Warning: root is the owner of this node"),
+            "{w}"
+        );
+        assert!(w.contains("home can now set its own mode to user"), "{w}");
+        assert!(w.contains("run as root"), "{w}");
+        assert_eq!(
+            settings_grant_warning("home", SettingsGrant::Off, true),
+            None
+        );
+        assert_eq!(
+            settings_grant_warning("home", SettingsGrant::Write, false),
+            None
+        );
+    }
+
+    /// On Windows, where the account that installs is the owner, either
+    /// flag is refused with what holds there, before the pair is looked at.
+    #[test]
+    fn windows_refuses_the_owner_flags_first() {
+        use crate::service::RootOwner;
+        for (owner, accepted) in [
+            (Some("root"), false),
+            (None, true),
+            (Some("root"), true),
+            (Some("none"), false),
+        ] {
+            let e = root_owner(owner, accepted, true).unwrap_err();
+            assert_eq!(
+                e,
+                "--owner and --accept-root-owner are for Linux: on Windows the account that installs is the owner",
+                "{owner:?} {accepted}"
+            );
+        }
+        assert_eq!(root_owner(None, false, true).unwrap(), RootOwner::Ask);
+    }
+
+    /// Install asks only where its input and its output are a terminal and
+    /// it runs without --json: elsewhere nobody would see the question.
+    #[test]
+    fn install_asks_only_where_the_question_is_seen() {
+        assert!(at_terminal(true, true, false));
+        for (stdin, stdout, json) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+            (false, false, false),
+        ] {
+            assert!(!at_terminal(stdin, stdout, json), "{stdin} {stdout} {json}");
+        }
+        let said = crate::service::NO_QUESTION;
+        assert!(said.contains("--owner=root --accept-root-owner"), "{said}");
+        assert!(said.contains("the answer is no"), "{said}");
     }
 
     /// Setup chooses no account: it has no flags, and asks for none.

@@ -101,6 +101,13 @@ The center serves the form that takes the password. A tampered center could
 capture the password before the browser seals it. Turn sudo on from the
 machine if you do not trust the center.
 
+Where root is the node's owner ([service](service.md#root-as-the-owner)), no
+center turns sudo on: sudo checks no password of root's, so the password
+would show nothing. Root does, with `nerve-node sudo on` on the machine. That
+does not keep a center from root there: a center with the
+[settings grant](settings-grant.md) may switch itself to `user` mode, whose
+commands run as root, with no password at all.
+
 ## Sudo on Windows
 
 Windows has no `sudo` program. A sudo command runs as the

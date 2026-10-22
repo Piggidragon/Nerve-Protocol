@@ -51,7 +51,7 @@ pub fn built_in(home: &Path) -> Vec<Folder> {
 /// What a command of the installed node gets that would run as the owner
 /// while the node has none.
 #[cfg(not(windows))]
-pub const NO_OWNER: &str = "this node has no owner, as `install` ran as root and not through sudo: commands of user mode, and of allowlist mode as the owner, run as the owner, so none runs; run `sudo nerve-node install` again from the owner's own account";
+pub const NO_OWNER: &str = "this node has no owner, as `install` ran as root and not through sudo: commands of user mode, and of allowlist mode as the owner, run as the owner, so none runs; run `sudo nerve-node install` again from the owner's own account, or `nerve-node install` as root with a yes to its question (or `--owner=root --accept-root-owner`) to make root the owner";
 /// What a command of the installed node gets while it has no owner: on
 /// Windows `install` takes it, with its password.
 #[cfg(windows)]
@@ -393,7 +393,11 @@ pub fn for_commands(
             )
         }
     })?;
-    if a.uid == own_uid || a.uid == 0 {
+    // Root runs what runs as the owner only where it is the owner, which
+    // `install` made it after root confirmed it (crate::service::RootOwner).
+    // No other account with uid 0 is.
+    let root_owner = as_owner && !cfg!(windows) && name == crate::service::ROOT && a.uid == 0;
+    if a.uid == own_uid || a.uid == 0 && !root_owner {
         return Err(format!(
             "{name} is the node's own user or root, which can read the node's keys; no command runs as it"
         ));
@@ -866,6 +870,7 @@ mod tests {
         Ok(match name {
             "alice" => Some(account("alice", 1000)),
             "root" => Some(account("root", 0)),
+            "toor" => Some(account("toor", 0)),
             "nerve" => Some(account("nerve", 990)),
             RUN_USER => Some(Account {
                 comment: RUN_MARK.into(),
@@ -898,14 +903,23 @@ mod tests {
             for_commands(true, Some("alice"), 0, false, true, db).unwrap(),
             None
         );
-        // Refused: an owner that does not exist, the node's own user, root,
-        // and a `nerve-run` that install did not make.
+        // Root as the owner (which install made it only after root
+        // confirmed it) runs what runs as the owner; folder and allowlist
+        // mode stay nerve-run's.
+        let a = run(true, Some("root")).unwrap().unwrap();
+        assert_eq!((a.name.as_str(), a.uid), ("root", 0));
+        assert_eq!(run(false, Some("root")).unwrap().unwrap().name, RUN_USER);
+        // Refused: an owner that does not exist, the node's own user, an
+        // account with uid 0 other than root, and a `nerve-run` that install
+        // did not make.
         let e = run(true, Some("bob")).unwrap_err();
         assert!(e.contains("bob") && e.contains("does not exist"), "{e}");
-        for who in ["nerve", "root"] {
+        for who in ["nerve", "toor"] {
             let e = run(true, Some(who)).unwrap_err();
             assert!(e.contains("node's own user or root"), "{e}");
         }
+        let e = for_commands(true, Some("root"), 0, true, true, db).unwrap_err();
+        assert!(e.contains("node's own user or root"), "{e}");
         let fake = |name: &str| {
             Ok(match name {
                 RUN_USER => Some(account(RUN_USER, 989)),

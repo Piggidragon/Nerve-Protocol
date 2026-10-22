@@ -547,6 +547,15 @@ fn every_page_light_and_dark() {
     perm.set_mode("allowlist".into());
     perm.set_as_owner(true);
     shots.take("permissions-allowlist-as-owner");
+    // Root as the owner (issue #151): what runs as the owner runs as root.
+    perm.set_owner_is_root(true);
+    perm.set_account("root".into());
+    shots.take("permissions-allowlist-as-root");
+    perm.set_mode("user".into());
+    shots.take("permissions-user-as-root");
+    perm.set_owner_is_root(false);
+    perm.set_account("nerve-run".into());
+    perm.set_mode("allowlist".into());
     perm.set_mode_choice("folder".into());
     perm.set_mode_open(true);
     shots.take("permissions-mode-folder-nerve-run");

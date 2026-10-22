@@ -1046,8 +1046,10 @@ impl Shared {
         json!({
             "version": cfg.version,
             "locked": cfg.locked,
-            // The installed node's owner (crate::owner).
+            // The installed node's owner (crate::owner), and whether it is
+            // root, as whom what runs as the owner then runs.
             "owner": self.owner_name(&cfg),
+            "owner_is_root": crate::owner::is_root(self.owner_name(&cfg).as_deref()),
             "confinement": self.confinement.describe(),
             "running": self.running.load(Ordering::Relaxed),
             "sudo": if self.sudo_on() { "on" } else { "off" },
@@ -2467,6 +2469,27 @@ mod tests {
         write(&storage(SecretStorage::Keyring));
         assert_eq!(told(), 2);
         daemon.stop().await;
+    }
+
+    /// The status says whether the owner is root, as whom what runs as
+    /// the owner then runs (#151); `false` for any other owner and none.
+    #[tokio::test]
+    async fn the_status_says_when_root_is_the_owner() {
+        for (owner, root) in [
+            (Some("root"), !cfg!(windows)),
+            (Some("alice"), false),
+            (None, false),
+        ] {
+            let log = Log::new(Level::Info);
+            let d = tempfile::tempdir().unwrap();
+            let mut o = options(&d, &log);
+            o.full_rights = Some(false);
+            o.owner = owner.map(String::from);
+            let daemon = Daemon::start(o).await.unwrap();
+            let st = daemon.status();
+            assert_eq!(st["owner_is_root"], root, "{owner:?}: {st}");
+            daemon.stop().await;
+        }
     }
 
     /// The status says of each pairing whether Landlock holds its commands,

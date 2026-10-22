@@ -26,6 +26,23 @@ fn text_model(items: Vec<String>) -> ModelRc<SharedString> {
     ))
 }
 
+/// What the Overview says while root is the node's owner (#151).
+pub const ROOT_OWNER: &str = "Root is the owner of this node: commands of user mode, and of allowlist mode as the owner, run as root. They can do everything on this machine, Nerve and its keys included, and nothing in Nerve holds them back.";
+
+/// What the app says once the settings grant of the center `name` is given
+/// (`on`) or taken. Where root is the node's owner (`root`), the center may
+/// set its own mode to user, whose commands run as root, and the app says
+/// so, as `center grant settings write` does.
+pub fn settings_grant_said(name: &str, on: bool, root: bool) -> String {
+    match (on, root) {
+        (true, true) => format!(
+            "{name} may change this machine's settings now. Root is the owner of this node, so {name} can set its own mode to user, and its commands then run as root."
+        ),
+        (true, false) => format!("{name} may change this machine's settings now."),
+        (false, _) => format!("{name} can no longer change this machine's settings."),
+    }
+}
+
 /// The node's status and its centers, from `status --json`.
 pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
     let running = v["daemon"] == "running";
@@ -90,6 +107,11 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
                 "The node found no keyring at its start. Restart it once the keyring runs.".into(),
             );
         }
+    }
+    // Root as the owner is said whether the node runs or not: what runs as
+    // the owner runs as root.
+    if v["owner_is_root"] == true {
+        warnings.push(ROOT_OWNER.into());
     }
     let n = |k: &str| limits[k].as_u64().unwrap_or_default();
     let limits_text = if held || limits_restart || !limits_off.is_empty() {
@@ -1590,6 +1612,32 @@ mod tests {
         let (st, _) = status(&v, NOW);
         assert_eq!(st.state, "locked");
         assert_eq!(st.warnings.row_count(), 1);
+    }
+
+    /// Giving the settings grant where root is the owner says that the
+    /// center can make itself root.
+    #[test]
+    fn the_settings_grant_says_root_where_root_is_the_owner() {
+        let said = settings_grant_said("home", true, true);
+        assert!(said.contains("home can set its own mode to user"), "{said}");
+        assert!(said.contains("run as root"), "{said}");
+        assert!(!settings_grant_said("home", true, false).contains("root"));
+        assert!(!settings_grant_said("home", false, true).contains("root"));
+    }
+
+    /// Root as the owner is a warning on the Overview, running or not.
+    #[test]
+    fn root_as_the_owner_is_said() {
+        for daemon in ["running", "not running"] {
+            let v =
+                json!({"daemon": daemon, "owner": "root", "owner_is_root": true, "centers": []});
+            let (st, _) = status(&v, NOW);
+            let w: Vec<SharedString> = st.warnings.iter().collect();
+            assert_eq!(w, [SharedString::from(ROOT_OWNER)], "{daemon}");
+            let v =
+                json!({"daemon": daemon, "owner": "alice", "owner_is_root": false, "centers": []});
+            assert_eq!(status(&v, NOW).0.warnings.row_count(), 0, "{daemon}");
+        }
     }
 
     fn call(target: &str, decision: &str, center: &str) -> Value {

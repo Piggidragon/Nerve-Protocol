@@ -267,6 +267,22 @@ pub struct Record {
     /// one a folder made later below them got from there.
     #[serde(default)]
     pub made_defaults: Vec<PathBuf>,
+    /// Grants of an earlier owner or `nerve-run` whose entries could not all
+    /// be taken off after the accounts changed ([`sync`]): walked again at
+    /// each sync, and by `uninstall` as root. No command of `nerve-run` runs
+    /// while one is left.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left: Vec<Left>,
+}
+
+/// A grant of earlier accounts still to come off ([`Record::left`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Left {
+    pub path: PathBuf,
+    /// The `nerve-run` and the owner of when its entries were put on.
+    pub run: u32,
+    pub owner: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -976,6 +992,18 @@ pub fn sync(
                 return report;
             }
         };
+        // What earlier accounts left is tried again; what still does not
+        // come off stays.
+        for l in &before.left {
+            let gone = Who {
+                run: l.run,
+                owner: l.owner,
+            };
+            if !walk(&l.path, &[], gone, None, &mut defaults, &mut report).whole {
+                report.stale.push(l.path.clone());
+                kept.left.push(l.clone());
+            }
+        }
         if old_uid {
             let gone = Who {
                 run: before.uid,
@@ -984,6 +1012,11 @@ pub fn sync(
             for g in &before.grants {
                 if !walk(&g.path, &[], gone, None, &mut defaults, &mut report).whole {
                     report.stale.push(g.path.clone());
+                    kept.left.push(Left {
+                        path: g.path.clone(),
+                        run: gone.run,
+                        owner: gone.owner,
+                    });
                 }
             }
             for d in &before.traverse {
@@ -1114,11 +1147,51 @@ pub fn behind(file: &Path, want: &[Granted], who: Who, retry: bool) -> bool {
             r.uid != who.run
                 || r.owner != who.owner
                 || r.grants != want
-                || (retry && !r.failed.is_empty())
+                || (retry && !(r.failed.is_empty() && r.left.is_empty()))
         }
         Ok(None) => !want.is_empty(),
         Err(_) => true,
     }
+}
+
+/// The accounts the record in `file` names entries for, and whether it
+/// keeps entries of earlier ones ([`Record::left`]): `None` without a
+/// record, with one that names none, and with one that cannot be read,
+/// where the node refuses every command of `nerve-run` until it can
+/// ([`sync`]).
+pub fn recorded(file: &Path) -> Option<(Who, bool)> {
+    match read_record(file) {
+        Ok(Some(r)) if !(r.grants.is_empty() && r.traverse.is_empty() && r.left.is_empty()) => {
+            Some((
+                Who {
+                    run: r.uid,
+                    owner: r.owner,
+                },
+                !r.left.is_empty(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Marks every grant of the record in `file` as failed, so that the node
+/// walks each again at its next sync ([`behind`] with `retry`, as at its
+/// start): after [`remove_all`] stopped half way, the record says entries
+/// are on that the walk took off.
+pub fn retry_all(file: &Path) -> Result<(), String> {
+    let Some(mut r) = read_record(file)? else {
+        return Ok(());
+    };
+    r.failed = r.grants.iter().map(|g| g.path.clone()).collect();
+    write_record(file, &r)
+}
+
+/// The access entry of `uid` on `p`, for the tests of other modules.
+#[cfg(test)]
+pub(crate) fn access_entry(p: &Path, uid: u32) -> Option<u16> {
+    get(&c_path(p).unwrap(), ACCESS)
+        .unwrap()
+        .and_then(|a| a.user(uid))
 }
 
 /// Takes every entry the record in `file` names off again: `uninstall`, as
@@ -1126,6 +1199,8 @@ pub fn behind(file: &Path, want: &[Granted], who: Who, retry: bool) -> bool {
 /// there, which are its own, and those go to the owner, as `heir` names its
 /// uid and gid for the record's owner: its uid is freed next, and the next
 /// account to get it must not have them. The record goes once all are off.
+/// `install` does the same before the owner changes (crate::service), so
+/// that no entry stays that the new owner could not take off.
 pub fn remove_all(file: &Path, heir: &dyn Fn(u32) -> (u32, u32)) -> Report {
     let mut report = Report::default();
     let r = match read_record(file) {
@@ -1140,7 +1215,7 @@ pub fn remove_all(file: &Path, heir: &dyn Fn(u32) -> (u32, u32)) -> Report {
         run: r.uid,
         owner: r.owner,
     };
-    let heir = heir(r.owner);
+    let to_owner = heir(r.owner);
     let mut defaults = Defaults::of(&r);
     // The outer grants first: a grant inside one that came off whole, and
     // whose walk saw all of it, is done even where a link on its way keeps
@@ -1150,7 +1225,14 @@ pub fn remove_all(file: &Path, heir: &dyn Fn(u32) -> (u32, u32)) -> Report {
     let mut done: Vec<&Path> = Vec::new();
     for g in grants {
         let errors = report.errors.len();
-        let w = walk(&g.path, &[], who, Some(heir), &mut defaults, &mut report);
+        let w = walk(
+            &g.path,
+            &[],
+            who,
+            Some(to_owner),
+            &mut defaults,
+            &mut report,
+        );
         if w.whole {
             if w.seen_all {
                 done.push(&g.path);
@@ -1167,6 +1249,16 @@ pub fn remove_all(file: &Path, heir: &dyn Fn(u32) -> (u32, u32)) -> Report {
         {
             report.errors.push(failed(d, &e));
             report.stale.push(d.clone());
+        }
+    }
+    for l in &r.left {
+        let gone = Who {
+            run: l.run,
+            owner: l.owner,
+        };
+        let to = heir(l.owner);
+        if !walk(&l.path, &[], gone, Some(to), &mut defaults, &mut report).whole {
+            report.stale.push(l.path.clone());
         }
     }
     if report.stale.is_empty() {
@@ -2167,5 +2259,64 @@ mod tests {
         let r = without_passing(|| sync(&file, &want[..1], who(), &none));
         assert!(r.stale.is_empty() && r.errors.is_empty(), "{r:?}");
         assert_eq!(rights(&mine.join("f"), RUN), Some(R));
+    }
+
+    /// After the owner changed, the entries of the earlier owner's grants
+    /// that could not come off stay in the record ([`Record::left`]): every
+    /// sync walks them again and refuses nerve-run's commands while one is
+    /// left, and `uninstall` takes them off.
+    #[test]
+    fn what_an_earlier_owner_left_stays_until_it_comes_off() {
+        if uid() == 0 {
+            return;
+        }
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let sub = work.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("f"), "f").unwrap();
+        let file = root.join("acl.json");
+        let want = [grant(&work, "rw")];
+        let r = sync(&file, &want, who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert_eq!(rights(&sub.join("f"), RUN), Some(R | W));
+        struct Reopen<'a>(&'a Path);
+        impl Drop for Reopen<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _reopen = Reopen(&sub);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Another owner now, with no grants.
+        let new = Who {
+            run: RUN,
+            owner: uid() + 1,
+        };
+        let r = sync(&file, &[], new, &none);
+        assert!(r.refusal().is_some(), "{r:?}");
+        assert_eq!(recorded(&file).map(|(_, left)| left), Some(true));
+        assert!(behind(&file, &[], new, true));
+        // Still there at the next sync.
+        let r = sync(&file, &[], new, &none);
+        assert!(r.stale.contains(&work), "{r:?}");
+        // Open again, it comes off, and nothing is left.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = sync(&file, &[], new, &none);
+        assert!(r.stale.is_empty() && r.errors.is_empty(), "{r:?}");
+        assert_eq!(rights(&sub.join("f"), RUN), None);
+        assert_eq!(recorded(&file), None);
+        // uninstall takes what is left off too.
+        let r = sync(&file, &want, who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = sync(&file, &[], new, &none);
+        assert!(r.refusal().is_some(), "{r:?}");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = remove_all(&file, &|_| (uid(), gid()));
+        assert!(r.stale.is_empty(), "{r:?}");
+        assert_eq!(rights(&sub.join("f"), RUN), None);
+        assert!(!file.exists());
     }
 }

@@ -35,6 +35,9 @@ impl Drop for Secret {
     }
 }
 
+/// Why a center may not turn the switch on while root is the owner.
+pub const ROOT_SUDO: &str = "root is the owner of this node, and sudo checks no password of root's, so no center turns sudo on here; root does, with `nerve-node sudo on` on this machine";
+
 /// What stands in for the password where it would have appeared.
 pub const REDACTED: &str = "[redacted]";
 
@@ -125,6 +128,14 @@ impl Shared {
                     "this node does not let this center change its settings".into(),
                 ));
             }
+        }
+        // `sudo -v` as root takes any password, so with root as the owner
+        // a password shows nothing: only root itself turns the switch on,
+        // at the node (`nerve-node sudo on`), never a center.
+        if let Writer::Center(_) = by
+            && crate::owner::is_root(self.owner_name(&self.config()).as_deref())
+        {
+            return Err(SetError::Forbidden(ROOT_SUDO.into()));
         }
         if password.expose().is_empty() || password.expose().contains('\n') {
             return Err(SetError::Invalid(

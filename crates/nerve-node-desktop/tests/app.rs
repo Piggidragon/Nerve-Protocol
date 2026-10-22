@@ -203,6 +203,23 @@ fn the_app_drives_the_cli_end_to_end() {
         "{}",
         store.get_toast()
     );
+    assert!(
+        !store.get_toast().contains("run as root"),
+        "{}",
+        store.get_toast()
+    );
+    // Where root is the owner, giving the grant says that the center can
+    // make itself root (#151).
+    window.global::<Perm>().set_owner_is_root(true);
+    store.invoke_center_grant("home".into(), true);
+    assert!(
+        store
+            .get_toast()
+            .contains("Root is the owner of this node, so home can set its own mode to user, and its commands then run as root."),
+        "{}",
+        store.get_toast()
+    );
+    window.global::<Perm>().set_owner_is_root(false);
     assert!(!store.get_restart_due());
     // With the service running, the app restarts it for such a change, a
     // moment later. The service here is none, so the restart fails, and
@@ -558,6 +575,16 @@ fn the_app_drives_the_cli_end_to_end() {
             assert_eq!(perm.get_built_in(), "");
         }
     }
+    // Root as the owner (#151): the page knows, so its texts say root.
+    let mut st = serde_json::json!({"daemon": "running", "owner": "root", "owner_is_root": true,
+        "centers": [{"name": "home", "mode": "user", "account": "root"}]});
+    ctl.show_status(Ok(st.clone()));
+    assert!(perm.get_owner_is_root());
+    assert_eq!(perm.get_account(), "root");
+    st["owner"] = serde_json::json!("alice");
+    st["owner_is_root"] = serde_json::json!(false);
+    ctl.show_status(Ok(st));
+    assert!(!perm.get_owner_is_root());
     ctl.refresh_status();
     until(&ctl, "the node's own status", || {
         perm.get_landlock() && perm.get_home_warning() == "" && perm.get_stale() == ""

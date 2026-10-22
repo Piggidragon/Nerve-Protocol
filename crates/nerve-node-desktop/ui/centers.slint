@@ -3,7 +3,7 @@
 
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
 import { Load, CenterRow } from "data.slint";
-import { Store } from "store.slint";
+import { Store, Perm } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, IconTile, Banner, Loading, PageHeader, PageFrame,
     EmptyState, Divider, Switch, Reveal, Fit,
@@ -160,7 +160,9 @@ component CenterCard inherits Card {
                         font-weight: Type.medium;
                     }
                     Text {
-                        text: root.item.settings-write ? "Up to user mode and sudo." : "Only you change what it may do.";
+                        text: !root.item.settings-write ? "Only you change what it may do."
+                            : Perm.owner-is-root ? "Up to user mode, which runs as root on this node."
+                            : "Up to user mode and sudo.";
                         color: Theme.text-muted;
                         font-size: Type.caption;
                         wrap: word-wrap;

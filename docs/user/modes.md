@@ -4,9 +4,9 @@ Every pairing has a mode. It sets how much that center may do on the machine.
 
 | Mode | What is allowed | Commands on the installed Linux node |
 |---|---|---|
-| `allowlist` | Only what an [allow rule](rules.md) names | As `nerve-run`, held to the folders you grant; or as you, if you say so |
+| `allowlist` | Only what an [allow rule](rules.md) names | As `nerve-run`, held to the folders you grant; or as you, if you say so (as root where [root is the owner](service.md#root-as-the-owner)) |
 | `folder` (default for a new pairing) | Full access inside the folders you grant, by their rights | As `nerve-run`, held to those folders |
-| `user` | Everything you could do yourself | As you, not confined |
+| `user` | Everything you could do yourself | As you, not confined (as root where [root is the owner](service.md#root-as-the-owner)) |
 
 From most to least locked down: `allowlist`, `folder`, `user`. On the node
 [installed as a service](service.md) on Linux, `folder` and `allowlist` mode
@@ -672,7 +672,7 @@ confinement. A command can do what you can do, including changing the node's
 own state. Use it only for a center you would trust with a shell.
 
 On a node [installed as a service](service.md) the node runs as its own
-user, `nerve`, and `user` mode commands run as you, the owner, the account
+user, `nerve`, and, unless root is the owner (below), `user` mode commands run as you, the owner, the account
 that ran `install`. They can do what you can do. They cannot read the node's
 keys, which are `nerve`'s, but they can change the node's settings as you
 can without a password, through the owner socket (on Windows the owners'
@@ -682,6 +682,17 @@ and the node's [guard](rules.md#the-guard-against-changing-the-node) catch
 such a command when an agent tries it by mistake, and the node refuses a
 process it sees below one of its commands, but none of that is a boundary.
 The same holds for `allowlist` mode with `--as-owner`.
+
+Where root is the owner (an install that root ran itself and confirmed,
+[service](service.md#root-as-the-owner)), `user` mode and `allowlist` mode
+with `--as-owner` run commands as root. They can do everything on the
+machine, read the node's keys and change the node itself. Nothing in Nerve
+holds them back: the guard, the action checker and the refusal of the owner
+socket only catch mistakes, and root needs none of them to get in. It is
+your choice, as root, when you answer yes at `install`. `folder` mode and
+`allowlist` mode without `--as-owner` still run as `nerve-run`. A center with
+the [settings grant](settings-grant.md) can switch itself to `user` mode,
+and so to root.
 
 ### Paths a command builds at run time
 

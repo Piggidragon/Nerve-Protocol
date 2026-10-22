@@ -1259,8 +1259,8 @@ mod tests {
             for (i, row) in t.iter_mut().enumerate() {
                 row[0] = i;
             }
-            for j in 0..=b.len() {
-                t[0][j] = j;
+            for (j, cell) in t[0].iter_mut().enumerate() {
+                *cell = j;
             }
             for i in 1..=a.len() {
                 for j in 1..=b.len() {

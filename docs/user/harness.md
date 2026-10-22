@@ -39,6 +39,12 @@ in to the [web UI](web-ui.md).
 
 ## The tools the model gets
 
+What the model may use follows what the nodes allow. A new pairing is in
+`folder` mode, so `list` shows the file capabilities at once, and `exec.run`
+where the machine can confine a command; a call reaches only the folders you
+give the machine (on the installed Linux node also `nerve-run`'s home, `/tmp`
+and `/var/tmp`).
+
 | Tool | Does |
 |---|---|
 | `list` | Shows the paired machines and what they offer, in three levels (below). It only reads |

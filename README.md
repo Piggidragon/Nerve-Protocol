@@ -70,10 +70,11 @@ Get the programs from
    nerve-node run
    ```
 
-3. A new pairing allows nothing. Allow what you want:
+3. A new pairing is in `folder` mode and reaches no folder of yours. Give it
+   one:
 
    ```sh
-   nerve-node rule add allow 'git status'
+   nerve-node folder add ~/project +r +w +x
    ```
 
 ## The action checker

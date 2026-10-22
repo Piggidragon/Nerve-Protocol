@@ -39,7 +39,7 @@ name = "laptop"             # shown to centers; the host name by default
 shell = "/bin/bash"         # runs commands; the platform shell by default
 allow_root = false          # let the node run as root, or elevated as administrator on Windows
 sudo_path = "/usr/bin/sudo" # optional
-user = "alice"              # installed node: the account commands and sudo run as
+user = "alice"              # installed node on Windows: the account commands and sudo run as
 secret_storage = "file"     # file | keyring: where the node keeps its keys
 
 [limits]
@@ -157,7 +157,9 @@ system keyring ([below](#where-the-node-keeps-its-keys)). A command that
 runs as you (in `user` mode) can reach it in either place. The check protects against
 `folder` mode commands and against centers, not against `user` mode. On a
 node installed as a service, commands run as another account
-([service](service.md#the-accounts-commands-run-as)) and cannot reach it.
+([service](service.md#the-accounts-commands-run-as)) and cannot reach it,
+except where [root is the owner](service.md#root-as-the-owner): there `user`
+mode commands run as root.
 
 ### An older file put back
 

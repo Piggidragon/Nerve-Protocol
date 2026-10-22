@@ -202,8 +202,9 @@ node lab-pc: the centers home
 tunnel lab-pc from 10.0.0.7:51544 to center home for 2 h 5 min
 ```
 
-On Linux `nerve-node status` shows the relay in one line; on Windows
-`status` does not ask the node, `relay ls` does. Every tunnel is one entry
+`nerve-node status` shows the relay in one line and `relay ls` names the
+tunnels; on Windows both ask the node over its
+[control pipe](platforms.md#the-control-pipe). Every tunnel is one entry
 in the [audit log](audit.md) when it ends: the node, its address, the
 center, when it started and ended, why it ended and how much it carried;
 never a token. The node's [log](logs.md) also has a line for every tunnel

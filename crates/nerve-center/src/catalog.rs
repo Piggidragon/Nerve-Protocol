@@ -556,6 +556,23 @@ mod tests {
         );
     }
 
+    /// Text moved from the end of one part to the start of the next is
+    /// another unit: the hash takes each part with its length.
+    #[test]
+    fn a_units_hash_tells_where_one_part_ends() {
+        let unit = |description: &str, params: Value| Unit {
+            name: "fs.read".into(),
+            cap: "fs".into(),
+            action: "read".into(),
+            effect: Effect::Read,
+            description: description.into(),
+            params,
+            result: Value::Null,
+            provider: "node".into(),
+        };
+        assert_ne!(unit("x1", json!(2)).hash(), unit("x", json!(12)).hash());
+    }
+
     /// The units of a capability without summaries of their own share its
     /// summary, cut: a node's long text is kept once, not once per unit.
     #[test]

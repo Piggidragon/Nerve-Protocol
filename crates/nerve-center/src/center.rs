@@ -1977,8 +1977,9 @@ impl Center {
                     let link = links.get(&n.id).filter(|l| l.is_live());
                     let d = n.descriptor.as_ref();
                     // Whether the agent is offered anything of a capability:
-                    // one whose every action was left out is listed for the
-                    // owner, but the `nodes` tool does not name it.
+                    // one whose every action was left out, or that the node's
+                    // owner turned off, is listed for the owner, but the
+                    // `nodes` tool does not name it.
                     let offered: BTreeSet<&str> =
                         n.catalog.units.iter().map(|u| u.cap.as_str()).collect();
                     let caps: Vec<Value> = d
@@ -1986,7 +1987,7 @@ impl Center {
                             d.capabilities
                                 .iter()
                                 .map(|c| json!({"id": c.id, "profile": c.profile, "exposure": c.exposure, "summary": c.summary,
-                                                "offered": offered.contains(c.id.as_str())}))
+                                                "offered": c.exposure != Exposure::Off && offered.contains(c.id.as_str())}))
                                 .collect()
                         })
                         .unwrap_or_default();

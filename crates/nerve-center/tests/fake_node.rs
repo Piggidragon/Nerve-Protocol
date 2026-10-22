@@ -585,6 +585,39 @@ async fn only_the_capability_with_a_bad_name_is_left_out() {
     r.stop().await;
 }
 
+/// A capability the node's owner turned off is no tool, so the agent's
+/// `nodes` tool does not name it either; the overview lists it as not offered.
+#[tokio::test]
+async fn a_capability_that_is_off_is_not_named_to_the_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(&r, &key).await;
+    let mut d = descriptor(&key, "box-1");
+    d["capabilities"][0]["exposure"] = json!("off");
+    let _seen = serve(ws, d);
+    let c = r.center.clone();
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    let names: Vec<String> = c.tools().into_iter().map(|t| t.name).collect();
+    assert_eq!(names, ["exec_run"]);
+    let ov = overview(&r).await;
+    assert_eq!(ov["nodes"][0]["capabilities"][0]["id"], "fs");
+    assert_eq!(ov["nodes"][0]["capabilities"][0]["offered"], false);
+    assert_eq!(ov["nodes"][0]["capabilities"][1]["offered"], true);
+    let e = Engine::new(&r.center, "test");
+    let listed = rpc(
+        &e,
+        1,
+        "tools/call",
+        json!({"name": "nodes", "arguments": {}}),
+    )
+    .await;
+    let listed = listed["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(listed.contains("offers exec\n"), "{listed}");
+    r.stop().await;
+}
+
 /// An action whose schema is outside the subset is no tool, and the
 /// overview names it with the reason; its capability's other actions stay.
 #[tokio::test]

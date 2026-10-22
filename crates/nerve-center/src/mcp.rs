@@ -316,8 +316,8 @@ fn nodes_text(center: &Center) -> String {
             .as_array()
             .into_iter()
             .flatten()
-            // Only what the agent has a tool of: a capability whose every
-            // action the center left out is no use to it.
+            // Only what the agent has a tool of: a capability that is off,
+            // or whose every action the center left out, is no use to it.
             .filter(|c| c["offered"] == true)
             .filter_map(|c| c["id"].as_str())
             .filter(|c| !tools::RESERVED_CAPS.contains(c))

@@ -41,16 +41,57 @@ node itself: a command that runs `nerve-node` or `nerve-node-desktop` (at
 the start of a command, after `sudo`, or by a path, `.exe` too), a command
 line that names the node's socket or pipes or its config and state folders
 (`/etc/nerve`, `/var/lib/nerve`, `~/.config/nerve`, `~/.local/state/nerve`,
-`%ProgramData%\Nerve`), and a write into those folders. The name alone is
-not refused: `cargo build -p nerve-node` and `journalctl -u nerve-node` run.
-`rule ls deny` shows them; remove any you do not want.
+`%ProgramData%\Nerve`), a write into those folders, and a command that
+stops, restarts, disables or kills the node's service or process by its name, as the node's own `service stop` would.
+The name alone is not refused: `cargo build -p nerve-node` and
+`journalctl -u nerve-node` run. `rule ls deny` shows them; remove any you do
+not want.
+
+| | Refused | Still runs |
+|---|---|---|
+| Linux | `systemctl stop`, `restart`, `try-restart`, `reload-or-restart`, `disable`, `kill` or `mask` on `nerve-node` (or `nerve-node.service`); `service nerve-node stop`, `restart`, `try-restart`, `force-reload` or `condrestart`; `pkill` or `killall` on `nerve-node` or `nerve-node-desktop`, with flags such as `-9`, `-f` or `-x`. With or without `sudo`, a path to the program, or flags such as `--now` | `systemctl status`, `is-active`, `show`, `cat` on it, `service nerve-node status`, `journalctl -u nerve-node`, `pgrep`, `ps` |
+| Windows | `sc stop`, `config` or `delete`; `net stop`; `Stop-Service`, `Restart-Service`, `Set-Service` or `Remove-Service`; `Stop-Process -Name`; `taskkill` with `nerve-node.exe` or `nerve-node-desktop.exe`; `Get-Service` or `Get-Process` on the node piped into one of the cmdlets | `sc query`, `sc qc`, `Get-Service nerve-node`, `Get-Process nerve-node` |
+
+The Windows commands match in any case (`STOP-SERVICE`, `NET STOP`,
+`sc stop Nerve-Node`, `taskkill /IM NERVE-NODE.EXE`), as Windows reads them.
+The rules see a line break or a tab after a name or before a command as they
+see a space or `;`, so the second line of a script counts, with an indent of
+up to 16 characters. A command also starts after `{` and after the shell
+words `then`, `do`, `else`, `!`, `time` and `nohup`, so
+`if x; then sudo systemctl restart nerve-node; fi`, `{ Stop-Service nerve-node }`
+and `try { Restart-Service nerve-node } catch { }` are refused. That holds for the rules that name the node's programs, sockets and folders
+too. A rule with such a character is listed with `\t`, `\r` and `\n` written
+out, so `rule ls` and the app's rule lists keep one line a rule, and `rule rm`
+and `rule edit` take the entry as it is listed there (the new entry of `rule
+edit` too). `config add` and the app's add field take the character itself
+(as `rule guard` puts the guard's rules): the listed text of a guard rule or
+of a rule already on that list is refused there, since pasted so its `\n`
+would be the letter, not the line break. Any other text is a rule as it
+stands, a Windows path such as `C:\tools\x.exe` too.
+
+The rules match the whole line, so some lines are refused that only mention
+the node: a line that stops some other service and names `nerve-node` later,
+a `pkill -f` whose pattern holds the name (`pkill -f "cargo run -p
+nerve-node"`), and a quoted text with `;`, `|`, `(` or `{` in front of a
+command's words (`git commit -m "Docs (Stop-Service nerve-node)"`). A line
+break inside quotes starts a command like any other, so a line of a commit
+message or a here-document that begins with `nerve-node ...` or
+`systemctl stop nerve-node` is refused too. A quoted mention on one line is
+otherwise left alone: `sudo` counts only at a command's start (also for the
+rule on the program itself, where it may be followed by one of its flags,
+`-u root` included), so `git commit -m "run sudo systemctl stop nerve-node"`
+runs. The rules do not read `kill` with a process id (`kill $(pidof
+nerve-node)`), `pkill nerve` as a part of the name, or `sudo` behind another
+program (`env X=1 sudo ...`, `timeout 30 sudo ...`).
 
 ```sh
 nerve-node rule guard --center lab   # puts back the ones a pairing lacks
 ```
 
 A pairing that lacks some of them (you removed them) gets them back with
-`rule guard`, and the desktop app offers it on **Permissions**.
+`rule guard`, and the desktop app offers it on **Permissions**. It also takes
+off the older text of a rule that the guard has changed, and puts the new one
+in its place.
 
 The guard catches an agent's mistakes, such as an agent that tries to give
 itself more rights. It does not stop a command written to get around it (a

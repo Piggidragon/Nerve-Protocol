@@ -211,6 +211,13 @@ impl Engine {
     /// taint and counts in no statistics. The session notes the units it
     /// gave the details of, which `execute` then accepts.
     fn list_call(&self, args: &Map<String, Value>) -> Value {
+        if let Some(e) = unknown_argument(
+            args,
+            "list takes node and capability",
+            &["node", "capability"],
+        ) {
+            return e;
+        }
         let node = match args.get("node") {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => Some(s.as_str()),
@@ -237,8 +244,14 @@ impl Engine {
                         let answer = listing::details(&offer, &asked);
                         // The offer is a copy: the state is not held while
                         // the session's map is locked (see `Inner::store`).
+                        // Only the units the answer gives whole count as
+                        // listed.
                         let sess = self.live_session();
-                        for u in offer.units.iter().filter(|u| asked.contains(&u.name)) {
+                        for u in offer
+                            .units
+                            .iter()
+                            .filter(|u| answer.listed.contains(&u.name))
+                        {
                             sess.listed(&offer.node.id, &u.name, u.hash());
                         }
                         answer
@@ -255,6 +268,16 @@ impl Engine {
     /// Each refusal before the call says what to do instead, and nothing of
     /// it reaches the node.
     async fn execute(&self, mut args: Map<String, Value>) -> Value {
+        // A model that put the capability's arguments beside `args`, or
+        // misspelt it, learns so: run without them, the call could do
+        // something else than it believes.
+        if let Some(e) = unknown_argument(
+            &args,
+            "execute takes node, capability and args, and the capability's own arguments go in args",
+            &["node", "capability", "args"],
+        ) {
+            return e;
+        }
         let node = match args.remove("node") {
             Some(Value::String(s)) => s,
             _ => return invalid("node: expected a node's name, a string (required)"),
@@ -346,10 +369,17 @@ impl Engine {
                     &util::clip(&body, RESULT_TEXT),
                 );
                 // `structuredContent` carries the node's data in the same
-                // marking as the text, for a harness that shows only it.
+                // marking as the text, for a harness that shows only it;
+                // a result too long for the text is left to the cut text,
+                // so no harness hands the model more than that.
                 let mut r = text_result(&text, false);
-                r["structuredContent"] =
-                    listing::envelope(&listing::source(&route.node_name, &route.node_id), false, v);
+                if body.len() <= RESULT_TEXT && structured_fits(&v) {
+                    r["structuredContent"] = listing::envelope(
+                        &listing::source(&route.node_name, &route.node_id),
+                        false,
+                        v,
+                    );
+                }
                 r
             }
             Err(CallError::Rpc(e)) => {
@@ -385,10 +415,13 @@ pub fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "node": {"type": "string", "description": "A node's name (or id) from list(). Leave it out to list the nodes."},
+                    // An array only, not a choice of types: some providers
+                    // refuse a type list in a tool's schema, and with it every
+                    // call of the harness. A bare name is still accepted.
                     "capability": {
-                        "type": ["string", "array"],
+                        "type": "array",
                         "items": {"type": "string"},
-                        "description": "With node: one capability's name, or a list of names, to get their details.",
+                        "description": "With node: the names of the capabilities to get the details of, like [\"fs.read\"].",
                     },
                 },
                 "additionalProperties": false,
@@ -436,6 +469,11 @@ fn capability_names(v: Option<&Value>) -> Result<Option<Vec<String>>, String> {
                 if !names.iter().any(|n| n == s) {
                     names.push(s.to_string());
                 }
+                // Refused as soon as there are too many, before the rest
+                // of a long list is compared with the names kept.
+                if names.len() > listing::DETAILS_MAX {
+                    break;
+                }
             }
             names
         }
@@ -478,9 +516,25 @@ fn invalid(what: &str) -> Value {
     text_result(&format!("error invalid_args: {what}"), true)
 }
 
+/// The `error invalid_args` for an argument the tool does not take, if
+/// there is one: `takes` says what it does take.
+fn unknown_argument(args: &Map<String, Value>, takes: &str, known: &[&str]) -> Option<Value> {
+    let k = args.keys().find(|k| !known.contains(&k.as_str()))?;
+    Some(invalid(&format!("{:?}: {takes}", util::clip(k, 64))))
+}
+
+/// Whether `v` goes in `structuredContent`: at most what a text is cut at.
+fn structured_fits(v: &Value) -> bool {
+    serde_json::to_string(v).is_ok_and(|s| s.len() <= RESULT_TEXT)
+}
+
+/// A `list` answer; its data goes in `structuredContent` when it fits,
+/// else the cut text stands alone (as for a long `execute` result).
 fn answer_result(a: Answer) -> Value {
     let mut r = text_result(&a.text, a.is_error);
-    r["structuredContent"] = a.data;
+    if structured_fits(&a.data) {
+        r["structuredContent"] = a.data;
+    }
     r
 }
 
@@ -888,6 +942,9 @@ mod tests {
                     p.get("properties").is_none() && p.get("oneOf").is_none(),
                     "{p}"
                 );
+                // One type each: some providers refuse a list of types, and
+                // with it every call of the harness.
+                assert!(p["type"].is_string(), "{p}");
             }
             // One example call, whose arguments are the tool's own.
             let desc = t["description"].as_str().unwrap();
@@ -1030,11 +1087,26 @@ mod tests {
                 json!({"node": "nope"}),
                 "error unknown_node: there is no node \"nope\"; the nodes are box-1.",
             ),
+            (
+                json!({"node": "box-1", "cap": "fs.read"}),
+                "error invalid_args: \"cap\": list takes node and capability",
+            ),
         ] {
             let r = call(&e, "list", args.clone()).await;
             assert_eq!(r["isError"], true, "{args}");
             assert_eq!(text(&r), want, "{args}");
         }
+        // A long list is refused once it has too many names, not after
+        // each was compared with all the others.
+        let huge: Vec<String> = (0..50_000).map(|i| format!("c{i}.a")).collect();
+        let started = std::time::Instant::now();
+        let r = call(&e, "list", json!({"node": "box-1", "capability": huge})).await;
+        assert_eq!(
+            text(&r),
+            "error invalid_args: capability: at most 32 names in one call"
+        );
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 
     /// `list` only reads: the session makes no call, gets no taint, and the
@@ -1102,6 +1174,16 @@ mod tests {
             (
                 json!({"capability": "fs.read", "args": {}}),
                 "error invalid_args: node: expected a node's name, a string (required)",
+            ),
+            // An argument beside `args` is refused, not dropped: the call
+            // would run without it.
+            (
+                json!({"node": "box-1", "capability": "fs.read", "args": {"path": "/"}, "max": 10}),
+                "error invalid_args: \"max\": execute takes node, capability and args, and the capability's own arguments go in args",
+            ),
+            (
+                json!({"node": "box-1", "capability": "fs.read", "arguments": {"path": "/"}}),
+                "error invalid_args: \"arguments\": execute takes node, capability and args, and the capability's own arguments go in args",
             ),
             // Past every check it is a call, and this node is offline.
             (
@@ -1302,6 +1384,100 @@ mod tests {
     /// session lists and new descriptors, all at once, do not deadlock: the
     /// session's map of shown units is never locked while the state is held,
     /// and the state never while the map is (issue #150).
+    /// Details that would take an answer past what one holds are named
+    /// for another call, never cut off, and `execute` does not accept them
+    /// until that call gave them.
+    #[tokio::test]
+    async fn only_details_given_whole_count_as_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path());
+        with_box(&c);
+        let big = json!({"type": "object", "properties": {"path": {"type": "string",
+            "description": "d".repeat(12_000)}}, "required": ["path"]});
+        let actions: Vec<(String, Effect, Value)> = (0..listing::DETAILS_MAX)
+            .map(|i| (format!("a{i:02}"), Effect::Read, big.clone()))
+            .collect();
+        let refs: Vec<(&str, Effect, Value)> = actions
+            .iter()
+            .map(|(n, e, p)| (n.as_str(), *e, p.clone()))
+            .collect();
+        let mut d = box_desc();
+        d.capabilities.push(cap("big", "big", &refs));
+        describe(&c, d);
+        let e = Engine::new(&c, "test");
+        let names: Vec<String> = actions.iter().map(|(n, ..)| format!("big.{n}")).collect();
+        let r = call(&e, "list", json!({"node": "box-1", "capability": names})).await;
+        assert_eq!(r["isError"], false, "{r}");
+        let t = text(&r);
+        assert!(t.len() <= listing::TEXT_MAX, "{}", t.len());
+        assert!(!t.contains('…'), "nothing is cut");
+        let data = &r["structuredContent"]["result"];
+        let given: Vec<&str> = data["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        let later: Vec<&str> = data["later"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert!(given.len() > 1 && !later.is_empty(), "{given:?} {later:?}");
+        assert_eq!(given.len() + later.len(), names.len());
+        for n in &given {
+            assert!(t.contains(&format!("capability: {n}\n")), "{n}");
+        }
+        assert!(
+            t.contains(&format!(
+                "Not detailed, this answer is full: {:?}",
+                later[0]
+            )),
+            "{t}"
+        );
+        let run = |unit: &str| json!({"node": "box-1", "capability": unit, "args": {"path": "/x"}});
+        let r = call(&e, "execute", run(given[0])).await;
+        assert_eq!(text(&r), CALLED);
+        let r = call(&e, "execute", run(later[0])).await;
+        assert!(text(&r).starts_with("error list_first: "), "{r}");
+        call(&e, "list", json!({"node": "box-1", "capability": later[0]})).await;
+        let r = call(&e, "execute", run(later[0])).await;
+        assert_eq!(text(&r), CALLED);
+    }
+
+    /// `structuredContent` holds no more than the text: an answer whose data
+    /// is longer is the cut text alone.
+    #[tokio::test]
+    async fn a_long_listing_has_no_structured_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path());
+        with_box(&c);
+        let actions: Vec<(String, Effect, Value)> = (0..2000)
+            .map(|i| (format!("a{i:04}"), Effect::Read, path()))
+            .collect();
+        let refs: Vec<(&str, Effect, Value)> = actions
+            .iter()
+            .map(|(n, e, p)| (n.as_str(), *e, p.clone()))
+            .collect();
+        let mut many = cap("many", "many", &refs);
+        for a in many.actions.values_mut() {
+            a.summary = "s".repeat(190);
+        }
+        let mut d = box_desc();
+        d.capabilities.push(many);
+        describe(&c, d);
+        let e = Engine::new(&c, "test");
+        let r = call(&e, "list", json!({"node": "box-1"})).await;
+        assert_eq!(r["isError"], false, "{r}");
+        assert!(r.get("structuredContent").is_none());
+        assert!(text(&r).ends_with("…\n[end of device content]"));
+        // A short one keeps it.
+        describe(&c, box_desc());
+        let r = call(&e, "list", json!({"node": "box-1"})).await;
+        assert!(r["structuredContent"]["result"].is_object(), "{r}");
+    }
+
     #[test]
     fn list_and_execute_with_the_lists_and_new_descriptors_do_not_deadlock() {
         let dir = tempfile::tempdir().unwrap();

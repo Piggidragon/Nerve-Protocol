@@ -10,6 +10,8 @@
 //! The catalog is derived from the descriptor and never stored: it is built
 //! again whenever the descriptor changes and after the state file is read.
 
+use std::sync::Arc;
+
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -17,7 +19,13 @@ use nerve_proto::descriptor::valid_member_name;
 use nerve_proto::schema::{self, Role};
 use nerve_proto::{Descriptor, Effect};
 
+use crate::listing::one_line;
 use crate::tools::RESERVED_CAPS;
+use crate::util;
+
+/// The longest description a unit keeps, in bytes. A model needs a few
+/// sentences, and a node's long text is not copied into every unit.
+pub const DESCRIPTION_MAX: usize = 2048;
 
 /// One action a node offers, with schemas that passed the subset check.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,10 +35,13 @@ pub struct Unit {
     pub cap: String,
     pub action: String,
     pub effect: Effect,
-    /// The action's summary.
-    pub summary: String,
-    /// The capability's summary, which `list` puts before the action's.
-    pub cap_summary: String,
+    /// What `list` tells of it: the action's own summary, else its
+    /// capability's, on one line and cut at [`DESCRIPTION_MAX`]. Not both: a
+    /// capability's summary speaks of all its actions ("stat, list, read …
+    /// and write"), and a model shown it beside one action took that action
+    /// to do them all. The units without a summary of their own share their
+    /// capability's text.
+    pub description: Arc<str>,
     /// Always an object schema: a descriptor without params takes any
     /// arguments, as the node does.
     pub params: Value,
@@ -42,7 +53,7 @@ pub struct Unit {
 
 impl Unit {
     /// What the model was told of this unit, as one number: SHA-256 over
-    /// its name, effect, summaries, params and result, cut to 53 bits so it
+    /// its name, effect, description, params and result, cut to 53 bits so it
     /// is exact as a JSON number. `execute` compares it with the one `list`
     /// gave the session: a unit that changed must be listed again, while a
     /// rule, mode or `until` change on the node leaves it alone.
@@ -54,8 +65,7 @@ impl Unit {
         for part in [
             self.name.clone(),
             self.effect.as_str().to_string(),
-            self.cap_summary.clone(),
-            self.summary.clone(),
+            self.description.to_string(),
             self.params.to_string(),
             self.result.to_string(),
         ] {
@@ -98,6 +108,7 @@ impl Catalog {
             // every schema the node publishes keeps to the subset; one that
             // does not leaves out the whole capability.
             let whole = cap_outside_subset(cap);
+            let cap_description = described(&cap.summary);
             if cap.actions.is_empty()
                 && let Some(reason) = whole.clone()
             {
@@ -126,8 +137,10 @@ impl Catalog {
                     cap: cap.id.clone(),
                     action: action.clone(),
                     effect: def.effect,
-                    summary: def.summary.clone(),
-                    cap_summary: cap.summary.clone(),
+                    description: match described(&def.summary) {
+                        own if own.is_empty() => cap_description.clone(),
+                        own => own,
+                    },
                     params,
                     result: def.result.clone(),
                     provider: cap.provider.clone(),
@@ -158,6 +171,11 @@ impl Catalog {
     pub fn offers(&self, cap: &str, action: &str) -> bool {
         self.unit(&format!("{cap}.{action}")).is_some()
     }
+}
+
+/// `summary` as a unit's description: one line, cut.
+fn described(summary: &str) -> Arc<str> {
+    util::clip(&one_line(summary), DESCRIPTION_MAX).into()
 }
 
 /// Names hold letters, digits, `-` and `_`: `.` joins a unit's name, so a
@@ -254,8 +272,7 @@ mod tests {
                 cap: "fs".into(),
                 action: "read".into(),
                 effect: Effect::Read,
-                summary: "read it".into(),
-                cap_summary: "fs summary".into(),
+                description: "read it".into(),
                 params: path(),
                 result: Value::Null,
                 provider: "node".into(),
@@ -329,17 +346,26 @@ mod tests {
         assert!(h < 1 << 53, "{h}");
         assert_eq!(hash(&d), h, "the same unit, the same hash");
 
-        // A new revision of the descriptor (a rule edit, a mode change) and
-        // a change of another unit are not this unit's business.
+        // A new revision of the descriptor (a rule edit, a mode change), a
+        // change of another unit, and the capability's summary beside the
+        // action's own (which `list` does not show) are not this unit's
+        // business; nor is text past what the description keeps.
         let mut same = d.clone();
         same.rev = 7;
         same.summary = "now in folder mode".into();
         same.capabilities[1].actions.get_mut("run").unwrap().params = json!({"type": "object"});
+        same.capabilities[0].summary = "Files.".into();
         assert_eq!(hash(&same), h);
+        let long = "x".repeat(DESCRIPTION_MAX);
+        let mut a = d.clone();
+        a.capabilities[0].actions.get_mut("read").unwrap().summary = format!("{long}a");
+        let mut b = d.clone();
+        b.capabilities[0].actions.get_mut("read").unwrap().summary = format!("{long}b");
+        assert_eq!(hash(&a), hash(&b));
 
         // Each thing `list` tells of it is.
         type Edit = fn(&mut Descriptor);
-        let edits: [(&str, Edit); 6] = [
+        let edits: [(&str, Edit); 5] = [
             ("params", |d| {
                 d.capabilities[0].actions.get_mut("read").unwrap().params = json!({
                     "type": "object", "properties": {"path": {"type": "string"},
@@ -355,18 +381,60 @@ mod tests {
             ("summary", |d| {
                 d.capabilities[0].actions.get_mut("read").unwrap().summary = "Read.".into()
             }),
-            ("capability summary", |d| {
-                d.capabilities[0].summary = "Files.".into()
-            }),
-            ("summaries run together", |d| {
-                d.capabilities[0].summary = "fs summaryread".into();
-                d.capabilities[0].actions.get_mut("read").unwrap().summary = " it".into()
-            }),
+            (
+                "the capability's summary, which it shows for want of its own",
+                |d| d.capabilities[0].actions.get_mut("read").unwrap().summary = String::new(),
+            ),
         ];
         for (what, edit) in edits {
             let mut changed = d.clone();
             edit(&mut changed);
             assert_ne!(hash(&changed), h, "{what}");
+        }
+        let mut bare = d.clone();
+        bare.capabilities[0]
+            .actions
+            .get_mut("read")
+            .unwrap()
+            .summary = String::new();
+        let mut files = bare.clone();
+        files.capabilities[0].summary = "Files.".into();
+        assert_ne!(
+            hash(&bare),
+            hash(&files),
+            "the capability's summary it shows"
+        );
+    }
+
+    /// The units of a capability without summaries of their own share its
+    /// summary, cut: a node's long text is kept once, not once per unit.
+    #[test]
+    fn a_long_summary_is_kept_once_and_cut() {
+        let actions: Vec<(String, Effect, Value)> = (0..50)
+            .map(|i| (format!("a{i}"), Effect::Read, json!({"type": "object"})))
+            .collect();
+        let refs: Vec<(&str, Effect, Value)> = actions
+            .iter()
+            .map(|(n, e, p)| (n.as_str(), *e, p.clone()))
+            .collect();
+        let mut big = cap("big", "big", &refs);
+        big.summary = "y".repeat(100_000);
+        for a in big.actions.values_mut() {
+            a.summary = String::new();
+        }
+        big.actions.get_mut("a7").unwrap().summary = "z\n".repeat(100_000);
+        let c = Catalog::build(&desc("box", vec![big]));
+        assert_eq!(c.units.len(), 50);
+        let first = &c.units[0].description;
+        assert!(first.starts_with("yyy") && first.ends_with('…'), "{first}");
+        assert_eq!(first.len(), DESCRIPTION_MAX + '…'.len_utf8());
+        for u in &c.units {
+            if u.action == "a7" {
+                assert!(u.description.starts_with("z z "), "{}", u.description);
+                assert!(u.description.len() <= DESCRIPTION_MAX + '…'.len_utf8());
+            } else {
+                assert!(Arc::ptr_eq(&u.description, first), "{}", u.name);
+            }
         }
     }
 
@@ -566,8 +634,7 @@ mod tests {
                 cap: format!("c{i:06}"),
                 action: "a".into(),
                 effect: Effect::Read,
-                summary: String::new(),
-                cap_summary: String::new(),
+                description: "".into(),
                 params: Value::Null,
                 result: Value::Null,
                 provider: String::new(),

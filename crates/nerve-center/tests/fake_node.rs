@@ -168,7 +168,8 @@ enum Seen {
 
 /// Answers the center like a node: describe, sub, invoke (echoing the
 /// arguments; the command `hang` is never answered, `refuse` is forbidden,
-/// `boom` fails and `plain` answers a bare string), and reports what it saw.
+/// `boom` fails, `plain` answers a bare string, `long` and `quotes` long
+/// ones), and reports what it saw.
 fn serve(ws: WebSocketStream<BoxIo>, desc: Value) -> mpsc::UnboundedReceiver<Seen> {
     serve_task(ws, desc).0
 }
@@ -258,6 +259,10 @@ fn serve_changing(
                             let _ = tx.send(Seen::Invoke(Value::Object(params.clone())));
                             if command == Some("plain") {
                                 json!("plain words")
+                            } else if command == Some("long") {
+                                json!("x".repeat(300 * 1024))
+                            } else if command == Some("quotes") {
+                                json!("\"".repeat(200 * 1024))
                             } else {
                                 json!({"content": format!("echo {}", params["args"]), "encoding": "utf-8"})
                             }
@@ -465,6 +470,20 @@ async fn pair_connect_describe_and_call() {
         "{plain}"
     );
     assert!(matches!(seen.recv().await, Some(Seen::Invoke(_))));
+    // A result longer than the text holds is the cut text alone: no harness
+    // hands the model more of it, also one that shows only
+    // `structuredContent`. That counts the result as JSON, quotes escaped.
+    for command in ["long", "quotes"] {
+        let long = run(&e, "box-1", "exec.run", json!({"command": command})).await;
+        assert_ne!(long["result"]["isError"], true, "{command}");
+        assert!(
+            long["result"].get("structuredContent").is_none(),
+            "{command}"
+        );
+        let text = long["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() < 300 * 1024, "{command}: {}", text.len());
+        assert!(matches!(seen.recv().await, Some(Seen::Invoke(_))));
+    }
 
     // Ending the session tells the node.
     e.close().await;

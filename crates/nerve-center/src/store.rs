@@ -199,7 +199,7 @@ pub struct NodeRecord {
     pub arch: String,
     pub paired_ms: u64,
     /// The owner switched the node off in the center: it stays paired and
-    /// connected, but the agent is offered none of its tools and no call
+    /// connected, but the agent is offered none of its capabilities and no call
     /// reaches it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,

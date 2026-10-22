@@ -53,6 +53,19 @@ fn obj(props: Value, required: &[&str]) -> Value {
            "additionalProperties": false})
 }
 
+/// An argument that may be left out. Its parser reads `null` as left out,
+/// so the schema takes `null` as well: a center checks arguments against it
+/// and must not refuse what the node takes.
+fn opt(mut s: Value) -> Value {
+    if let Some(t) = s.get("type").cloned() {
+        s["type"] = json!([t, "null"]);
+    }
+    if let Some(Value::Array(e)) = s.get_mut("enum") {
+        e.push(Value::Null);
+    }
+    s
+}
+
 fn event(summary: &str, implicit: bool, data: Value) -> EventDecl {
     EventDecl {
         summary: summary.into(),
@@ -127,12 +140,12 @@ fn path_param(windows: bool) -> Value {
 /// The `cwd` argument of `exec.run`: it takes the same wire form as an `fs`
 /// path, so a Windows node says so here as well. A Unix node's is unchanged.
 fn cwd_param(windows: bool) -> Value {
-    if windows {
+    opt(if windows {
         json!({"type": "string",
                "description": "working folder, the drive as a folder: /c/Users/x for C:\\Users\\x"})
     } else {
         json!({"type": "string"})
-    }
+    })
 }
 
 fn fs_cap(exposure: Exposure) -> Capability {
@@ -177,8 +190,8 @@ fn fs_cap(exposure: Exposure) -> Capability {
             Effect::Read,
             "A file's content, utf8 or base64, with its etag.",
             obj(
-                json!({"path": path, "offset": {"type": "integer", "minimum": 0},
-                       "length": {"type": "integer", "minimum": 0}}),
+                json!({"path": path, "offset": opt(json!({"type": "integer", "minimum": 0})),
+                       "length": opt(json!({"type": "integer", "minimum": 0}))}),
                 &["path"],
             ),
             obj(
@@ -195,8 +208,8 @@ fn fs_cap(exposure: Exposure) -> Capability {
             "Lines containing a literal pattern, below a path.",
             obj(
                 json!({"path": path, "pattern": {"type": "string", "minLength": 1},
-                       "glob": {"type": "string"},
-                       "max": {"type": "integer", "minimum": 1}}),
+                       "glob": opt(json!({"type": "string"})),
+                       "max": opt(json!({"type": "integer", "minimum": 1}))}),
                 &["path", "pattern"],
             ),
             obj(
@@ -215,7 +228,7 @@ fn fs_cap(exposure: Exposure) -> Capability {
             "Paths below a path that match a glob.",
             obj(
                 json!({"path": path, "glob": {"type": "string"},
-                       "max": {"type": "integer", "minimum": 1}}),
+                       "max": opt(json!({"type": "integer", "minimum": 1}))}),
                 &["path", "glob"],
             ),
             obj(
@@ -232,7 +245,8 @@ fn fs_cap(exposure: Exposure) -> Capability {
             "Writes a whole file; if_match guards against a concurrent change.",
             obj(
                 json!({"path": path, "content": {"type": "string"},
-                       "encoding": {"enum": ["utf8", "base64"]}, "if_match": {"type": "string"}}),
+                       "encoding": opt(json!({"enum": ["utf8", "base64"]})),
+                       "if_match": opt(json!({"type": "string"}))}),
                 &["path", "content"],
             ),
             obj(
@@ -256,8 +270,10 @@ fn fs_cap(exposure: Exposure) -> Capability {
 fn timeout_param(t: &crate::exec::Timeouts) -> Value {
     let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let max = ms(t.max);
-    json!({"type": "integer", "minimum": 0, "default": ms(t.limit(None).after),
-           "description": format!("milliseconds, at most {max}: a larger value gets {max}; 0 gets the default")})
+    opt(
+        json!({"type": "integer", "minimum": 0, "default": ms(t.limit(None).after),
+           "description": format!("milliseconds, at most {max}: a larger value gets {max}; 0 gets the default")}),
+    )
 }
 
 /// The `call` of `exec.signal` and of the `exit` event: the id of the
@@ -293,15 +309,15 @@ fn exec_cap(
             obj(
                 json!({"command": {"type": "string", "minLength": 1}, "cwd": cwd_param(windows),
                        "timeout_ms": timeout_param(timeouts),
-                       "memory_mb": {"type": "integer", "minimum": 1,
-                                     "maximum": limits.memory_max_mb,
-                                     "default": limits.memory_mb},
-                       "cpu_percent": {"type": "integer", "minimum": 1,
-                                       "maximum": limits.cpu_max_percent,
-                                       "default": limits.cpu_percent},
-                       "processes": {"type": "integer", "minimum": 1,
-                                     "maximum": limits.processes_max,
-                                     "default": limits.processes}}),
+                       "memory_mb": opt(json!({"type": "integer", "minimum": 1,
+                                               "maximum": limits.memory_max_mb,
+                                               "default": limits.memory_mb})),
+                       "cpu_percent": opt(json!({"type": "integer", "minimum": 1,
+                                                 "maximum": limits.cpu_max_percent,
+                                                 "default": limits.cpu_percent})),
+                       "processes": opt(json!({"type": "integer", "minimum": 1,
+                                               "maximum": limits.processes_max,
+                                               "default": limits.processes}))}),
                 &["command"],
             ),
             obj(
@@ -400,10 +416,10 @@ fn settings_cap() -> Capability {
             "Turns the sudo switch on (with the sealed password) or off.",
             obj(
                 json!({"on": {"type": "boolean"},
-                       "sealed": {"type": "object", "properties": {
+                       "sealed": opt(json!({"type": "object", "properties": {
                            "offer": {"type": "string"}, "key": {"type": "string"},
                            "iv": {"type": "string"}, "ct": {"type": "string"}},
-                        "required": ["offer", "key", "iv", "ct"]}}),
+                        "required": ["offer", "key", "iv", "ct"]}))}),
                 &["on"],
             ),
             obj(json!({"sudo": {"enum": ["on", "off"]}}), &["sudo"]),
@@ -1042,7 +1058,7 @@ mod tests {
     }
 
     /// `exec.run`'s `cwd` shows the same form on a Windows node, and stays
-    /// a bare string on a Unix one.
+    /// a bare string (or null) on a Unix one.
     #[test]
     fn a_windows_node_shows_the_wire_form_of_a_working_folder() {
         let win = cwd_param(true);
@@ -1051,7 +1067,7 @@ mod tests {
             text.contains("/c/Users/x") && text.contains("C:\\Users\\x"),
             "{text}"
         );
-        assert_eq!(cwd_param(false), json!({"type": "string"}));
+        assert_eq!(cwd_param(false), json!({"type": ["string", "null"]}));
         for windows in [true, false] {
             let exec = exec_cap(
                 Exposure::On,
@@ -1086,7 +1102,7 @@ mod tests {
         );
         assert_eq!(
             timeout_ms(&cfg),
-            json!({"type": "integer", "minimum": 0, "default": 600_000,
+            json!({"type": ["integer", "null"], "minimum": 0, "default": 600_000,
                    "description": "milliseconds, at most 3600000: a larger value gets 3600000; 0 gets the default"})
         );
         cfg.limits.default_timeout_secs = 90;
@@ -1099,7 +1115,7 @@ mod tests {
         assert_ne!(changed, rev);
         assert_eq!(
             timeout_ms(&cfg),
-            json!({"type": "integer", "minimum": 0, "default": 90_000,
+            json!({"type": ["integer", "null"], "minimum": 0, "default": 90_000,
                    "description": "milliseconds, at most 120000: a larger value gets 120000; 0 gets the default"})
         );
         // The default shown is the one that applies: cut to the maximum.
@@ -1150,7 +1166,7 @@ mod tests {
         let (p, rev) = run(&cfg);
         assert_eq!(
             p["memory_mb"],
-            json!({"type": "integer", "minimum": 1, "maximum": 16384, "default": 4096})
+            json!({"type": ["integer", "null"], "minimum": 1, "maximum": 16384, "default": 4096})
         );
         assert_eq!(p["cpu_percent"]["maximum"], 800);
         assert_eq!(p["cpu_percent"]["default"], 200);
@@ -1263,10 +1279,11 @@ mod tests {
         /// subset cannot say: the form of a path, a glob, base64, a command
         /// of blanks.
         Content,
-        /// `null` for a field that may be left out: the parser reads it as
-        /// left out, the schema refuses it. So a center refuses what the
-        /// node would take, never the other way round.
-        Null,
+        /// The schema refuses what the parser takes. No row wants this: a
+        /// center checks the arguments against the schema, so the agent
+        /// would be refused what the node does (an optional field sent as
+        /// `null`, which the parser reads as left out, was one).
+        Stricter,
     }
 
     /// The `fs` and `exec` schemas say what their parsers take: arguments
@@ -1321,7 +1338,8 @@ mod tests {
             ("fs.read", json!({"path": p, "offset": 1.5}), Refuse),
             ("fs.read", json!({"path": p, "offset": 5.0}), Refuse),
             ("fs.read", json!({"path": p, "offset": "5"}), Refuse),
-            ("fs.read", json!({"path": p, "offset": null}), Null),
+            ("fs.read", json!({"path": p, "offset": null}), Take),
+            ("fs.read", json!({"path": p, "length": null}), Take),
             ("fs.grep", json!({"path": p, "pattern": "x"}), Take),
             (
                 "fs.grep",
@@ -1331,6 +1349,11 @@ mod tests {
             (
                 "fs.grep",
                 json!({"path": p, "pattern": "x", "max": 1_000_000_000}),
+                Take,
+            ),
+            (
+                "fs.grep",
+                json!({"path": p, "pattern": "x", "glob": null, "max": null}),
                 Take,
             ),
             ("fs.grep", json!({"path": p, "pattern": ""}), Refuse),
@@ -1346,6 +1369,12 @@ mod tests {
                 Content,
             ),
             ("fs.find", json!({"path": p, "glob": "*"}), Take),
+            (
+                "fs.find",
+                json!({"path": p, "glob": "*", "max": null}),
+                Take,
+            ),
+            ("fs.find", json!({"path": p, "glob": null}), Refuse),
             ("fs.find", json!({"path": p}), Refuse),
             ("fs.find", json!({"path": p, "glob": 3}), Refuse),
             ("fs.find", json!({"path": p, "glob": "*", "max": 0}), Refuse),
@@ -1359,6 +1388,11 @@ mod tests {
                 "fs.write",
                 json!({"path": p, "content": "hi", "encoding": "latin1"}),
                 Refuse,
+            ),
+            (
+                "fs.write",
+                json!({"path": p, "content": "hi", "encoding": null, "if_match": null}),
+                Take,
             ),
             ("fs.write", json!({"path": p}), Refuse),
             (
@@ -1407,8 +1441,15 @@ mod tests {
             (
                 "exec.run",
                 json!({"command": "true", "timeout_ms": null}),
-                Null,
+                Take,
             ),
+            (
+                "exec.run",
+                json!({"command": "true", "cwd": null, "memory_mb": null,
+                       "cpu_percent": null, "processes": null}),
+                Take,
+            ),
+            ("exec.run", json!({"command": null}), Refuse),
             ("exec.run", json!({"command": "true", "memory_mb": 1}), Take),
             (
                 "exec.run",
@@ -1459,6 +1500,11 @@ mod tests {
                 Refuse,
             ),
             ("exec.signal", json!({"call": {}, "signal": "term"}), Refuse),
+            (
+                "exec.signal",
+                json!({"call": null, "signal": "term"}),
+                Refuse,
+            ),
             ("exec.signal", json!({"call": 3, "signal": "hup"}), Refuse),
             ("exec.signal", json!({"call": 3}), Refuse),
             (
@@ -1476,7 +1522,7 @@ mod tests {
                 (Ok(()), Ok(())) => Take,
                 (Err(_), Err(_)) => Refuse,
                 (Ok(()), Err(_)) => Content,
-                (Err(_), Ok(())) => Null,
+                (Err(_), Ok(())) => Stricter,
             };
             assert_eq!(
                 got, want,

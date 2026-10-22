@@ -1391,6 +1391,15 @@ impl Link {
     /// Starts an `invoke` as its own task, so a slow call does not hold up the
     /// link.
     async fn start_invoke(self: &Arc<Self>, id: Id, p: Map<String, Value>) {
+        // `exec.signal` and the `exec/exit` event name a call by its number
+        // (spec §5.1), so a call with a text id could not be named there.
+        if let Id::Str(_) = id {
+            let e = RpcError::new(
+                ErrorCode::InvalidRequest,
+                "an invoke id is a whole number of 0 or more",
+            );
+            return self.reply(id, Err(e)).await;
+        }
         let inv = match params::<Invoke>(&p).and_then(|i| i.check().map(|()| i)) {
             Ok(i) => i,
             Err(e) => return self.reply(id, Err(e)).await,

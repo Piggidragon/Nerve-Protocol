@@ -1485,10 +1485,11 @@ mod tests {
         assert_eq!(text(&r), CALLED);
     }
 
-    /// `structuredContent` holds no more than the text: an answer whose data
-    /// is longer is the cut text alone.
+    /// A node with more capabilities than one answer holds with their
+    /// summaries is listed by name alone, in whole lines, and keeps its
+    /// `structuredContent`, which holds no more than the text may.
     #[tokio::test]
-    async fn a_long_listing_has_no_structured_content() {
+    async fn a_long_listing_keeps_whole_lines_and_its_structured_content() {
         let dir = tempfile::tempdir().unwrap();
         let c = open(dir.path());
         with_box(&c);
@@ -1509,12 +1510,17 @@ mod tests {
         let e = Engine::new(&c, "test");
         let r = call(&e, "list", json!({"node": "box-1"})).await;
         assert_eq!(r["isError"], false, "{r}");
-        assert!(r.get("structuredContent").is_none());
-        assert!(text(&r).ends_with("…\n[end of device content]"));
-        // A short one keeps it.
-        describe(&c, box_desc());
-        let r = call(&e, "list", json!({"node": "box-1"})).await;
-        assert!(r["structuredContent"]["result"].is_object(), "{r}");
+        let t = text(&r);
+        assert!(
+            t.contains("by name alone") && !t.contains('…'),
+            "{}",
+            &t[..300]
+        );
+        assert!(t.contains("\n- many.a1999\n"));
+        let data = &r["structuredContent"]["result"];
+        assert!(data["capabilities"].as_array().unwrap().len() > 2000, "{r}");
+        assert_eq!(data["more"], 0);
+        assert!(r["structuredContent"].to_string().len() <= RESULT_TEXT);
     }
 
     #[test]

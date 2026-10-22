@@ -72,7 +72,7 @@ center is paired.
 
 | Command | Does | Page |
 |---|---|---|
-| `install [--owner=root --accept-root-owner]` | Install the node as a service under its own user, make `nerve-run` and take you as the owner (Linux with sudo, Windows as administrator); run by root itself, make root the owner after its yes, or with the flags | [service](service.md#install) |
+| `install [--owner=root --accept-root-owner \| --owner=none]` | Install the node as a service under its own user, make `nerve-run` and take you as the owner (Linux with sudo, Windows as administrator); run by root itself, make root the owner after its yes, or with the flags, and keep it at a later install; `--owner=none` leaves the node without an owner | [service](service.md#install) |
 | `setup` | Name the node, choose where the keys are, pair the first center, choose its mode and a folder | [service](service.md#setup) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [service](service.md#update) |
 | `service start\|stop\|restart` | Start, stop or restart the installed service | [service](service.md#start-and-stop) |

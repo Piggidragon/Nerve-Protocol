@@ -29,6 +29,20 @@ fn text_model(items: Vec<String>) -> ModelRc<SharedString> {
 /// What the Overview says while root is the node's owner (#151).
 pub const ROOT_OWNER: &str = "Root is the owner of this node: commands of user mode, and of allowlist mode as the owner, run as root. They can do everything on this machine, Nerve and its keys included, and nothing in Nerve holds them back.";
 
+/// What the app says once the settings grant of the center `name` is given
+/// (`on`) or taken. Where root is the node's owner (`root`), the center may
+/// set its own mode to user, whose commands run as root, and the app says
+/// so, as `center grant settings write` does.
+pub fn settings_grant_said(name: &str, on: bool, root: bool) -> String {
+    match (on, root) {
+        (true, true) => format!(
+            "{name} may change this machine's settings now. Root is the owner of this node, so {name} can set its own mode to user, and its commands then run as root."
+        ),
+        (true, false) => format!("{name} may change this machine's settings now."),
+        (false, _) => format!("{name} can no longer change this machine's settings."),
+    }
+}
+
 /// The node's status and its centers, from `status --json`.
 pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
     let running = v["daemon"] == "running";
@@ -1585,6 +1599,17 @@ mod tests {
         let (st, _) = status(&v, NOW);
         assert_eq!(st.state, "locked");
         assert_eq!(st.warnings.row_count(), 1);
+    }
+
+    /// Giving the settings grant where root is the owner says that the
+    /// center can make itself root.
+    #[test]
+    fn the_settings_grant_says_root_where_root_is_the_owner() {
+        let said = settings_grant_said("home", true, true);
+        assert!(said.contains("home can set its own mode to user"), "{said}");
+        assert!(said.contains("run as root"), "{said}");
+        assert!(!settings_grant_said("home", true, false).contains("root"));
+        assert!(!settings_grant_said("home", false, true).contains("root"));
     }
 
     /// Root as the owner is a warning on the Overview, running or not.

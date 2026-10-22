@@ -952,11 +952,8 @@ impl Ctl {
     }
 
     fn center_grant(self: &Rc<Self>, name: &str, on: bool) {
-        let said = if on {
-            format!("{name} may change this machine's settings now.")
-        } else {
-            format!("{name} can no longer change this machine's settings.")
-        };
+        let root = self.with_perm(|p| p.get_owner_is_root()).unwrap_or(false);
+        let said = view::settings_grant_said(name, on, root);
         let value = if on { "write" } else { "off" };
         let args = vec![
             "center".into(),

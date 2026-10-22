@@ -34,9 +34,15 @@ no other, no login shell, home `/var/lib/nerve-run`, comment
 (`Environment=NERVE_NODE_OWNER=<name>`); the node reads it from there. No
 other account can be chosen. Run by root itself (no `SUDO_USER`, or
 `SUDO_USER=root`), `install` makes root the owner only after a yes at a
-terminal (default no; input that is no terminal's answers nothing) or with
-`--owner=root --accept-root-owner`, and writes `NERVE_NODE_OWNER=root`; an
-install without either drops root as the owner. Then what runs as the owner
+terminal (default no; asked only where stdin and stdout are a terminal and
+not with `--json`, else no at once, said on stderr) or with
+`--owner=root --accept-root-owner`, and writes `NERVE_NODE_OWNER=root`. A
+later install by root keeps a root owner without asking; `--owner=none`
+leaves the node without an owner. Where an install changes the owner (or
+`nerve-run`'s uid), it first stops the service and takes `nerve-run`'s
+entries off every grant the ACL record names, as root (`acl::remove_all`, as
+`uninstall`), and the record goes; where not all come off, the owner stays
+and the service starts again. Then what runs as the owner
 runs as root (uid 0, root's groups, `HOME` root's, no `no_new_privs`, the
 capabilities of root's exec), and the account check below is skipped for
 it; `nerve-run`'s commands are unchanged. No other account with uid 0 is an

@@ -230,19 +230,31 @@ async fn status(paths: &NodePaths) -> Result<Value, String> {
             v
         })
         .collect();
-    Ok(json!({
+    let sudo = sudo_is_on(paths).await?;
+    Ok(stopped(
+        &cfg,
+        crate::service::owner_of(paths),
+        sudo,
+        centers,
+    ))
+}
+
+/// The `status` of a node that does not run, with its `owner` as the unit
+/// names it, whether `sudo` is on, and its `centers`.
+fn stopped(cfg: &NodeConfig, owner: Option<String>, sudo: bool, centers: Vec<Value>) -> Value {
+    json!({
         "daemon": "not running",
         "version": cfg.version,
         "locked": cfg.locked,
-        "owner": crate::service::owner_of(paths),
-        "owner_is_root": crate::owner::is_root(crate::service::owner_of(paths).as_deref()),
-        "sudo": if sudo_is_on(paths).await? { "on" } else { "off" },
+        "owner_is_root": crate::owner::is_root(owner.as_deref()),
+        "owner": owner,
+        "sudo": if sudo { "on" } else { "off" },
         "command_limits": crate::cgroup::status(
             &cfg.limits.command,
             &Err("the node does not run".into()),
         ),
         "centers": centers,
-    }))
+    })
 }
 
 /// One center as `center ls` and a stopped node's `status` show it.
@@ -377,5 +389,20 @@ mod tests {
     fn active_only_with_json() {
         assert!(!active());
         assert!(ALSO.sync_scope(std::cell::RefCell::default(), active));
+    }
+
+    /// A stopped node's status says when root is the owner, as the app's
+    /// Overview warns of it whether the node runs or not.
+    #[test]
+    fn a_stopped_status_says_when_root_is_the_owner() {
+        let cfg = NodeConfig::default();
+        let v = stopped(&cfg, Some("root".into()), false, Vec::new());
+        assert_eq!(v["owner"], "root");
+        assert_eq!(v["owner_is_root"], !cfg!(windows));
+        for owner in [Some("alice".to_string()), None] {
+            let v = stopped(&cfg, owner.clone(), false, Vec::new());
+            assert_eq!(v["owner_is_root"], false, "{owner:?}");
+            assert_eq!(v["owner"], json!(owner));
+        }
     }
 }

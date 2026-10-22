@@ -1860,18 +1860,23 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             value,
             center,
         }) => {
-            let name = match what.as_str() {
+            let (name, g) = match what.as_str() {
                 "settings" => {
                     let g: SettingsGrant = parse_enum(&value, "off or write")?;
-                    edit_center(&paths, &center, |e| {
+                    let name = edit_center(&paths, &center, |e| {
                         e.settings = g;
                         Ok(())
                     })
-                    .await?
+                    .await?;
+                    (name, g)
                 }
                 other => return Err(format!("unknown grant {other} (settings)")),
             };
             w(out, format!("{name}: {what} {value}"));
+            let root = crate::owner::is_root(crate::service::owner_of(&paths).as_deref());
+            if let Some(warning) = settings_grant_warning(&name, g, root) {
+                w(out, warning);
+            }
             Ok(())
         }
         Cmd::Status => {
@@ -1886,25 +1891,9 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 &paths.config_file(),
                 &crate::secrets::NodeSecrets::for_cli(&paths),
             )?;
-            w(out, "daemon: not running".into());
             let owner = crate::service::owner_of(&paths);
-            let root = crate::owner::is_root(owner.as_deref());
-            if let Some(line) = owner_line(owner.as_deref(), root) {
+            for line in stopped_lines(&cfg, owner.as_deref()) {
                 w(out, line);
-            }
-            let limits =
-                crate::cgroup::status(&cfg.limits.command, &Err("the node does not run".into()));
-            if let Some(line) = limits_lines(&limits).first() {
-                w(out, line.clone());
-            }
-            if cfg.locked {
-                w(
-                    out,
-                    "LOCKED (panic): nothing runs until `nerve-node unlock`".into(),
-                );
-            }
-            for c in &cfg.centers {
-                w(out, format!("{}  {}", c.name, c.url));
             }
             Ok(())
         }
@@ -2326,6 +2315,35 @@ fn owner_line(owner: Option<&str>, root: bool) -> Option<String> {
         (Some(o), false) => Some(format!("owner: {o}")),
         (None, _) => None,
     }
+}
+
+/// What `center grant settings write` warns of where root is the owner
+/// (`root`): the center may then set its own mode to user, whose commands
+/// run as root, with no password asked.
+fn settings_grant_warning(name: &str, g: SettingsGrant, root: bool) -> Option<String> {
+    (root && g == SettingsGrant::Write).then(|| {
+        format!(
+            "Warning: root is the owner of this node, so {name} can now set its own mode to user, and its commands then run as root: anything on this machine, Nerve and its keys included"
+        )
+    })
+}
+
+/// What `status` says of a node that does not run, with the config `cfg`
+/// and the `owner` the unit names, a line each.
+fn stopped_lines(cfg: &NodeConfig, owner: Option<&str>) -> Vec<String> {
+    let mut lines = vec!["daemon: not running".to_string()];
+    lines.extend(owner_line(owner, crate::owner::is_root(owner)));
+    let limits = crate::cgroup::status(&cfg.limits.command, &Err("the node does not run".into()));
+    if let Some(line) = limits_lines(&limits).first() {
+        lines.push(line.clone());
+    }
+    if cfg.locked {
+        lines.push("LOCKED (panic): nothing runs until `nerve-node unlock`".into());
+    }
+    for c in &cfg.centers {
+        lines.push(format!("{}  {}", c.name, c.url));
+    }
+    lines
 }
 
 /// What `status` says of a running node, from its `status` answer `v`, a
@@ -5772,6 +5790,21 @@ mod tests {
         );
         assert!(crate::owner::ROOT_OWNER_NOTE.contains("run as root"));
         assert_eq!(owner_line(None, false), None);
+        // So does a stopped node's.
+        let cfg = NodeConfig::default();
+        let root_line = format!("owner: {}", crate::owner::ROOT_OWNER_NOTE);
+        let stopped = stopped_lines(&cfg, Some("root"));
+        assert_eq!(stopped[0], "daemon: not running");
+        assert_eq!(stopped.contains(&root_line), !cfg!(windows), "{stopped:#?}");
+        let alice = stopped_lines(&cfg, Some("alice"));
+        assert!(alice.contains(&"owner: alice".to_string()), "{alice:#?}");
+        assert!(!alice.contains(&root_line), "{alice:#?}");
+        assert!(
+            !stopped_lines(&cfg, None)
+                .iter()
+                .any(|l| l.starts_with("owner:")),
+            "no owner, no line"
+        );
         // Nothing of the kind on a node that has none of it.
         let plain = status_lines(&json!({"confinement": "landlock abi 6"})).join("\n");
         assert!(
@@ -5878,6 +5911,27 @@ mod tests {
         let mut piped = std::io::Cursor::new(b"y\n".to_vec());
         assert!(terminal_input(false, &mut piped).is_none());
         assert!(terminal_input(true, &mut piped).is_some());
+    }
+
+    /// `center grant settings write` warns where root is the owner: the
+    /// center can make itself root by setting its own mode to user.
+    #[test]
+    fn the_settings_grant_warns_where_root_is_the_owner() {
+        let w = settings_grant_warning("home", SettingsGrant::Write, true).unwrap();
+        assert!(
+            w.starts_with("Warning: root is the owner of this node"),
+            "{w}"
+        );
+        assert!(w.contains("home can now set its own mode to user"), "{w}");
+        assert!(w.contains("run as root"), "{w}");
+        assert_eq!(
+            settings_grant_warning("home", SettingsGrant::Off, true),
+            None
+        );
+        assert_eq!(
+            settings_grant_warning("home", SettingsGrant::Write, false),
+            None
+        );
     }
 
     /// On Windows, where the account that installs is the owner, either

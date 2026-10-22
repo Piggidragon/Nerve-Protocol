@@ -51,6 +51,7 @@ downloaded file is called. Run as root itself, without `sudo` (a server
 where you log in as root), it asks whether root is to be the node's owner,
 or takes `--owner=root --accept-root-owner` without a terminal; then `user`
 mode runs commands as root ([root as the owner](service.md#root-as-the-owner)).
+Root stays the owner at a later `install`; `install --owner=none` takes it back.
 
 The center installs itself as a service the same way, with MCP over HTTP
 ([center](center.md#run-it-as-a-service)):

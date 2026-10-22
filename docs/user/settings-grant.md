@@ -27,6 +27,12 @@ A center with the grant can widen its own rights up to `user` mode. A center
 that is taken over is then as strong as `user` mode on that machine. Give the
 grant only to a center you would also give a shell.
 
+Where root is the node's owner ([service](service.md#root-as-the-owner)),
+`user` mode runs commands as root. A center with the grant can switch itself
+to it, and so run commands as root, with no password asked. On such a node
+the grant gives the center root: `center grant settings write` warns of it,
+and so does the desktop app when you give the grant.
+
 ## What stays with you
 
 No grant lets a center change:

@@ -1,11 +1,12 @@
 //! The center against a fake node in the same process: pairing, the link
-//! handshake, describe, MCP tools/call through to `invoke`, an unknown node
+//! handshake, describe, MCP `list` and `execute` through to `invoke`, an unknown node
 //! (401) and the one-link rule.
 
 use std::time::Duration;
 
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use nerve_center::center::Center;
 use nerve_center::config::Args;
 use nerve_center::mcp::Engine;
 use nerve_center::server::{self, Running};
@@ -245,17 +246,44 @@ async fn rpc(e: &Engine, id: u64, method: &str, params: Value) -> Value {
 }
 
 /// The `tools/call` params that run `unit` (`cap.action`) on `node` with the
-/// arguments `args`. The tests name units, never tools: this is the one place
-/// that knows how a unit is called. Today the fake node's units are the
-/// profiled tools `<cap>_<action>`, which pick the node by their `node`
-/// argument.
+/// arguments `args`: one `execute`. The tests name units, never tools: this
+/// is the one place that knows how a unit is called.
 fn run_params(node: &str, unit: &str, args: Value) -> Value {
-    let (cap, action) = unit.split_once('.').expect("a unit is cap.action");
-    let mut arguments = json!({"node": node});
-    for (k, v) in args.as_object().expect("the arguments are an object") {
-        arguments[k] = v.clone();
-    }
-    json!({"name": format!("{cap}_{action}"), "arguments": arguments})
+    assert!(args.is_object(), "the arguments are an object");
+    json!({"name": "execute", "arguments": {"node": node, "capability": unit, "args": args}})
+}
+
+/// Waits until a node has described itself and offers the agent something.
+async fn described(c: &Center) {
+    wait_for(|| {
+        c.listed_nodes()
+            .iter()
+            .any(|n| n.capabilities > 0)
+            .then_some(())
+    })
+    .await;
+}
+
+/// The capabilities `list(node)` names for `node`.
+fn offered(c: &Center, node: &str) -> Vec<String> {
+    c.offer(node)
+        .map(|o| o.units.into_iter().map(|u| u.name).collect())
+        .unwrap_or_default()
+}
+
+/// The text of `list` with these arguments, as a harness reads it.
+async fn list_text(e: &Engine, args: Value) -> String {
+    let r = rpc(
+        e,
+        900,
+        "tools/call",
+        json!({"name": "list", "arguments": args}),
+    )
+    .await;
+    r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 /// Runs `unit` on `node` through `e` as a harness would; the JSON-RPC reply.
@@ -291,9 +319,9 @@ async fn pair_connect_describe_and_call() {
     assert!(params.get("resume").is_none(), "{params:?}");
     let mut seen = serve(ws, descriptor(&key, "box-1"));
 
-    // The descriptor arrives and becomes tools; settings stays out of them.
+    // The descriptor arrives; settings stays out of what is offered.
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    described(&c).await;
     let e = Engine::new(&r.center, "test");
     let init = rpc(
         &e,
@@ -316,7 +344,8 @@ async fn pair_connect_describe_and_call() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["nodes", "exec_run", "fs_read"]);
+    assert_eq!(names, ["list", "execute"]);
+    assert_eq!(offered(&c, "box-1"), ["exec.run", "fs.read"]);
 
     // A read goes straight through and is marked as device content.
     let call = run(&e, "box-1", "fs.read", json!({"path": "/etc/hostname"})).await;
@@ -376,7 +405,7 @@ async fn a_cancelled_mcp_call_is_cancelled_on_the_node() {
     let (ws, _) = handshake(&r, &key).await;
     let mut seen = serve(ws, descriptor(&key, "box-1"));
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    described(&c).await;
     let e = std::sync::Arc::new(Engine::new(&r.center, "test"));
     rpc(
         &e,
@@ -530,9 +559,9 @@ fn log_lines(c: &nerve_center::center::Center, text: &str) -> Vec<String> {
         .collect()
 }
 
-/// A capability whose name a tool could not carry is left out on its own:
-/// the node's other capabilities stay tools, and the owner sees why. The
-/// agent's `nodes` tool does not name it, and the log says it once.
+/// A capability whose name the center cannot split is left out on its own:
+/// the node's other capabilities stay offered, and the owner sees why.
+/// `list` does not name it, and the log says it once.
 #[tokio::test]
 async fn only_the_capability_with_a_bad_name_is_left_out() {
     let dir = tempfile::tempdir().unwrap();
@@ -545,9 +574,8 @@ async fn only_the_capability_with_a_bad_name_is_left_out() {
     d["capabilities"][0]["actions"]["list"] = d["capabilities"][0]["actions"]["read"].clone();
     let _seen = serve(ws, d);
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
-    let names: Vec<String> = c.tools().into_iter().map(|t| t.name).collect();
-    assert_eq!(names, ["exec_run"]);
+    described(&c).await;
+    assert_eq!(offered(&c, "box-1"), ["exec.run"]);
     let ov = overview(&r).await;
     let reason = "capability name \"my_fs\": letters, digits and - only, no _";
     assert_eq!(
@@ -559,15 +587,8 @@ async fn only_the_capability_with_a_bad_name_is_left_out() {
     assert_eq!(ov["nodes"][0]["capabilities"][0]["id"], "my_fs");
     assert_eq!(ov["nodes"][0]["capabilities"][0]["offered"], false);
     let e = Engine::new(&r.center, "test");
-    let listed = rpc(
-        &e,
-        1,
-        "tools/call",
-        json!({"name": "nodes", "arguments": {}}),
-    )
-    .await;
-    let listed = listed["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(listed.contains("offers exec"), "{listed}");
+    let listed = list_text(&e, json!({"node": "box-1"})).await;
+    assert!(listed.contains("- exec.run: "), "{listed}");
     assert!(!listed.contains("my_fs"), "{listed}");
     // One line for both, however many there are.
     let lines = wait_for(|| {
@@ -585,8 +606,8 @@ async fn only_the_capability_with_a_bad_name_is_left_out() {
     r.stop().await;
 }
 
-/// A capability the node's owner turned off is no tool, so the agent's
-/// `nodes` tool does not name it either; the overview lists it as not offered.
+/// A capability the node's owner turned off is not offered: `list` names it
+/// only in its trailing line, and the overview lists it as not offered.
 #[tokio::test]
 async fn a_capability_that_is_off_is_not_named_to_the_agent() {
     let dir = tempfile::tempdir().unwrap();
@@ -598,27 +619,28 @@ async fn a_capability_that_is_off_is_not_named_to_the_agent() {
     d["capabilities"][0]["exposure"] = json!("off");
     let _seen = serve(ws, d);
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
-    let names: Vec<String> = c.tools().into_iter().map(|t| t.name).collect();
-    assert_eq!(names, ["exec_run"]);
+    described(&c).await;
+    assert_eq!(offered(&c, "box-1"), ["exec.run"]);
     let ov = overview(&r).await;
     assert_eq!(ov["nodes"][0]["capabilities"][0]["id"], "fs");
     assert_eq!(ov["nodes"][0]["capabilities"][0]["offered"], false);
     assert_eq!(ov["nodes"][0]["capabilities"][1]["offered"], true);
     let e = Engine::new(&r.center, "test");
-    let listed = rpc(
-        &e,
-        1,
-        "tools/call",
-        json!({"name": "nodes", "arguments": {}}),
-    )
-    .await;
-    let listed = listed["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(listed.contains("offers exec\n"), "{listed}");
+    let listed = list_text(&e, json!({"node": "box-1"})).await;
+    assert!(
+        listed.contains("- exec.run: Run a command.\nTurned off by the node's owner: fs.read\n"),
+        "{listed}"
+    );
+    assert!(
+        list_text(&e, json!({}))
+            .await
+            .contains("online, linux/x86_64, 1 capability\n"),
+        "the turned-off one is not counted"
+    );
     r.stop().await;
 }
 
-/// An action whose schema is outside the subset is no tool, and the
+/// An action whose schema is outside the subset is not offered, and the
 /// overview names it with the reason; its capability's other actions stay.
 #[tokio::test]
 async fn a_broken_schema_is_not_a_tool_and_shows_in_the_overview() {
@@ -632,9 +654,8 @@ async fn a_broken_schema_is_not_a_tool_and_shows_in_the_overview() {
         "params": {"type": "object", "properties": {"pattern": {"type": "string", "pattern": "^a"}}}});
     let _seen = serve(ws, d);
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
-    let names: Vec<String> = c.tools().into_iter().map(|t| t.name).collect();
-    assert_eq!(names, ["exec_run", "fs_read"]);
+    described(&c).await;
+    assert_eq!(offered(&c, "box-1"), ["exec.run", "fs.read"]);
     let ov = overview(&r).await;
     let broken = ov["nodes"][0]["broken"].as_array().unwrap();
     assert_eq!(broken.len(), 1, "{broken:?}");
@@ -646,10 +667,17 @@ async fn a_broken_schema_is_not_a_tool_and_shows_in_the_overview() {
     );
     // The overview still lists the capability itself.
     assert_eq!(ov["nodes"][0]["capabilities"][0]["id"], "fs");
-    // And `tools/call` of the left-out unit is an unknown tool.
+    // And `execute` of the left-out unit finds no such capability.
     let e = Engine::new(&r.center, "test");
     let call = run(&e, "box-1", "fs.grep", json!({"pattern": "a"})).await;
-    assert!(call.get("error").is_some(), "{call}");
+    assert_eq!(call["result"]["isError"], true, "{call}");
+    assert!(
+        call["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("error unknown_capability: "),
+        "{call}"
+    );
     r.stop().await;
 }
 
@@ -664,7 +692,7 @@ async fn wrong_args_are_refused_before_the_node() {
     let (ws, _) = handshake(&r, &key).await;
     let mut seen = serve(ws, descriptor(&key, "box-1"));
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    described(&c).await;
     let e = Engine::new(&r.center, "test");
     for (args, want) in [
         (
@@ -786,7 +814,7 @@ async fn http_mcp_needs_a_token_and_a_session() {
         .await;
     assert_eq!(resp.status, 200);
     let v: Value = serde_json::from_slice(&resp.body).unwrap();
-    assert_eq!(v["result"]["tools"][0]["name"], "nodes");
+    assert_eq!(v["result"]["tools"][0]["name"], "list");
     assert_eq!(
         h.request(http(
             "DELETE",
@@ -810,8 +838,10 @@ async fn http_mcp_needs_a_token_and_a_session() {
     r.stop().await;
 }
 
+/// A disabled node stays paired and connected; `list` marks it and offers
+/// none of its capabilities, and `execute` on it never reaches it.
 #[tokio::test]
-async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
+async fn a_disabled_node_offers_nothing_and_gets_no_calls() {
     let dir = tempfile::tempdir().unwrap();
     let r = center(dir.path()).await;
     let key = NodeKey::generate().unwrap();
@@ -819,7 +849,7 @@ async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
     let (ws, _) = handshake(&r, &key).await;
     let mut seen = serve(ws, descriptor(&key, "box-1"));
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    described(&c).await;
     let e = Engine::new(&r.center, "test");
     let names = |list: &Value| -> Vec<String> {
         list["result"]["tools"]
@@ -831,34 +861,34 @@ async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
     };
     let id = key.node_id();
 
-    // Switched off: the tools are gone, `nodes` still lists the node and
-    // says why, and the link stays up.
+    // Switched off: the tools stay the same two, `list` still lists the node
+    // and says why, and the link stays up.
     c.set_disabled(&id, true).unwrap();
-    assert!(c.tools().is_empty());
-    assert_eq!(names(&rpc(&e, 1, "tools/list", json!({})).await), ["nodes"]);
-    let listed = rpc(
-        &e,
-        2,
-        "tools/call",
-        json!({"name": "nodes", "arguments": {}}),
-    )
-    .await;
-    let listed = listed["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(offered(&c, "box-1").is_empty());
+    assert_eq!(
+        names(&rpc(&e, 1, "tools/list", json!({})).await),
+        ["list", "execute"]
+    );
+    let listed = list_text(&e, json!({})).await;
     assert!(
-        listed.contains("box-1") && listed.contains("online"),
+        listed.contains(&format!(
+            "- box-1 (id {id}): disabled, linux/x86_64, 0 capabilities\n"
+        )),
         "{listed}"
     );
+    let listed = list_text(&e, json!({"node": "box-1"})).await;
     assert!(listed.contains("disabled in the center"), "{listed}");
-    assert!(!listed.contains("offers fs"), "{listed}");
+    assert!(!listed.contains("fs.read"), "{listed}");
     assert!(c.link(&id).is_some());
 
-    // A call on a tool list read before the switch is refused by the center
-    // itself, before anything goes to the node.
-    let route = {
-        c.set_disabled(&id, false).unwrap();
-        let tools = c.tools();
-        c.set_disabled(&id, true).unwrap();
-        tools.iter().find(|t| t.name == "fs_read").unwrap().routes["box-1"].clone()
+    // A call that got past `execute` before the switch is refused by the
+    // center itself, before anything goes to the node.
+    let route = nerve_center::tools::Route {
+        node_id: id.clone(),
+        node_name: "box-1".into(),
+        cap: "fs".into(),
+        action: "read".into(),
+        effect: nerve_proto::Effect::Read,
     };
     let sess = c.new_session("test");
     let err = c
@@ -867,9 +897,16 @@ async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
         .unwrap_err();
     let nerve_center::center::CallError::Rpc(err) = err;
     assert_eq!(err.message, "the node box-1 is disabled in the center");
-    // By name through MCP it is an unknown tool.
+    // Through MCP it is refused as unavailable.
     let by_name = run(&e, "box-1", "fs.read", json!({"path": "/x"})).await;
-    assert!(by_name.get("error").is_some(), "{by_name}");
+    assert_eq!(by_name["result"]["isError"], true, "{by_name}");
+    assert!(
+        by_name["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("error unavailable: node box-1 is disabled in the center"),
+        "{by_name}"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(300), seen.recv())
             .await
@@ -877,12 +914,9 @@ async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
         "the node received something"
     );
 
-    // Switched on again: the tools are back and a call reaches the node.
+    // Switched on again: its capabilities are back and a call reaches the node.
     c.set_disabled(&id, false).unwrap();
-    assert_eq!(
-        names(&rpc(&e, 4, "tools/list", json!({})).await),
-        ["nodes", "exec_run", "fs_read"]
-    );
+    assert_eq!(offered(&c, "box-1"), ["exec.run", "fs.read"]);
     let done = run(&e, "box-1", "fs.read", json!({"path": "/x"})).await;
     assert_ne!(done["result"]["isError"], true, "{done}");
     let Some(Seen::Invoke(inv)) = seen.recv().await else {
@@ -1053,7 +1087,7 @@ async fn a_node_that_drops_and_comes_back_is_in_the_log() {
     let (ws, _) = handshake(&r, &key).await;
     let (_seen, link) = serve_task(ws, descriptor(&key, "box-1"));
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    described(&c).await;
     let e = Engine::new(&r.center, "test");
     rpc(
         &e,
@@ -1400,7 +1434,7 @@ async fn a_call_in_flight_on_a_dropped_link(
     assert_eq!(m, method::DESCRIBE);
     send(&mut ws, Message::result(id, descriptor(key, "box-1"))).await;
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    described(&c).await;
     let e = std::sync::Arc::new(Engine::new(&r.center, "test"));
     rpc(
         &e,
@@ -1601,7 +1635,7 @@ async fn a_node_resumes_its_link_over_a_held_connection() {
     let (id, _, _) = request(&mut old).await;
     send(&mut old, Message::result(id, descriptor(&key, "box-1"))).await;
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    described(&c).await;
     let e = std::sync::Arc::new(Engine::new(&r.center, "test"));
     rpc(
         &e,
@@ -1716,7 +1750,7 @@ async fn a_frame_over_the_limit_ends_a_resumable_link() {
     let (id, _, _) = request(&mut ws).await;
     send(&mut ws, Message::result(id, descriptor(&key, "box-1"))).await;
     let c = r.center.clone();
-    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    described(&c).await;
     let e = std::sync::Arc::new(Engine::new(&r.center, "test"));
     rpc(
         &e,

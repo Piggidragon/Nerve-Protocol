@@ -26,9 +26,10 @@ use crate::checker::{
     ModelSource, NodeSettings, NodeSwitch, Scope,
 };
 use crate::link::{Link, SHORT_CALL};
+use crate::listing;
 use crate::pairing::{Codes, Outcome};
 use crate::store::{KeyRotation, NodeRecord, OldKey, Store};
-use crate::tools::{self, Route, Tool};
+use crate::tools::Route;
 use crate::util::{self, now_ms};
 
 pub const IDENTITY_FILE: &str = "tls.pem";
@@ -38,10 +39,9 @@ pub const NEXT_IDENTITY_FILE: &str = "tls.next.pem";
 pub use crate::audit::{AUDIT_KEEP, AUDIT_MAX_BYTES};
 const ALERTS_KEEP: usize = 50;
 
-/// What changed, for the MCP servers (tool lists) and the web UI.
+/// What changed, for whoever subscribed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
-    Tools,
     Nodes,
     Audit,
     Sessions,
@@ -1496,12 +1496,11 @@ impl Center {
             format!("the node was renamed from {old}"),
         );
         self.changed(Change::Nodes);
-        self.changed(Change::Tools);
         Ok(())
     }
 
     /// Switches a node off or on for the agent. The link stays as it is;
-    /// only the tool list and the call path look at the flag.
+    /// only `list` and the call path look at the flag.
     pub fn set_disabled(&self, node_id: &str, disabled: bool) -> Result<(), String> {
         self.update(|s| {
             s.nodes.get_mut(node_id).ok_or("no such node")?.disabled = disabled;
@@ -1511,13 +1510,12 @@ impl Center {
             Level::Info,
             Some(node_id),
             if disabled {
-                "the node was disabled: the agent gets none of its tools and calls to it are refused"
+                "the node was disabled: the agent is offered none of its capabilities and calls to it are refused"
             } else {
                 "the node was enabled"
             },
         );
         self.changed(Change::Nodes);
-        self.changed(Change::Tools);
         Ok(())
     }
 
@@ -1552,7 +1550,6 @@ impl Center {
                 &format!("the node is no longer paired: {why}"),
             );
             self.changed(Change::Nodes);
-            self.changed(Change::Tools);
         }
     }
 
@@ -1859,7 +1856,6 @@ impl Center {
                             ),
                         );
                     }
-                    self.changed(Change::Tools);
                     self.changed(Change::Nodes);
                 }
                 Err(e) => self.note(
@@ -1957,7 +1953,7 @@ impl Center {
         self.audit.lock().unwrap().list()
     }
 
-    /// The nodes as the web UI and `nodes` show them.
+    /// The nodes as the web UI shows them.
     pub fn nodes_json(&self) -> Value {
         let links: BTreeMap<String, Arc<Link>> = self.links.lock().unwrap().clone();
         // Which sessions use each node, read before the state is locked (see
@@ -1978,8 +1974,8 @@ impl Center {
                     let d = n.descriptor.as_ref();
                     // Whether the agent is offered anything of a capability:
                     // one whose every action was left out, or that the node's
-                    // owner turned off, is listed for the owner, but the
-                    // `nodes` tool does not name it.
+                    // owner turned off, is listed for the owner, but `list`
+                    // does not count it.
                     let offered: BTreeSet<&str> =
                         n.catalog.units.iter().map(|u| u.cap.as_str()).collect();
                     let caps: Vec<Value> = d
@@ -2020,32 +2016,69 @@ impl Center {
         json!(nodes)
     }
 
-    // ---- Tools ----
+    // ---- What the agent is offered ----
 
-    pub fn tools(&self) -> Vec<Tool> {
+    /// The ids of the nodes with a live link, read before the state is
+    /// locked (see `Inner::store`).
+    fn online_ids(&self) -> BTreeSet<String> {
+        self.links
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, l)| l.is_live())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// The nodes as `list()` shows them.
+    pub fn listed_nodes(&self) -> Vec<listing::NodeLine> {
+        let online = self.online_ids();
         self.read(|s| {
-            let views: Vec<tools::NodeView> = s
-                .nodes
+            s.nodes
                 .values()
-                // A disabled node offers the agent nothing.
-                .filter(|n| !n.disabled)
-                .filter_map(|n| {
-                    n.descriptor.as_ref().map(|d| tools::NodeView {
-                        id: &n.id,
-                        name: &n.name,
-                        descriptor: d,
-                        catalog: &n.catalog,
-                    })
-                })
-                .collect();
-            tools::build(&views)
+                .map(|n| listing::line(n, online.contains(&n.id)))
+                .collect()
         })
     }
 
-    /// The unit `name` (`cap.action`) of a node as the center checked it;
-    /// none when the node has no such unit or it is left out.
-    pub fn unit(&self, node_id: &str, name: &str) -> Option<catalog::Unit> {
-        self.read(|s| s.nodes.get(node_id)?.catalog.unit(name).cloned())
+    /// The node `given` (its name or id) with what it offers the agent, as
+    /// `list(node)` shows it; none when there is no such node.
+    pub fn offer(&self, given: &str) -> Option<listing::Offer> {
+        let online = self.online_ids();
+        self.read(|s| {
+            let n = listing::find(&s.nodes, given)?;
+            Some(listing::offer(n, online.contains(&n.id)))
+        })
+    }
+
+    /// The names of the paired nodes, for an answer that names a node that
+    /// is not there.
+    pub fn node_names(&self) -> Vec<String> {
+        self.read(|s| s.nodes.values().map(|n| n.name.clone()).collect())
+    }
+
+    /// Where `execute` of `unit` on the node `given` (its name or id) goes,
+    /// with the unit to check the arguments against. `Ok(None)` when there
+    /// is no such node.
+    pub fn listed_unit(
+        &self,
+        given: &str,
+        unit: &str,
+    ) -> Result<Option<(Route, catalog::Unit)>, (String, listing::Miss)> {
+        self.read(|s| {
+            let Some(n) = listing::find(&s.nodes, given) else {
+                return Ok(None);
+            };
+            let u = listing::unit(n, unit).map_err(|m| (n.name.clone(), m))?;
+            let route = Route {
+                node_id: n.id.clone(),
+                node_name: n.name.clone(),
+                cap: u.cap.clone(),
+                action: u.action.clone(),
+                effect: u.effect,
+            };
+            Ok(Some((route, u)))
+        })
     }
 
     // ---- Sessions ----
@@ -2358,8 +2391,8 @@ impl Center {
         args: Map<String, Value>,
     ) -> Result<Value, CallError> {
         // Checked first: nothing is sent to a disabled node, not even the
-        // session mark. A call can still arrive here from a tool list that
-        // was read before the switch.
+        // session mark. `execute` refuses a disabled node before it gets
+        // here, but the switch may come in between.
         if self.read(|s| s.nodes.get(&route.node_id).is_some_and(|n| n.disabled)) {
             return Err(RpcError::new(
                 ErrorCode::Unavailable,
@@ -3180,7 +3213,6 @@ mod tests {
             node_name: node.into(),
             cap: "exec".into(),
             action: "run".into(),
-            profile: "exec".into(),
             effect: nerve_proto::Effect::Execute,
         }
     }
@@ -4368,7 +4400,6 @@ mod tests {
             node_name: "box-1".into(),
             cap: "fs".into(),
             action: "read".into(),
-            profile: "fs".into(),
             effect: nerve_proto::Effect::Read,
         };
         let took = Duration::from_millis(1500);

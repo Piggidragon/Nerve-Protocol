@@ -27,7 +27,10 @@ pub struct Unit {
     pub cap: String,
     pub action: String,
     pub effect: Effect,
+    /// The action's summary.
     pub summary: String,
+    /// The capability's summary, which `list` puts before the action's.
+    pub cap_summary: String,
     /// Always an object schema: a descriptor without params takes any
     /// arguments, as the node does.
     pub params: Value,
@@ -95,6 +98,7 @@ impl Catalog {
                     action: action.clone(),
                     effect: def.effect,
                     summary: def.summary.clone(),
+                    cap_summary: cap.summary.clone(),
                     params,
                     result: def.result.clone(),
                     provider: cap.provider.clone(),
@@ -107,8 +111,8 @@ impl Catalog {
     }
 
     /// The unit `name` (`cap.action`); none for a broken or unknown one.
-    /// Found by halving, since the tools are built by asking for each unit
-    /// of every node, under the store's lock.
+    /// Found by halving: `execute` and `list` ask for units under the
+    /// store's lock, and a node may offer many.
     pub fn unit(&self, name: &str) -> Option<&Unit> {
         self.units
             .binary_search_by(|u| u.name.as_str().cmp(name))
@@ -217,6 +221,7 @@ mod tests {
                 action: "read".into(),
                 effect: Effect::Read,
                 summary: "read it".into(),
+                cap_summary: "fs summary".into(),
                 params: path(),
                 result: Value::Null,
                 provider: "node".into(),
@@ -455,9 +460,9 @@ mod tests {
         );
     }
 
-    /// The tools are built by asking for every unit of every node under the
-    /// store's lock, so finding one must not scan them all: with a hundred
-    /// thousand units a scan each would take minutes.
+    /// Units are looked up under the store's lock, so finding one must not
+    /// scan them all: with a hundred thousand units a scan each would take
+    /// minutes.
     #[test]
     fn many_units_are_found_without_a_scan_each() {
         let units: Vec<Unit> = (0..100_000)
@@ -467,6 +472,7 @@ mod tests {
                 action: "a".into(),
                 effect: Effect::Read,
                 summary: String::new(),
+                cap_summary: String::new(),
                 params: Value::Null,
                 result: Value::Null,
                 provider: String::new(),

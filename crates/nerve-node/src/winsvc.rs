@@ -132,14 +132,9 @@ pub fn service_dacl(owners: &[String]) -> String {
     s
 }
 
-/// The owners (crate::owner): the account that installs joins them at
-/// install (`always`), and at an update only when there are none, as after
-/// an install from before them.
-fn put_owners(sys: &dyn WinSystem, always: bool, steps: &mut Steps) -> Result<(), String> {
+/// The owners (crate::owner): the account that installs joins them.
+fn put_owners(sys: &dyn WinSystem, steps: &mut Steps) -> Result<(), String> {
     let mut owners = sys.owners()?;
-    if !always && !owners.is_empty() {
-        return Ok(());
-    }
     let Some((sid, name)) = sys.owner_sid() else {
         steps.did("no owner besides the administrators");
         return Ok(());
@@ -404,7 +399,7 @@ fn install_steps(
         crate::eventlog::SOURCE,
         layout.paths.log_file().display()
     ));
-    put_owners(sys, true, steps)?;
+    put_owners(sys, steps)?;
     // Now that the service and the Event Log name this program.
     remove_node_alone(layout, sys, steps)?;
     sys.start()?;
@@ -428,8 +423,7 @@ fn remove_node_alone(
     let Some(node) = node_beside(layout) else {
         return Ok(());
     };
-    // A file only: a link to the app, as an earlier install made, goes with
-    // the uninstall.
+    // A file only: a link is never deleted here.
     if !std::fs::symlink_metadata(&node).is_ok_and(|m| m.is_file()) {
         return Ok(());
     }
@@ -716,11 +710,6 @@ async fn update_steps(
         .ok_or_else(|| {
             format!("the user {USER} is missing; `nerve-node install` makes it again")
         })?;
-    // A node installed before it wrote to the Event Log has no source there,
-    // and one whose source points elsewhere gets it back; it is the same
-    // program path after the update.
-    sys.put_event_source(layout)?;
-    put_owners(sys, false, steps)?;
     let new = match from {
         Some(f) => {
             let b = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
@@ -1880,7 +1869,7 @@ pub(crate) mod tests {
             "{out}"
         );
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.2.0\n");
-        assert_eq!(sys.calls()[calls..], ["event source", "stop", "start"]);
+        assert_eq!(sys.calls()[calls..], ["stop", "start"]);
         assert_eq!(sys.started.borrow().last().unwrap(), "nerve-node 1.2.0");
         for (p, b) in before {
             let now = std::fs::read(&p).unwrap();
@@ -1892,9 +1881,7 @@ pub(crate) mod tests {
         }
         assert_eq!(audit_events(&l).last().unwrap()["event"], "update");
         assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
-        // The same program again changes nothing, but registers the Event
-        // Log source of a node installed before there was one.
-        *sys.event_source.borrow_mut() = None;
+        // The same program again changes nothing.
         let calls = sys.calls().len();
         let mut out = Vec::new();
         update(&l, &sys, Some(&new), &mut out).await.unwrap();
@@ -1903,37 +1890,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("nothing to update")
         );
-        assert_eq!(sys.calls()[calls..], ["event source"]);
-        assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
-    }
-
-    /// An install from before the owners gets the one who updates as its
-    /// owner; an update after that changes none.
-    #[tokio::test]
-    async fn an_update_gives_an_earlier_install_its_owner() {
-        let d = tempfile::tempdir().unwrap();
-        let sys = Fake::new();
-        let l = installed(d.path(), &sys, "1.0.0");
-        sys.owner_list.borrow_mut().clear();
-        *sys.installer.borrow_mut() = Some(("S-1-5-21-1-2-3-1002".into(), "bob".into()));
-        let new = d.path().join("new.exe");
-        std::fs::write(&new, "nerve-node 1.2.0\n").unwrap();
-        let mut out = Vec::new();
-        update(&l, &sys, Some(&new), &mut out).await.unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("bob is an owner of the node"), "{out}");
-        assert_eq!(*sys.owner_list.borrow(), ["S-1-5-21-1-2-3-1002"]);
-        // The owners are set before the service starts again.
-        let calls = sys.calls();
-        let owners = calls.iter().position(|c| c.starts_with("owners"));
-        let start = calls.iter().rposition(|c| c == "start");
-        assert!(owners < start, "{calls:?}");
-        *sys.installer.borrow_mut() = Some(("S-1-5-21-1-2-3-1004".into(), "dave".into()));
-        std::fs::write(&new, "nerve-node 1.3.0\n").unwrap();
-        let mut out = Vec::new();
-        update(&l, &sys, Some(&new), &mut out).await.unwrap();
-        assert!(!String::from_utf8(out).unwrap().contains("owner"));
-        assert_eq!(*sys.owner_list.borrow(), ["S-1-5-21-1-2-3-1002"]);
+        assert!(sys.calls()[calls..].is_empty(), "{:?}", sys.calls());
     }
 
     /// The service's DACL gives each owner start, stop and asking, and
@@ -1988,10 +1945,7 @@ pub(crate) mod tests {
         assert!(e.contains("did not start"), "{e}");
         assert!(e.contains("the old one does not either"), "{e}");
         // The old program is started again, even though here it fails too.
-        assert_eq!(
-            sys.calls()[calls..],
-            ["event source", "stop", "start", "stop", "start"]
-        );
+        assert_eq!(sys.calls()[calls..], ["stop", "start", "stop", "start"]);
         assert_eq!(
             sys.started.borrow()[starts..],
             ["nerve-node 2.0.0", "nerve-node 1.2.0"]
@@ -2029,10 +1983,7 @@ pub(crate) mod tests {
         assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
         // The new program was started and stopped, then the old one started
         // after it was put back: the node is up again.
-        assert_eq!(
-            sys.calls()[calls..],
-            ["event source", "stop", "start", "stop", "start"]
-        );
+        assert_eq!(sys.calls()[calls..], ["stop", "start", "stop", "start"]);
         assert_eq!(
             sys.started.borrow()[starts..],
             ["nerve-node 2.0.0", "nerve-node 1.2.0"]
@@ -2174,20 +2125,6 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
         assert!(!l.bin.exists() && std::fs::symlink_metadata(&node).is_err());
-
-        // A link an earlier build made stays at install and goes with the
-        // uninstall.
-        #[cfg(unix)]
-        {
-            install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap();
-            std::os::unix::fs::symlink(&l.bin, &node).unwrap();
-            install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap();
-            assert_eq!(std::fs::read_link(&node).unwrap(), l.bin);
-            let mut out = Vec::new();
-            uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
-            assert!(String::from_utf8(out).unwrap().contains("removed the link"));
-            assert!(std::fs::symlink_metadata(&node).is_err());
-        }
     }
 
     #[tokio::test]

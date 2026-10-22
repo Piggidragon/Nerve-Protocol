@@ -46,7 +46,7 @@ pub struct Check {
     /// `ok`, `unreachable` or `certificate`.
     pub reach: &'static str,
     /// The center's word for the code: `open`, `used`, `gone` or `busy`;
-    /// `unknown` when the center has no check (an older one) or did not
+    /// `unknown` when the center has no check (protocol §3.2) or did not
     /// answer it; `None` when it was not reached.
     pub code: Option<String>,
     /// Why pairing cannot work now, in words; `None` when it can, or may.
@@ -132,7 +132,7 @@ pub async fn check(paths: &NodePaths, link: &PairLink) -> Result<Check, String> 
             .and_then(|v| v["code"].as_str().map(str::to_string))
             .filter(|c| ["open", "used", "gone", "busy"].contains(&c.as_str()))
             .unwrap_or_else(|| "unknown".into()),
-        // A center from before the check (404), or one that failed it: the
+        // A center without the check (404), or one that failed it: the
         // pairing itself will say.
         _ => "unknown".into(),
     };

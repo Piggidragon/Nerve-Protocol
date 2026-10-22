@@ -617,5 +617,15 @@ async fn wrong_args_never_reach_the_provider() {
         .unwrap()
         .expect("answered");
     assert_eq!(v, json!({"on": true}));
+    // The arguments are checked before the policy, so only the call that fits
+    // is decided and audited: the refused ones never show up as allowed.
+    let audit = std::fs::read_to_string(daemon.paths().audit_log()).unwrap();
+    let decided: Vec<Value> = audit
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["cap"] == "lamp")
+        .collect();
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["decision"], "allowed", "{decided:?}");
     daemon.stop().await;
 }

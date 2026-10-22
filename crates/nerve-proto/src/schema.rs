@@ -31,6 +31,10 @@ pub const MAX_RESULT_DEPTH: usize = 4;
 pub const MAX_PROPERTIES: usize = 32;
 /// The most bytes a schema may take as compact JSON text.
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
+/// The most values one `enum` may list. Each argument is compared with
+/// them in turn, so this bounds the work per argument; a longer choice is
+/// more than a model can read anyway.
+pub const MAX_ENUM_VALUES: usize = 256;
 
 /// What a schema describes, which sets how deep it may nest and what its
 /// root must be.
@@ -343,6 +347,12 @@ fn node<'a>(
                 next.push((v, below(at, word)));
             }
             "enum" => match v.as_array() {
+                Some(e) if e.len() > MAX_ENUM_VALUES => {
+                    return Err(fail(
+                        word,
+                        format!("lists more than {MAX_ENUM_VALUES} values"),
+                    ));
+                }
                 Some(e) if !e.is_empty() => {
                     if let Some(t) = types
                         && let Some(x) = e.iter().find(|x| !t.fits(x))
@@ -436,20 +446,24 @@ fn node<'a>(
             ));
         }
     }
-    let values = [
-        (
-            "enum",
-            m.get("enum").and_then(Value::as_array).map(Vec::as_slice),
-        ),
-        ("const", m.get("const").map(std::slice::from_ref)),
-    ];
-    for (word, values) in values {
-        if let Some(x) = values.into_iter().flatten().find(|x| !fits(m, x)) {
-            return Err(fail(
-                word,
-                format!("{x} does not keep to the schema's other keywords"),
-            ));
-        }
+    // An enum's own values are in it, so they are held to the type, the
+    // bounds and the const without looking each one up in the enum again.
+    let holds = |x: &Value| keeps(m, x) && m.get("const").is_none_or(|c| same(c, x));
+    let off = |word: &str, x: &Value| {
+        fail(
+            word,
+            format!("{x} does not keep to the schema's other keywords"),
+        )
+    };
+    if let Some(Value::Array(e)) = m.get("enum")
+        && let Some(x) = e.iter().find(|x| !holds(x))
+    {
+        return Err(off("enum", x));
+    }
+    if let Some(c) = m.get("const")
+        && !fits(m, c)
+    {
+        return Err(off("const", c));
     }
     Ok(())
 }
@@ -729,20 +743,68 @@ pub fn validate(schema: &Value, args: &Value) -> Result<(), ArgError> {
 }
 
 /// Whether `v` meets the keywords of `m` that concern `v` itself, not its
-/// members. As in JSON Schema, a bound applies only to values of its kind.
+/// members.
 fn fits(m: &Map<String, Value>, v: &Value) -> bool {
+    keeps(m, v) && is_listed(m, v) && m.get("const").is_none_or(|c| same(c, v))
+}
+
+/// Whether `v` is one of `m`'s `enum`, if it has one.
+fn is_listed(m: &Map<String, Value>, v: &Value) -> bool {
+    match m.get("enum") {
+        Some(Value::Array(e)) => e.iter().any(|x| same(x, v)),
+        _ => true,
+    }
+}
+
+/// Whether two values are equal as JSON Schema counts it: numbers by their
+/// value, so `1.0` is `1`, and arrays and objects member by member.
+fn same<'a>(mut a: &'a Value, mut b: &'a Value) -> bool {
+    // Filled only for arrays and objects, so comparing two plain values,
+    // which an argument against an enum mostly is, allocates nothing.
+    let mut stack = Vec::new();
+    loop {
+        match (a, b) {
+            // Two integers or two floats are equal as `Number`s exactly
+            // when their values are; only an integer and a float need the
+            // comparison by value.
+            (Value::Number(x), Value::Number(y)) => {
+                if x != y && (x.is_f64() == y.is_f64() || cmp_num(x, y) != Some(Ordering::Equal)) {
+                    return false;
+                }
+            }
+            (Value::Array(x), Value::Array(y)) => {
+                if x.len() != y.len() {
+                    return false;
+                }
+                stack.extend(x.iter().zip(y));
+            }
+            (Value::Object(x), Value::Object(y)) => {
+                if x.len() != y.len() {
+                    return false;
+                }
+                for (k, v) in x {
+                    let Some(w) = y.get(k) else { return false };
+                    stack.push((v, w));
+                }
+            }
+            (a, b) => {
+                if a != b {
+                    return false;
+                }
+            }
+        }
+        let Some((x, y)) = stack.pop() else {
+            return true;
+        };
+        (a, b) = (x, y);
+    }
+}
+
+/// Whether `v` has `m`'s type and keeps to its bounds. As in JSON Schema, a
+/// bound applies only to values of its kind.
+fn keeps(m: &Map<String, Value>, v: &Value) -> bool {
     if let Some(Ok(t)) = m.get("type").map(types)
         && !t.fits(v)
-    {
-        return false;
-    }
-    if let Some(Value::Array(e)) = m.get("enum")
-        && !e.contains(v)
-    {
-        return false;
-    }
-    if let Some(c) = m.get("const")
-        && c != v
     {
         return false;
     }
@@ -776,16 +838,16 @@ fn expected(m: &Map<String, Value>) -> String {
     if let Some(c) = m.get("const") {
         return format!("exactly {c}");
     }
-    let types = m.get("type").and_then(|t| types(t).ok());
-    let mut s = if let Some(Value::Array(e)) = m.get("enum") {
+    // An enum's values say themselves whether null is one of them.
+    if let Some(Value::Array(e)) = m.get("enum") {
         let values: Vec<String> = e.iter().map(Value::to_string).collect();
-        format!("one of {}", values.join(", "))
-    } else if let Some(t) = types {
-        format!("{}{}", t.ty.noun(), bounds(t.ty, m))
-    } else {
-        "a value".into()
+        return format!("one of {}", values.join(", "));
+    }
+    let Some(t) = m.get("type").and_then(|t| types(t).ok()) else {
+        return "a value".into();
     };
-    if types.is_some_and(|t| t.null && t.ty != Ty::Null) {
+    let mut s = format!("{}{}", t.ty.noun(), bounds(t.ty, m));
+    if t.null && t.ty != Ty::Null {
         s.push_str(", or null");
     }
     s
@@ -1300,6 +1362,87 @@ mod tests {
         assert!(e.reason.contains("over 16 KiB"), "{e}");
         let took = start.elapsed();
         assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    }
+
+    #[test]
+    fn enum_limit() {
+        // Each argument is compared with an enum's values in turn, so their
+        // number is held to a limit as the properties are.
+        let e = |n: usize| -> Vec<Value> { (0..n).map(Value::from).collect() };
+        let s = with(json!({"type": "integer", "enum": e(MAX_ENUM_VALUES)}));
+        assert_eq!(check(&s, Role::Params), Ok(()));
+        let s = with(json!({"type": "integer", "enum": e(MAX_ENUM_VALUES + 1)}));
+        let e = check(&s, Role::Params).unwrap_err();
+        assert_eq!(e.pointer, "/properties/a/enum");
+        assert!(e.reason.contains("more than 256 values"), "{e}");
+    }
+
+    #[test]
+    fn enum_and_const_compare_numbers_by_value() {
+        let ok = |s: Value, a: Value| {
+            let s = with(s);
+            assert_eq!(check(&s, Role::Params), Ok(()), "{s}");
+            assert_eq!(validate(&s, &json!({"a": a})), Ok(()), "{s} {a}");
+        };
+        ok(json!({"type": "number", "enum": [0.5, 1, 2]}), json!(1.0));
+        ok(json!({"type": "number", "enum": [0.5, 1, 2]}), json!(0.50));
+        ok(json!({"type": "number", "const": 0}), json!(0.0));
+        ok(json!({"type": "number", "const": 0}), json!(-0.0));
+        ok(
+            json!({"enum": [{"a": [1, "x"]}, 3]}),
+            json!({"a": [1.0, "x"]}),
+        );
+        ok(
+            json!({"type": "number", "enum": [1.0], "const": 1}),
+            json!(1),
+        );
+        // Not the same value, or not the same kind of value.
+        let s = with(json!({"type": "number", "enum": [0.5, 1, 2]}));
+        assert!(validate(&s, &json!({"a": 1.5})).is_err());
+        let s = with(json!({"enum": [1, [1], {"a": 1}]}));
+        for a in [
+            json!("1"),
+            json!(true),
+            json!([1, 1]),
+            json!({"a": 1, "b": 1}),
+            json!({"b": 1}),
+        ] {
+            assert!(validate(&s, &json!({"a": a})).is_err(), "{a}");
+        }
+        // An integer is still written without a fraction (§6.1).
+        let s = with(json!({"type": "integer", "enum": [1, 2]}));
+        assert!(validate(&s, &json!({"a": 1.0})).is_err());
+    }
+
+    #[test]
+    fn an_enum_names_null_only_when_it_holds_it() {
+        for (s, want) in [
+            (
+                json!({"type": ["string", "null"], "enum": ["fast", "slow"]}),
+                "one of \"fast\", \"slow\"",
+            ),
+            (
+                json!({"type": ["string", "null"], "enum": ["fast", null]}),
+                "one of \"fast\", null",
+            ),
+        ] {
+            let s = with(s);
+            assert_eq!(check(&s, Role::Params), Ok(()), "{s}");
+            for a in [json!("medium"), json!(null)] {
+                if a.is_null() && want.ends_with("null") {
+                    assert_eq!(validate(&s, &json!({"a": a})), Ok(()), "{s}");
+                    continue;
+                }
+                assert_eq!(
+                    validate(&s, &json!({"a": a})),
+                    Err(ArgError {
+                        field: "a".into(),
+                        expected: want.into()
+                    }),
+                    "{s} {a}"
+                );
+            }
+        }
     }
 
     #[test]

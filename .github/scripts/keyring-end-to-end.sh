@@ -66,6 +66,7 @@ diagnostics() {
   journalctl -u nerve-node --no-pager -n 60 2>&1 || true
   loginctl list-users 2>&1 || true
   nuid=$(id -u nerve 2>/dev/null || true)
+  [ -z "$nuid" ] || systemctl status "user@$nuid.service" "user-runtime-dir@$nuid.service" --no-pager -l 2>&1 | tail -30 || true
   [ -z "$nuid" ] || journalctl -u "user@$nuid" --no-pager -n 40 2>&1 || true
   # What the session of nerve was given: its manager's environment, the
   # system-wide one every login reads, and this script's own session.
@@ -217,8 +218,23 @@ step "5b. The session of nerve starts again, as at a reboot"
 # yet in every image: a failure is noted, the next step tests the node's own
 # repair, and the script fails at its end.
 GENERATOR_FAILED=
+# A reboot stops the session's manager and, much later, starts a new one.
+# `systemctl restart user@N` starts the new one in the same second, and on
+# systemd 249 (Ubuntu 22.04) that fails with status 219/CGROUP while the old
+# cgroup is still being removed (nothing of nerve-node's, and before any
+# generator runs). So: stop, wait until the cgroup is gone, start, and try
+# the start again a few times.
 restart_session() {
-  systemctl restart "user@$NERVE_UID.service"
+  local cg="/sys/fs/cgroup/user.slice/user-$NERVE_UID.slice/user@$NERVE_UID.service"
+  systemctl stop "user@$NERVE_UID.service"
+  for _ in $(seq 1 60); do [ -e "$cg" ] || break; sleep 0.5; done
+  local started=
+  for _ in 1 2 3 4 5; do
+    if systemctl start "user@$NERVE_UID.service"; then started=1; break; fi
+    systemctl status "user@$NERVE_UID.service" --no-pager -l 2>&1 | tail -15 || true
+    sleep 3
+  done
+  [ -n "$started" ] || fail "the session of nerve does not start again"
   for _ in $(seq 1 60); do [ -S "/run/user/$NERVE_UID/bus" ] && break; sleep 1; done
   [ -S "/run/user/$NERVE_UID/bus" ] || fail "nerve has no session bus after its session started again"
   nerve_env systemctl --user show-environment | tee "$1"

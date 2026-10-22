@@ -141,7 +141,7 @@ JSON is a failure of the check, not an empty result.
 | 4 | a result is device content, in the text and in the envelope of `structuredContent`: the object is its `result` |
 | 4 | arguments that do not fit (one missing, of another type, one too many) are `error invalid_args` naming the field, and never reach the node |
 | 4 | a misspelt capability or node is answered with the name it was likely meant to be |
-| 4 | a failure on the node is `error <code>: <message>` |
+| 4 | a failure on the node is `error <code>: node <name> answered: <message>` |
 | 4 | `execute` reaches the node it names |
 | 4 | a capability whose `params` changed since `list` gave its details is `error list_first` until it is listed again |
 | 4 | a change to another capability of the node needs no new `list` |

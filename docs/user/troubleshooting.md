@@ -13,7 +13,8 @@ For a link that drops, a pairing that fails or an error, open the center's
 ## A call is refused
 
 The agent sees `error forbidden: …` or `error disabled: …`. Every refusal
-names its reason.
+names its reason. One the machine gave reads
+`error forbidden: node box-1 answered: …`.
 
 | Message | Cause | Fix |
 |---|---|---|

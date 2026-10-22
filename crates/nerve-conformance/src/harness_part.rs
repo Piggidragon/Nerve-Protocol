@@ -790,6 +790,17 @@ fn check_error_result(result: &Value, code: &str) -> Result<(), String> {
     )
 }
 
+/// A node's failure: `error <code>: node <name> answered: <message>`, so
+/// the model never takes the node's words for the center's.
+fn check_node_error(result: &Value, code: &str, node: &str) -> Result<(), String> {
+    check_error_result(result, code)?;
+    let text = text_of(result);
+    ensure(
+        text.starts_with(&format!("error {code}: node {node} answered: ")),
+        format!("the text is {text:?}, wanted `error {code}: node {node} answered: ...`"),
+    )
+}
+
 /// An `error <code>` whose message names `name`: the field that does not
 /// fit, or the name a misspelt one was meant to be.
 fn check_error_names(result: &Value, code: &str, name: &str) -> Result<(), String> {
@@ -1146,10 +1157,10 @@ pub async fn run(target: &Target) -> Report {
     );
     r.check(
         "harness 4",
-        "a failure on the node is `error <code>: <message>`",
+        "a failure on the node is `error <code>: node <name> answered: <message>`",
         s1.run(A, "echo.fail", json!({}))
             .await
-            .and_then(|res| check_error_result(&res, "io")),
+            .and_then(|res| check_node_error(&res, "io", A)),
     );
     // Session 2 calls A as well, so a node is used by two sessions.
     let calls_s1 = a.calls();
@@ -1621,6 +1632,21 @@ mod tests {
         assert!(check_error_result(&e, "unavailable").is_err());
         e["content"][0]["text"] = json!("invalid_args without the word error");
         assert!(check_error_result(&e, "invalid_args").is_err());
+    }
+
+    #[test]
+    fn a_nodes_failure_is_said_to_be_the_nodes() {
+        let mut e = content(
+            "error io: node a answered: it failed on purpose",
+            Value::Null,
+        );
+        e["isError"] = json!(true);
+        assert!(check_node_error(&e, "io", "a").is_ok());
+        assert!(check_node_error(&e, "io", "b").is_err());
+        assert!(check_node_error(&e, "internal", "a").is_err());
+        // In the center's voice, unmarked.
+        e["content"][0]["text"] = json!("error io: it failed on purpose");
+        assert!(check_node_error(&e, "io", "a").is_err());
     }
 
     #[test]

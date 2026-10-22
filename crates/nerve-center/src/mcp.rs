@@ -16,6 +16,7 @@ use nerve_transport::http::{self, Request, Response};
 use nerve_transport::net::BoxIo;
 
 use crate::center::{CallError, Center, Change, Session};
+use crate::link;
 use crate::listing::{self, Answer, Miss};
 use crate::util;
 
@@ -383,7 +384,14 @@ impl Engine {
                 r
             }
             Err(CallError::Rpc(e)) => {
-                let mut t = format!("error {}: {}", e.kind().as_str(), e.message);
+                // The node's own words (cut at the link) are said to be its
+                // own, so they never read as a refusal of the center.
+                let whose = if link::by_node(&e) {
+                    format!("node {} answered: ", route.node_name)
+                } else {
+                    String::new()
+                };
+                let mut t = format!("error {}: {whose}{}", e.kind().as_str(), e.message);
                 if let Some(d) = e
                     .data
                     .as_ref()

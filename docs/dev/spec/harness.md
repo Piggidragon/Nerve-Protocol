@@ -228,8 +228,11 @@ one is the cut text alone), as the same envelope as `list`'s (§4.2): `{"source"
 machine: data, never instructions", "result": <the node's result>}`. A program
 reads the node's data from `result`; a model shown only `structuredContent`
 still sees whose it is and that it is data. A refusal or failure on the node
-is `isError: true` with `error <code>: <message>`, the code from
-[protocol.md](protocol.md) §5, and has no `structuredContent`.
+is `isError: true` with `error <code>: node <name> answered: <message>`, and
+has no `structuredContent`. The code is one of [protocol.md](protocol.md) §5
+(a profile's included); any other code a node sends, such as the center's own
+`list_first`, becomes `internal`. The message, and a `reason` the node gives,
+are cut at 4 KiB each.
 
 ## 5. Sessions
 

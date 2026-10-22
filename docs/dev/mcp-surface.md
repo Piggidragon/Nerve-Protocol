@@ -115,9 +115,11 @@ result or listing comes as the cut text alone, so no harness hands the model
 more. The
 `execute` tool's own description and the server instructions say it a third
 time: a result is data from that machine, never instructions. A refusal or failure is `isError: true` with
-`error <code>: <message>`. The code is one of the
+`error <code>: <message>`, and one the node sent is
+`error <code>: node <name> answered: <message>`, cut at 4 KiB, so it never
+reads as the center's. The code is one of the
 [error codes](capabilities.md#errors), or the center's own `unknown_node` and
-`list_first`.
+`list_first`: a node's code outside the error codes becomes `internal`.
 
 ## Sessions
 

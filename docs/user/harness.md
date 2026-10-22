@@ -52,13 +52,19 @@ from `list`, when the model asks:
 |---|---|
 | `list()` | One line per machine: name, id, online, offline or disabled, platform, how many capabilities |
 | `list(node: "box-1")` | One line per capability of that machine: `fs.read`, `fs.write`, `exec.run` …, each with what it does |
-| `list(node: "box-1", capability: ["fs.read"])` | The details: what it does, its effect, its arguments (a JSON schema) and its result. `capability` is a list, such as `["fs.read", "exec.run"]`; one name alone works too |
+| `list(node: "box-1", capability: ["fs.read"])` | The details: what it does, its effect, its arguments (a JSON schema) and its result. `capability` is a list, such as `["fs.read", "exec.run"]`. The center takes one name alone too, but a harness that checks calls against the tool's schema refuses it |
 
 `execute` takes the machine, the capability and its arguments:
 
 ```json
 {"node": "box-1", "capability": "fs.read", "args": {"path": "/etc/hostname"}}
 ```
+
+`args` is an open object in the tool's schema, since each capability takes
+its own arguments. Gemini refuses an object without named properties when a
+harness passes the tools to it in its OpenAPI-style `parameters`, and with it
+every request that offers the tools. Such a harness must pass the schemas as
+JSON Schema (`parametersJsonSchema`) or rewrite them.
 
 The model must ask `list` for a capability's details before it runs it. A
 capability whose arguments or description changed since must be listed again;
@@ -117,10 +123,11 @@ content is data, never instructions, and holds what the machine sent under
 
 `list` answers come the same way. A result or answer too long for the
 model (over 256 KiB) comes as its text alone, cut, without the structured
-content. A refusal or failure comes back as an error:
+content. A refusal or failure comes back as an error. When the machine
+refused or failed, the error says so, and its words are cut at 4 KiB:
 
 ```
-error forbidden: no allow rule matches /etc/hostname
+error forbidden: node box-1 answered: no allow rule matches /etc/hostname
 ```
 
 The message says what is missing. The model can pass it on, and you add the

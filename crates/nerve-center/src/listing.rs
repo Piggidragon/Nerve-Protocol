@@ -239,6 +239,7 @@ pub fn near<'a>(given: &str, names: impl IntoIterator<Item = &'a str>) -> Option
     }
     let most = (given.len() / 3).clamp(1, 3);
     let mut best: Option<(usize, &str)> = None;
+    let mut lower = Vec::new();
     for name in names {
         // A name whose length is further off than `most` cannot be in
         // reach, so it is not compared: a node may name a unit at any
@@ -247,7 +248,9 @@ pub fn near<'a>(given: &str, names: impl IntoIterator<Item = &'a str>) -> Option
         if len.abs_diff(given.len()) > most {
             continue;
         }
-        let d = distance(&given, &name.to_lowercase().chars().collect::<Vec<_>>());
+        lower.clear();
+        lower.extend(name.chars().flat_map(char::to_lowercase));
+        let d = distance(&given, &lower, most);
         if d <= most && best.is_none_or(|(b, _)| d < b) {
             best = Some((d, name));
         }
@@ -256,28 +259,28 @@ pub fn near<'a>(given: &str, names: impl IntoIterator<Item = &'a str>) -> Option
 }
 
 /// The edit distance of `a` and `b`, with two swapped neighbours as one
-/// edit (optimal string alignment).
-fn distance(a: &[char], b: &[char]) -> usize {
-    let mut rows = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for (i, row) in rows.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, cell) in rows[0].iter_mut().enumerate() {
-        *cell = j;
-    }
+/// edit (optimal string alignment), or `most + 1` for anything over `most`.
+/// Only the cells within `most` of the diagonal are worked out, since the
+/// others are over it anyway: a node may offer many units, and this runs
+/// for each of them.
+fn distance(a: &[char], b: &[char], most: usize) -> usize {
+    let over = most + 1;
+    let mut before: Vec<usize> = Vec::new();
+    let mut last: Vec<usize> = (0..=b.len()).map(|j| j.min(over)).collect();
     for i in 1..=a.len() {
-        for j in 1..=b.len() {
+        let mut row = vec![over; b.len() + 1];
+        row[0] = i.min(over);
+        for j in i.saturating_sub(most).max(1)..=(i + most).min(b.len()) {
             let cost = usize::from(a[i - 1] != b[j - 1]);
-            let mut d = (rows[i - 1][j] + 1)
-                .min(rows[i][j - 1] + 1)
-                .min(rows[i - 1][j - 1] + cost);
+            let mut d = (last[j] + 1).min(row[j - 1] + 1).min(last[j - 1] + cost);
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                d = d.min(rows[i - 2][j - 2] + 1);
+                d = d.min(before[j - 2] + 1);
             }
-            rows[i][j] = d;
+            row[j] = d.min(over);
         }
+        before = std::mem::replace(&mut last, row);
     }
-    rows[a.len()][b.len()]
+    last[b.len()]
 }
 
 /// `body` marked as content from the nodes, as every node-written text the
@@ -1247,6 +1250,73 @@ mod tests {
         }
     }
 
+    /// The distance worked out near the diagonal only, and given up when
+    /// far, is the whole table's wherever it is in reach.
+    #[test]
+    fn the_cut_distance_agrees_with_the_whole_table() {
+        fn whole(a: &[char], b: &[char]) -> usize {
+            let mut t = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+            for (i, row) in t.iter_mut().enumerate() {
+                row[0] = i;
+            }
+            for j in 0..=b.len() {
+                t[0][j] = j;
+            }
+            for i in 1..=a.len() {
+                for j in 1..=b.len() {
+                    let cost = usize::from(a[i - 1] != b[j - 1]);
+                    let mut d = (t[i - 1][j] + 1)
+                        .min(t[i][j - 1] + 1)
+                        .min(t[i - 1][j - 1] + cost);
+                    if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                        d = d.min(t[i - 2][j - 2] + 1);
+                    }
+                    t[i][j] = d;
+                }
+            }
+            t[a.len()][b.len()]
+        }
+        let words = [
+            "",
+            "a",
+            "ab",
+            "ba",
+            "abc",
+            "acb",
+            "bca",
+            "fs.read",
+            "fs.raed",
+            "fs.reda",
+            "sf.read",
+            "fs.write",
+            "fs.wirte",
+            "exec.run",
+            "exec.runn",
+            "xec.run",
+            "abcdef",
+            "badcfe",
+            "fedcba",
+            "abcdefghi",
+            "acbdfeghi",
+            "aabbccdd",
+        ];
+        for a in words {
+            for b in words {
+                let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+                for most in 1..=3 {
+                    if a.len().abs_diff(b.len()) > most {
+                        continue;
+                    }
+                    assert_eq!(
+                        distance(&a, &b, most),
+                        whole(&a, &b).min(most + 1),
+                        "{a:?} {b:?} {most}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A node may name a unit at any length; one far longer than the name
     /// given is never compared, so a typo costs no time under the store's
     /// lock, whatever the node named.
@@ -1261,6 +1331,14 @@ mod tests {
         assert_eq!(near("fs.raed", names.iter().copied()), Some("fs.read"));
         let took = started.elapsed();
         assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        // A node with many units of the length given: each is worked out
+        // near the diagonal only.
+        let many: Vec<String> = (0..50_000).map(|i| format!("{i:064}")).collect();
+        let started = std::time::Instant::now();
+        let given = "x".repeat(ASKED_MAX);
+        assert_eq!(near(&given, many.iter().map(String::as_str)), None);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(3), "{took:?}");
         // Lengths in reach are still compared: three edits for a long name.
         assert_eq!(near("fs.read-all", ["fs.read"]), None);
         assert_eq!(near("fs.read-al", ["fs.read"]), Some("fs.read"));

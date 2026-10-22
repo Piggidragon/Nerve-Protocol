@@ -43,7 +43,7 @@ motion, nothing moves. On a phone the menu opens from the button at the top.
   disabled), platform, a short summary and what it offers. Buttons: Rename,
   Disable or Enable, Remove. Under **Not offered to the agent** a card lists
   the actions the center left out, each with the reason: a name with a
-  character other than letters, digits and `-`, or a schema the center
+  character other than letters, digits, `-` and `_`, or a schema the center
   cannot check (arguments or result, for example one with `oneOf`). When a
   capability's `state` or the data of one of its events has such a schema,
   every action of it is left out, with a reason that starts with `state:` or
@@ -57,8 +57,8 @@ motion, nothing moves. On a phone the menu opens from the button at the top.
   session.
 - Alerts, for example a machine whose key is in use twice.
 
-A disabled machine stays paired and connected. The agent gets none of its tools
-and calls to it are refused.
+A disabled machine stays paired and connected. The agent's `list` shows it as
+disabled with no capabilities, and calls to it are refused.
 
 ### Statistics
 

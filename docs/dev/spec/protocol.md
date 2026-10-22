@@ -583,10 +583,10 @@ over the center's message limit: the call fails with `too_large` instead.
     "events": {}, "state": null, "streams": {}}]}
 ```
 
-- Capability ids and action names use ASCII letters, digits and `-`, never
-  `_`: a harness joins node, capability and action with `_` into one tool
-  name (`docs/dev/spec/harness.md`), and a `_` inside a part would make that name
-  ambiguous. A center leaves out every action of a capability whose id is
+- Capability ids and action names use ASCII letters, digits, `-` and `_`,
+  never `.`: the harness side names an action `<cap>.<action>`
+  (`docs/dev/spec/harness.md` §4.1), and a `.` inside a part would make that
+  name ambiguous. A center leaves out every action of a capability whose id is
   outside that set, and an action whose name is; it keeps the rest of the
   descriptor.
 - Effects: `read`, `sense`, `write`, `actuate`, `execute`.
@@ -707,9 +707,9 @@ concurrently.
   the owner's (`limits` of `node.toml`, node-local §2). The descriptor states
   them in the action's text, as the `default` of the `timeout_ms`
   parameter and in its `description`, in milliseconds; it has no `maximum`,
-  as a larger value is cut to the most and not refused. As that parameter
-  differs between nodes with other limits, a center does not merge their
-  `exec.run` into one tool.
+  as a larger value is cut to the most and not refused. A change of either
+  changes `exec.run`'s schema, so a harness lists it again before its next
+  run (harness.md §4.3).
 - state: `{shell, confinement}`; event `exit {call, exit_code}` (needs `sub`).
 - Output is capped at `limits.output_cap_bytes` of the node's config;
   `truncated` says it was cut.
@@ -775,4 +775,4 @@ browser or tool) to the node; the center only relays it.
 
 ## 8. Center side
 
-The center serves harnesses. `nerve-center` is an MCP server ([harness.md](harness.md)). It maps capabilities to tools, holds sessions, may refuse a call with its action checker before it reaches the node, and never stores file contents or command output; its one secret is the token of the checker's model endpoint.
+The center serves harnesses. `nerve-center` is an MCP server ([harness.md](harness.md)). It offers capabilities through two tools, `list` and `execute`, holds sessions, may refuse a call with its action checker before it reaches the node, and never stores file contents or command output; its one secret is the token of the checker's model endpoint.

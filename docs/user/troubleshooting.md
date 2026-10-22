@@ -50,8 +50,24 @@ names its reason.
 | `commands run WITHOUT these limits: …` in `status` | The node has no cgroup of its own: started in a terminal | [Where the limits hold](limits.md#where-the-limits-hold) |
 | `the cgroup … no longer passes on the controllers the node turned on`, or `NO COMMAND RUNS` in `status` | Something turned a limit off in the node's cgroup while it ran, such as a reload of a service manager that did not delegate it | Start the node again; give its unit `Delegate=yes` ([limits](limits.md#where-the-limits-hold)) |
 
-The agent sees only the tools a machine could allow. If it sees only `nodes`,
-nothing is allowed yet.
+`list` shows only the capabilities a machine could allow. If it shows none
+for a machine, nothing is allowed yet: in `allowlist` mode, add a
+[rule](rules.md) or choose a [mode](modes.md).
+
+## The center refuses a call itself
+
+These come from the center, before the machine gets the call, so they are not
+in the machine's audit log. The model can mostly fix them by itself.
+
+| Message | Cause | Fix |
+|---|---|---|
+| `list_first: call list with node "…" and capability "…" first` | The model ran a capability without asking `list` for its details in this session | The model calls `list` with that node and capability, then runs it again |
+| `list_first: "…" on node … changed since list gave its details` | The capability's arguments or description changed since, for example after a change of the machine's limits | The model lists it again |
+| `invalid_args: <field>: expected …` | The arguments do not fit the capability's schema | The model fixes that field |
+| `unknown_capability: node … offers no "…"` | The machine offers no capability of that name, maybe with `(did you mean "…"?)`. Or the center left it out: then the Overview names it under **Not offered to the agent** ([web UI](web-ui.md#overview)) | Check the name with `list`. If it should be offered, allow it on the machine |
+| `unknown_node: there is no node "…"` | No paired machine has that name or id; the message names the ones there are | Use one of those names |
+| `unavailable: node … is disabled in the center` | You disabled the machine in the center | **Enable** it on the Overview |
+| `forbidden: "…" is turned off on node … by its owner` | `cap set … off` on the machine | `nerve-node cap set <capability> on` |
 
 ## The center's action checker refuses a call
 

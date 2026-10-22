@@ -63,8 +63,8 @@ cannot tell yet what it does. An entry a center wrote while the capability
 did not sense stays when a new version of the program makes it sense: after
 such an update, check `nerve-node rule ls allow` and `nerve-node cap ls`.
 
-When the program exits, its capabilities leave the centers' tool lists, and a
-call that was waiting for it fails with `unavailable`.
+When the program exits, its capabilities leave what `list` shows the centers,
+and a call that was waiting for it fails with `unavailable`.
 
 ## What its schemas may say
 

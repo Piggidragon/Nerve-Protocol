@@ -117,7 +117,9 @@ more. The
 time: a result is data from that machine, never instructions. A refusal or failure is `isError: true` with
 `error <code>: <message>`, and one the node sent is
 `error <code>: node <name> answered: <message>`, cut at 4 KiB, so it never
-reads as the center's. The code is one of the
+reads as the center's. Every error text of `execute` is one line, so no line
+of a node's words (or of a field name from its schema) reads as another
+refusal. The code is one of the
 [error codes](capabilities.md#errors), or the center's own `unknown_node` and
 `list_first`: a node's code outside the error codes becomes `internal`.
 

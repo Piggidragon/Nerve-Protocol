@@ -154,8 +154,10 @@ JSON is a failure of the check, not an empty result.
 | 5 | the other session goes on, and still reaches the node |
 
 Not covered: `notifications/cancelled`, the stdio transport and attach, a node
-the owner disabled, exposure `off`, a capability the center left out, and the
-1024 units a session remembers (these have tests in `nerve-center`).
+the owner disabled, exposure `off`, a capability the center left out, the
+1024 units a session remembers, and of a node's error the 4 KiB cut, the one
+line and a code outside the protocol's becoming `internal` (the echo node
+cannot send those; these have tests in `nerve-center`).
 
 ## Provider part
 

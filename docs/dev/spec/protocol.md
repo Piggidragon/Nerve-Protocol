@@ -586,9 +586,10 @@ over the center's message limit: the call fails with `too_large` instead.
 - Capability ids and action names use ASCII letters, digits, `-` and `_`,
   never `.`: the harness side names an action `<cap>.<action>`
   (`docs/dev/spec/harness.md` §4.1), and a `.` inside a part would make that
-  name ambiguous. A center leaves out every action of a capability whose id is
-  outside that set, and an action whose name is; it keeps the rest of the
-  descriptor.
+  name ambiguous. Ids are unique within a descriptor. A center leaves out every
+  action of a capability whose id is outside that set, is longer than 64
+  bytes or is given twice, and an action whose name is outside that set or
+  longer than 64 bytes; it keeps the rest of the descriptor.
 - Effects: `read`, `sense`, `write`, `actuate`, `execute`.
 - `provider` names what serves a capability: `node`, or a local program
   attached to the node (node-local.md §7). A center treats both alike; the

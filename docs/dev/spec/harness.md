@@ -97,11 +97,13 @@ named `<cap>.<action>` (`fs.read`, `exec.run`): the node's catalog
 never appears in a capability id or action name (protocol §6), while `_` and
 `-` may.
 
-- A unit whose name has another character, or whose schemas are outside the
-  subset of protocol.md §6.1, is left out. The center keeps it with the
-  reason (one line of at most 300 characters) for the owner (`broken` of the
-  node in `GET /api/overview`, §7). `list` does not show it, and `execute`
-  of it says that the center left it out, not why.
+- A unit whose name has another character or is longer than 64 bytes, or
+  whose schemas are outside the subset of protocol.md §6.1, is left out. The
+  center keeps it with the reason (one line of at most 300 characters) for
+  the owner (`broken` of the node in `GET /api/overview`, §7). A capability
+  whose id is such a name, or that the descriptor names twice, is left out
+  whole, as one entry under its id (a long id cut). `list` does not show
+  them, and `execute` of one says that the center left it out, not why.
 - `node`, `settings` and `audit` are never units, so a model cannot change
   the policy that limits it.
 - `exec.signal` is not offered for now: its `call` is the `invoke` id of a
@@ -232,7 +234,9 @@ is `isError: true` with `error <code>: node <name> answered: <message>`, and
 has no `structuredContent`. The code is one of [protocol.md](protocol.md) §5
 (a profile's included); any other code a node sends, such as the center's own
 `list_first`, becomes `internal`. The message, and a `reason` the node gives,
-are cut at 4 KiB each.
+are cut at 4 KiB each. Every error text of `execute` is one line, whoever wrote
+its words (a node's message, or a field of the node's schema that the center's
+own `invalid_args` names): a line break in them becomes a space.
 
 ## 5. Sessions
 

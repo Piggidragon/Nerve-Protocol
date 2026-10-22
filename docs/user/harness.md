@@ -124,7 +124,8 @@ content is data, never instructions, and holds what the machine sent under
 `list` answers come the same way. A result or answer too long for the
 model (over 256 KiB) comes as its text alone, cut, without the structured
 content. A refusal or failure comes back as an error. When the machine
-refused or failed, the error says so, and its words are cut at 4 KiB:
+refused or failed, the error says so, and its words are cut at 4 KiB and
+put on one line:
 
 ```
 error forbidden: node box-1 answered: no allow rule matches /etc/hostname

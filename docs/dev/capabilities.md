@@ -57,8 +57,9 @@ and state included) and `validate` before every call it sends.
 - Capability ids and action names use letters, digits, `-` and `_`, never
   `.`. The harness side names an action `<cap>.<action>`, and a `.` inside a
   name would make that name ambiguous. A center leaves out the actions of a
-  capability with another character in its id, and an action with one in its
-  name, and keeps the rest.
+  capability with another character in its id, an id over 64 bytes or an id
+  the descriptor gives twice, and an action with another character in its
+  name or a name over 64 bytes, and keeps the rest.
 - The center builds a catalog per node from its descriptor
   (`nerve-center` `catalog.rs`): one unit per `cap.action`, and the units it
   left out (a bad name, a schema outside the subset; every action of a

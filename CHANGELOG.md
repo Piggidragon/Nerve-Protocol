@@ -88,6 +88,14 @@
 - `update` on Windows replaces the program and restarts the service only: it no longer registers the Event Log source or names an owner for an install made before there were any.
 - The center reads the action checker's blocklist by the built-ins' ids only, no longer the list without ids that #130 saved.
 
+### Two MCP tools and capabilities of your own ([#152](https://github.com/Piggidragon/Nerve-Protocol/issues/152))
+
+- Schemas keep to one small subset of JSON Schema, the same at the node and the center: one type (or one type or `null`), properties, lists, `enum` and bounds; no `$ref`, `oneOf`, conditions, `pattern` or `format`, at most 3 levels for arguments and 4 for results, 32 properties and 16 KiB (`docs/dev/spec/protocol.md` §6.1).
+- The center checks a call's arguments against the action's schema before it goes to the node: arguments that do not fit get `error invalid_args: <field>: expected <what>` (`timeout_ms: expected an integer of 0 or more`) and never reach the node. The node does the same for a provider's actions, so the program never sees them.
+- An action the center cannot offer (a schema outside the subset, a `_` or `.` in its name) is left out on its own, with its reason, on the machine's card in the web UI's Overview; before, one bad name dropped the node's whole description. A provider's action outside the subset is left out the same way, named by `nerve-node status` and in the log, and the program's other actions attach.
+- `exec.signal`'s `call` and the `exit` event's `call` are integers. `exec.run`'s `timeout_ms` states its most in its description instead of as `maximum`, since a larger value is cut to the most and not refused; an empty `command` or `fs.grep` `pattern` is refused by the schema as by the node.
+- The conformance suite checks that a node's schemas keep to the subset, that a provider's action outside it is left out, and that arguments that do not fit are refused before the node or the provider.
+
 ## 0.0.5
 
 ### The action checker

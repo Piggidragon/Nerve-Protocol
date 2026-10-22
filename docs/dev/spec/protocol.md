@@ -522,7 +522,7 @@ tolerant of unknown fields a node sends, so newer nodes keep working.
 
 | Code | JSON-RPC code | Meaning |
 |---|---|---|
-| `invalid_args` | -32602 | arguments do not match the action |
+| `invalid_args` | -32602 | arguments do not match the action (§6.1) |
 | `forbidden` | -32001 | policy refuses: no rule allows the call, or a rule forbids it |
 | `disabled` | -32004 | the capability or action is off |
 | `unavailable` | -32005 | the node or capability is not reachable now |
@@ -583,7 +583,9 @@ over the center's message limit: the call fails with `too_large` instead.
 - Capability ids and action names use ASCII letters, digits and `-`, never
   `_`: a harness joins node, capability and action with `_` into one tool
   name (`docs/dev/spec/harness.md`), and a `_` inside a part would make that name
-  ambiguous. A center ignores a descriptor with a name outside that set.
+  ambiguous. A center leaves out every action of a capability whose id is
+  outside that set, and an action whose name is; it keeps the rest of the
+  descriptor.
 - Effects: `read`, `sense`, `write`, `actuate`, `execute`.
 - `provider` names what serves a capability: `node`, or a local program
   attached to the node (node-local.md §7). A center treats both alike; the
@@ -595,6 +597,61 @@ over the center's message limit: the call fails with `too_large` instead.
   center fetches the descriptor again.
 - `detail: "summary"` drops `params`, `result` and schemas;
   `"capability"` returns only `cap`, in full; `"full"` returns everything.
+
+### 6.1 Schemas
+
+`params` (an action's arguments), `result`, an event's `data` and `state`
+are JSON Schemas of a small subset of JSON Schema 2020-12. A center shows
+them to a model and checks each call's arguments against them, and the node
+checks them again, so a schema must mean the same at every end. A schema is
+in the subset when:
+
+- Each schema object names `type`, `enum` or `const`. `type` is one of
+  `null`, `boolean`, `object`, `array`, `number`, `integer`, `string`, or a
+  pair of one of them and `"null"` (`["integer", "null"]`).
+- It uses only these keywords: `type`, `properties`, `required`,
+  `additionalProperties` (`true` or `false`), `items` (one schema), `enum`,
+  `const`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`,
+  `minLength`, `maxLength`, `minItems`, `maxItems`, `default`,
+  `description`, `title`, `examples`, `$schema` (only
+  `https://json-schema.org/draft/2020-12/schema`, only at the root) and
+  `x-nerve-path` (`"read"` or `"write"`: the string is a path the action
+  reads or writes; only its value is checked for now).
+- A keyword fits its type: `properties`, `required` and
+  `additionalProperties` need `object`; `items`, `minItems` and `maxItems`
+  `array`; `minLength`, `maxLength` and `x-nerve-path` `string`; the
+  numeric bounds `integer` or `number`. `required` names each property once,
+  and only properties that `properties` names. `enum` is not empty, and its
+  values and `const` fit the type. No pair of bounds leaves nothing between
+  them.
+- The arguments schema's root is `{"type": "object", …}`. It nests at most 3
+  levels deep, a result, event data or state at most 4: the root is level 1,
+  and a property's or an array's items schema is one level below its
+  parent's.
+- One object names at most 32 properties, and the schema takes at most
+  16 KiB as compact JSON.
+
+Everything else is refused, among it `$ref` and `$defs`, `oneOf`, `anyOf`,
+`allOf` and `not`, `if`, `then` and `else`, `patternProperties`, `pattern`
+and `format`, and any keyword the list does not name. What a text must look
+like goes into `description`; a choice of values is an `enum`.
+
+An action without `params` takes any object of arguments, as
+`{"type": "object"}`; without `result` (or an event without `data`) the
+descriptor says nothing of it. A center leaves out an action whose schemas
+are outside the subset, with the reason, and offers the rest; the owner sees
+what was left out (harness.md §7). A node does not attach a provider's action
+whose schemas are outside it (node-local.md §7).
+
+Arguments fit a schema when their value has its type, takes a value of
+`enum` or the `const`, keeps to its bounds, has every `required` field, and,
+with `additionalProperties: false`, no field `properties` does not name; the
+same holds for each field and item. An `integer` is a number without a
+fraction or an exponent, so `5.0` is not one. `default` is a hint for the
+caller; neither end fills it in. Arguments that do not fit are refused with
+`invalid_args` whose `data` holds `field`, the dotted path to what does not
+fit (`sudo.sealed`, `entries[2].name`, empty for the arguments as a whole),
+and `expected`, in words (`an integer from 1 to 600`).
 
 ## 7. Profiles
 
@@ -636,9 +693,11 @@ concurrently.
   default, one with a larger value gets the node's maximum, and past its limit
   the command is killed and the call fails with `timeout`. Both numbers are
   the owner's (`limits` of `node.toml`, node-local §2). The descriptor states
-  them in the action's text and as `maximum` and `default`, in milliseconds,
-  of the `timeout_ms` parameter; as that parameter differs between nodes
-  with other limits, a center does not merge their `exec.run` into one tool.
+  them in the action's text, as the `default` of the `timeout_ms`
+  parameter and in its `description`, in milliseconds; it has no `maximum`,
+  as a larger value is cut to the most and not refused. As that parameter
+  differs between nodes with other limits, a center does not merge their
+  `exec.run` into one tool.
 - state: `{shell, confinement}`; event `exit {call, exit_code}` (needs `sub`).
 - Output is capped at `limits.output_cap_bytes` of the node's config;
   `truncated` says it was cut.

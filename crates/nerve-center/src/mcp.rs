@@ -1412,11 +1412,27 @@ mod tests {
             assert_eq!(text(&r), want, "{unit}");
         }
         // list names a misspelt node the same way.
-        let r = call(&e, "list", json!({"node": "box-2"})).await;
+        let r = call(&e, "list", json!({"node": "bx-1"})).await;
         assert_eq!(
             text(&r),
-            "error unknown_node: there is no node \"box-2\" (did you mean \"box-1\"?); the nodes are box-1."
+            "error unknown_node: there is no node \"bx-1\" (did you mean \"box-1\"?); the nodes are box-1."
         );
+        // Another number is another machine, not a slip: the model is not
+        // pointed at box-1, where its call would run.
+        for (tool, args) in [
+            ("list", json!({"node": "box-3", "capability": "fs.read"})),
+            (
+                "execute",
+                json!({"node": "box-3", "capability": "fs.read", "args": {}}),
+            ),
+        ] {
+            let r = call(&e, tool, args).await;
+            assert_eq!(
+                text(&r),
+                "error unknown_node: there is no node \"box-3\"; the nodes are box-1.",
+                "{tool}"
+            );
+        }
     }
 
     /// `list` and `execute` on shared sessions, the web UI's node and

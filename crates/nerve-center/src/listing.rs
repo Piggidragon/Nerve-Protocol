@@ -231,6 +231,10 @@ pub fn unit(n: &NodeRecord, name: &str) -> Result<Unit, Miss> {
 /// The one of `names` that `given` was likely meant to be: the closest by
 /// edit distance (letter case aside, two swapped letters one edit), when it
 /// is close enough for a slip of the keys and not just another short name.
+/// None when two names are that close: picking one of them would be a
+/// guess. A name whose digits differ from the ones given is never it:
+/// `box-2` beside `box-1` is another machine, and pointing a model that
+/// names one at the other would run its call there.
 pub fn near<'a>(given: &str, names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     let given: Vec<char> = given.to_lowercase().chars().collect();
     // A long name the model made up is no slip: nothing is suggested.
@@ -238,7 +242,8 @@ pub fn near<'a>(given: &str, names: impl IntoIterator<Item = &'a str>) -> Option
         return None;
     }
     let most = (given.len() / 3).clamp(1, 3);
-    let mut best: Option<(usize, &str)> = None;
+    // The best distance, its name, and whether another name is as close.
+    let mut best: Option<(usize, &str, bool)> = None;
     let mut lower = Vec::new();
     for name in names {
         // A name whose length is further off than `most` cannot be in
@@ -248,14 +253,28 @@ pub fn near<'a>(given: &str, names: impl IntoIterator<Item = &'a str>) -> Option
         if len.abs_diff(given.len()) > most {
             continue;
         }
+        let digits = |c: &char| c.is_numeric();
+        if !given
+            .iter()
+            .copied()
+            .filter(digits)
+            .eq(name.chars().filter(digits))
+        {
+            continue;
+        }
         lower.clear();
         lower.extend(name.chars().flat_map(char::to_lowercase));
         let d = distance(&given, &lower, most);
-        if d <= most && best.is_none_or(|(b, _)| d < b) {
-            best = Some((d, name));
+        if d > most {
+            continue;
         }
+        best = match best {
+            Some((b, _, _)) if d > b => best,
+            Some((b, n, tie)) if d == b => Some((b, n, tie || n != name)),
+            _ => Some((d, name, false)),
+        };
     }
-    best.map(|(_, name)| name)
+    best.and_then(|(_, name, tie)| (!tie).then_some(name))
 }
 
 /// The edit distance of `a` and `b`, with two swapped neighbours as one
@@ -1546,6 +1565,38 @@ mod tests {
         }
     }
 
+    /// A name two names are as close to, or one naming another number,
+    /// gets none: `box-3` is not a slip for `box-1`, and the call would run
+    /// on a machine the model did not name.
+    #[test]
+    fn a_sibling_or_a_tie_gets_no_name() {
+        let boxes = ["box-1", "box-2"];
+        for (given, want) in [
+            ("box-3", None),
+            ("box-9", None),
+            ("box-12", None),
+            ("box", None),
+            ("box1", Some("box-1")),
+            ("BOX-1", Some("box-1")),
+            ("bxo-2", Some("box-2")),
+        ] {
+            assert_eq!(near(given, boxes), want, "{given}");
+        }
+        assert_eq!(near("box-2", ["box-1"]), None);
+        assert_eq!(near("box-1", ["box-1"]), Some("box-1"));
+        // Two units one edit away: either would be a guess.
+        assert_eq!(near("svc.sto", ["svc.stop", "svc.stow"]), None);
+        assert_eq!(near("svc.sto", ["svc.stop", "svc.stow", "svc.stop"]), None);
+        assert_eq!(near("svc.sto", ["svc.stop", "svc.start"]), Some("svc.stop"));
+        // A closer one after a tie is still the one.
+        assert_eq!(
+            near("fs.read", ["fs.reat", "fs.real", "fs.read"]),
+            Some("fs.read")
+        );
+        // A name given twice is no tie.
+        assert_eq!(near("fs.raed", ["fs.read", "fs.read"]), Some("fs.read"));
+    }
+
     /// A node may name a unit at any length; one far longer than the name
     /// given is never compared, so a typo costs no time under the store's
     /// lock, whatever the node named.
@@ -1562,7 +1613,16 @@ mod tests {
         assert!(took < std::time::Duration::from_secs(1), "{took:?}");
         // A node with many units of the length given: each is worked out
         // near the diagonal only.
-        let many: Vec<String> = (0..50_000).map(|i| format!("{i:064}")).collect();
+        // In letters, since a name with other digits than the given one is
+        // passed over before it is worked out.
+        let many: Vec<String> = (0..50_000)
+            .map(|i| {
+                format!("{i:064}")
+                    .bytes()
+                    .map(|b| char::from(b - b'0' + b'a'))
+                    .collect()
+            })
+            .collect();
         let started = std::time::Instant::now();
         let given = "x".repeat(ASKED_MAX);
         assert_eq!(near(&given, many.iter().map(String::as_str)), None);

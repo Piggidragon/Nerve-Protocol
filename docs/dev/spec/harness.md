@@ -202,7 +202,11 @@ and sends nothing to the node.
    since `execute` refuses it until then (step 4). The likely name is the closest by edit
    distance, ignoring case, within a third of the name's length (1 to 3
    edits); a name of more than 64 characters gets none, and names whose
-   length differs by more than that are not compared.
+   length differs by more than that are not compared. There is none when two
+   names are equally close, and never one whose digits differ from the
+   name's (`box-3` gets no `box-1`): another number is another machine, and
+   a model pointed at it would run its call there. The same holds for the
+   node's name in step 1.
 4. List first: `list(node, capability)` must have given this session the
    unit's details, and the unit must be the same now. Otherwise the result is
    `error list_first: call list with node "box-1" and capability ["fs.read"]

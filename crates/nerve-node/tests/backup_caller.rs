@@ -256,8 +256,8 @@ fn the_backup_file_is_opened_as_the_user_who_asked() {
         ],
     ));
     assert!(e.contains("may not read it"), "{e}");
-    // The place the 0.0.5 guide named, the node's state folder: written
-    // there as the node's user, as then.
+    // The node's state folder: written there as the node's user, its
+    // folder's owner.
     let old_place = root.join("state/nerve.bak");
     ok(&backup(By::Sudo(asker), &old_place));
     assert_eq!(std::fs::metadata(&old_place).unwrap().uid(), NODE);

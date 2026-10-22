@@ -1100,8 +1100,9 @@ pub(crate) async fn answer(
 ) -> nerve_transport::ctl::Reply {
     use nerve_transport::ctl::Reply;
     match req.method.as_str() {
-        // What the control socket says without its token: `service
-        // restart` of an owner waits for it.
+        // Anyone may ask whether the node runs: `service restart` of an
+        // owner, who cannot open the control socket, waits for it
+        // (`service.rs` `wait_running`).
         "status" => Reply::Ok(json!({"running": true})),
         "cli" => {
             let Some(who) = who else {

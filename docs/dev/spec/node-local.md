@@ -138,10 +138,9 @@ file it replaces, so the record never goes down.
   before it (the highest of the file, the config in force and the record, plus
   one), so the file taken is the newest, the record goes on from it, and an
   older copy is refused in turn.
-- A node with no record (an install from before there was one, or a state
-  folder made new) takes the file as it is and records its version. With no
-  `node.toml` and a record, the versions go on from the record, so the first
-  file the node saves is not an older one.
+- A node with no record (a state folder made new) takes the file as it is
+  and records its version. With no `node.toml` and a record, the versions go
+  on from the record, so the first file the node saves is not an older one.
 - A record that holds no number is an error, not none: the node does not
   start, and the CLI's commands refuse, naming the file. `config accept`
   writes it again, or the owner deletes it.
@@ -502,13 +501,13 @@ Every command has a run-time limit: its `timeout_ms`, or
 and never more than `limits.max_timeout_secs` (3600): a larger `timeout_ms` is
 cut to it, and so is the default when the maximum is lower. Both are at least
 1, are the owner's alone (a center's settings document does not reach them),
-and are left out of the file while they are the defaults, so an older node
-reads a file nobody set them in. They are read when a call starts: a running
-command keeps its limit. The `timeout` error names the limit that ended the
-command, and the descriptor states both numbers in `exec.run`'s text and as
-`maximum` and `default` (milliseconds) of its `timeout_ms` parameter, so a
-change of either changes the descriptor's rev, and nodes with other limits
-have other params (a center merges the tools of nodes with equal params).
+and are left out of the file while they are the defaults. They are read when a
+call starts: a running command keeps its limit. The `timeout` error names the
+limit that ended the command, and the descriptor states both numbers in
+`exec.run`'s text and as `maximum` and `default` (milliseconds) of its
+`timeout_ms` parameter, so a change of either changes the descriptor's rev, and
+nodes with other limits have other params (a center merges the tools of nodes
+with equal params).
 A command is killed with its process group when its call ends: on
 `timeout_ms`, `cancel`, `session.end` of the session that started it, a
 link that ended without being resumed (protocol §4.9), and when the call
@@ -1118,12 +1117,8 @@ a token at each start,
 The CLI reads the file and sends it. The
 file lies in the node's own folders, which a `folder` mode command's rules
 leave out, so such a command, and a process it left behind, are refused for
-every method.
-
-The one answer without the token is `status`: `{"ok": {"running": true}}`,
-nothing of the config. `update` of 0.0.2 asks it that way to wait for the
-node it restarted, and puts the old program back if it does not answer `ok`;
-since 0.0.3 `install`, `update` and `setup` send the token.
+every method. `install`, `update` and `setup` send the token too when they
+ask `status` to wait for the node they restarted.
 
 The token holds as far as the sandbox does, and the sandbox holds the
 command's own processes only. Any program of the commands' account that runs

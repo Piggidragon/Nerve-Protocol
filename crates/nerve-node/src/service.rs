@@ -1559,8 +1559,10 @@ pub(crate) fn install_parts(layout: &Layout, steps: &mut Steps) -> Result<(), St
     link_node(layout, steps)
 }
 
-/// Removes them again, and that link, before the program goes.
+/// Removes them again, and on Linux that link, before the program goes.
 pub(crate) fn uninstall_parts(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
+    // Only Linux makes the link; Windows removes the program itself.
+    #[cfg(unix)]
     unlink_node(layout, steps)?;
     if let Some(parts) = layout.edition.parts {
         for step in parts.uninstall(&layout.bin)? {
@@ -1700,6 +1702,7 @@ fn symlink(_: &Path, _: &Path) -> std::io::Result<()> {
 }
 
 /// Removes the link [`link_node`] made, and no other.
+#[cfg(unix)]
 fn unlink_node(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
     let Some(node) = node_beside(layout) else {
         return Ok(());

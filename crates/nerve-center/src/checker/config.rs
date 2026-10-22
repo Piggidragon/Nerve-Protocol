@@ -91,8 +91,7 @@ pub struct BlockEntry {
     /// carry one; the owner's entries may leave it empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
-    /// `None` for every node (every built-in, and every entry of a state
-    /// file from before per-node entries), else the node id it is for.
+    /// `None` for every node (every built-in), else the node id it is for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
     /// The nodes an entry for every node is switched off for, by id, while
@@ -954,13 +953,9 @@ const NAME_END: &str = "(?:$|[^a-z0-9_-])";
 ///
 /// On reading, the built-ins come from the code with those choices on them;
 /// a choice for an id the code no longer has is ignored. A whole list (an
-/// array) reads too: the form the center saved before (#130, built-ins in
-/// full with `builtin: true` and no id, mapped by their rule text) and what
-/// the web UI posts (built-ins with their id). A built-in of the code that
-/// such a list does not hold was removed by the owner; a stored built-in the
-/// code does not know is dropped. In a list without ids, a stored built-in
-/// the code does not know may be an older pattern of one it has, so then no
-/// built-in counts as removed: they all come back, on the safe side.
+/// array) reads too: what the web UI posts, the built-ins with their id. A
+/// built-in of the code that such a list does not hold was removed by the
+/// owner; a built-in whose id the code does not know is dropped.
 pub(super) mod stored {
     use std::collections::BTreeMap;
 
@@ -994,8 +989,6 @@ pub(super) mod stored {
         let defaults = default_blocklist();
         let mut part = OwnerPart::default();
         let mut seen = vec![false; defaults.len()];
-        // A built-in saved without an id whose rule the code does not have.
-        let mut unknown_old = false;
         for e in list {
             if !e.builtin {
                 part.own.push(BlockEntry {
@@ -1004,17 +997,7 @@ pub(super) mod stored {
                 });
                 continue;
             }
-            // By id, or by rule text for an entry saved before there were ids.
-            let found = defaults.iter().position(|d| {
-                if e.id.is_empty() {
-                    d.rule == e.rule
-                } else {
-                    d.id == e.id
-                }
-            });
-            if found.is_none() && e.id.is_empty() {
-                unknown_old = true;
-            }
+            let found = defaults.iter().position(|d| d.id == e.id);
             let Some(i) = found.filter(|&i| !seen[i]) else {
                 continue;
             };
@@ -1027,14 +1010,6 @@ pub(super) mod stored {
                 };
                 part.builtins.insert(defaults[i].id.clone(), choice);
             }
-        }
-        // An older pattern of a built-in leaves that built-in unseen, which
-        // is not the owner removing it: the code changed it. A list without
-        // ids cannot tell which one it was, so then none is taken as removed.
-        // The owner may have to remove one again; no protection is lost
-        // unseen.
-        if unknown_old {
-            return part;
         }
         for (d, seen) in defaults.iter().zip(seen) {
             if !seen {
@@ -1092,15 +1067,15 @@ pub(super) mod stored {
 mod tests {
     use super::*;
 
-    /// A state file from before per-node settings reads as today: every
-    /// block entry and allow rule for all nodes, no exceptions, every node
-    /// following the center's switches. Saved again it gains no new fields.
+    /// A state without per-node settings has every block entry and allow
+    /// rule for all nodes, no exceptions, every node following the center's
+    /// switches. Saved again it gains no per-node fields.
     #[test]
-    fn an_old_state_file_reads_as_every_entry_for_all_nodes() {
-        let old = r#"{"blocklist_on": true, "model_on": true,
-            "blocklist": [{"rule": "exec.run:rm -rf /", "on": true, "builtin": true}],
+    fn a_state_without_node_settings_has_every_entry_for_all_nodes() {
+        let plain = r#"{"blocklist_on": true, "model_on": true,
+            "blocklist": {"own": [{"rule": "exec.run:make clean", "on": true}]},
             "allow_rules": [{"rule": "exec.run:make *"}]}"#;
-        let c: CheckerConfig = serde_json::from_str(old).unwrap();
+        let c: CheckerConfig = serde_json::from_str(plain).unwrap();
         assert!(c.nodes.is_empty());
         assert_eq!(c.blocklist[0].node_id, None);
         assert!(c.blocklist[0].off_for.is_empty());
@@ -1117,8 +1092,7 @@ mod tests {
     }
 
     /// Every built-in has an id of its own and a rule of its own, so the
-    /// owner's choices are kept under the id and the form saved before ids
-    /// maps by rule text.
+    /// owner's choices are kept under the id.
     #[test]
     fn every_builtin_has_its_own_id_and_rule() {
         let d = default_blocklist();
@@ -1213,99 +1187,21 @@ mod tests {
         assert!(!c.blocklist[0].on);
     }
 
-    /// The form the center saved before (#130): every entry in full, the
-    /// built-ins with `builtin: true` and no id. They are mapped to their ids
-    /// by rule text, keep their on/off and per-node choices, a built-in
-    /// missing from the list stays removed, the owner's own entries stay,
-    /// and saved again no copy of a built-in is left.
+    /// A posted built-in is known by its id only: one without an id is no
+    /// built-in of the code, whatever its rule, and is dropped; the code's
+    /// built-in of that rule is not in the list, so it counts as removed.
     #[test]
-    fn the_list_saved_before_ids_keeps_the_owners_choices() {
-        let mut old = default_blocklist();
-        old.retain(|e| e.id != "wipefs");
-        for e in &mut old {
-            e.id = String::new();
-            if e.rule == "exec.run:mkfs*" {
-                e.on = false;
-            }
-            if e.rule == "exec.run:rm -rf /" {
-                e.off_for = vec!["n2".into()];
-            }
-        }
-        old.push(BlockEntry {
-            id: String::new(),
-            rule: "exec.run:terraform destroy*".into(),
-            on: false,
-            builtin: false,
-            note: "mine".into(),
-            node_id: None,
-            off_for: Vec::new(),
-        });
-        let mut v = serde_json::json!({"blocklist": old});
-        for e in v["blocklist"].as_array_mut().unwrap() {
-            e.as_object_mut().unwrap().remove("id");
-            // main wrote `builtin` for every entry.
-            if e.get("builtin").is_none() {
-                e["builtin"] = false.into();
-            }
-        }
-        let c: CheckerConfig = serde_json::from_value(v).unwrap();
-        let by_id = |id: &str| c.blocklist.iter().find(|e| e.id == id);
-        assert!(!by_id("mkfs").unwrap().on);
-        assert_eq!(by_id("rm-root").unwrap().off_for, ["n2"]);
-        assert!(by_id("wipefs").is_none());
-        assert!(by_id("nsenter").unwrap().on);
-        let own = c.blocklist.last().unwrap();
-        assert_eq!(
-            (own.rule.as_str(), own.on, own.note.as_str()),
-            ("exec.run:terraform destroy*", false, "mine")
-        );
-        let saved = serde_json::to_value(&c).unwrap();
-        assert_eq!(
-            saved["blocklist"],
-            serde_json::json!({
-                "builtins": {
-                    "mkfs": {"on": false},
-                    "rm-root": {"off_for": ["n2"]},
-                    "wipefs": {"removed": true},
-                },
-                "own": [{"rule": "exec.run:terraform destroy*", "on": false, "note": "mine"}],
-            })
-        );
-    }
-
-    /// A list without ids that holds a built-in in a pattern the code no
-    /// longer has (an older version of one it still has, from a build before
-    /// a review changed it, or one a later release dropped): that stored copy
-    /// is dropped, and no built-in is taken as removed, so the changed one is
-    /// back and on and nothing is lost unseen. The owner's other choices stay
-    /// (review r1, finding 1).
-    #[test]
-    fn an_older_pattern_of_a_builtin_does_not_read_as_removed() {
-        let mut old = default_blocklist();
-        old.retain(|e| e.id != "wipefs");
-        for e in &mut old {
-            if e.id == "rm-root" {
-                e.rule = "exec.run:rm -rf  /".into();
-            }
-            if e.id == "mkfs" {
-                e.on = false;
-            }
-            e.id = String::new();
-        }
-        old.push(BlockEntry::builtin("", "exec.run:an old default", ""));
-        let mut v = serde_json::json!({"blocklist": old});
-        for e in v["blocklist"].as_array_mut().unwrap() {
-            e.as_object_mut().unwrap().remove("id");
-        }
-        let c: CheckerConfig = serde_json::from_value(v).unwrap();
-        let root = c.blocklist.iter().find(|e| e.id == "rm-root").unwrap();
-        assert!(root.on && root.rule == "exec.run:rm -rf /");
-        assert!(c.blocklist.iter().any(|e| e.id == "wipefs" && e.on));
-        assert!(!c.blocklist.iter().any(|e| e.id.is_empty()));
-        assert!(!c.blocklist.iter().find(|e| e.id == "mkfs").unwrap().on);
+    fn a_builtin_is_known_by_its_id_only() {
+        let mut posted = CheckerConfig::default().view();
+        let first = default_blocklist()[0].clone();
+        posted["blocklist"][0].as_object_mut().unwrap().remove("id");
+        let mut c: CheckerConfig = serde_json::from_value(posted).unwrap();
+        c.settle_blocklist();
+        assert!(!c.blocklist.iter().any(|e| e.rule == first.rule), "{c:?}");
+        assert_eq!(c.blocklist.len(), default_blocklist().len() - 1);
         assert_eq!(
             serde_json::to_value(&c).unwrap()["blocklist"],
-            serde_json::json!({"builtins": {"mkfs": {"on": false}}})
+            serde_json::json!({"builtins": {first.id: {"removed": true}}})
         );
     }
 
@@ -1370,7 +1266,7 @@ mod tests {
         );
     }
 
-    /// A state file from before the model choice reads as d1-3B, and the
+    /// A model config that names no local model reads as d1-3B, and the
     /// models have stable names on the wire.
     #[test]
     fn the_local_model_defaults_to_d1_and_has_stable_names() {

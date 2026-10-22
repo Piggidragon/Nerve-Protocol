@@ -118,8 +118,6 @@ nerve-node center rotate-key --end-grace --center lab
 - If the center refuses the new key, the old one stays. If no answer comes,
   the old key stays in use and the node sends the new key again on its next
   link.
-- A center older than 0.0.4 cannot rotate keys; the command says so and
-  changes nothing.
 - Each rotation is in the [audit log](audit.md).
 
 The center's own key is rotated in its web UI ([center](center.md#rotate-the-key)).

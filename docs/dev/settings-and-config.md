@@ -105,7 +105,7 @@ command's Landlock rules leave them out, even when a granted folder holds them.
 may talk to it, and only a request that carries the token the node wrote to
 `<state>/run/ctl.token` at its start: the CLI reads it, a `folder` mode command
 cannot, as the state folder is out of its rules. A request without the token
-gets an answer only to `status`, and only `{"running": true}`. The token is as
+is refused, whatever its method. The token is as
 safe as the sandbox: while the commands run as the node's own user (a node a
 person runs), any other program of that user that runs commands on request
 over a socket (the user's systemd session, a tmux or screen server) runs them

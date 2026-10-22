@@ -10,6 +10,7 @@
 //! The catalog is derived from the descriptor and never stored: it is built
 //! again whenever the descriptor changes and after the state file is read.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -26,6 +27,12 @@ use crate::util;
 /// The longest description a unit keeps, in bytes. A model needs a few
 /// sentences, and a node's long text is not copied into every unit.
 pub const DESCRIPTION_MAX: usize = 2048;
+
+/// The longest capability or action name the center offers, in bytes. The
+/// protocol sets no bound, but a unit's name is copied into the unit, every
+/// listing and the session's memory, and a model has to type it: a longer
+/// name leaves out its capability or action.
+pub const NAME_MAX: usize = 64;
 
 /// One action a node offers, with schemas that passed the subset check.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,8 +54,9 @@ pub struct Unit {
     pub params: Value,
     /// `null` when the descriptor states no result.
     pub result: Value,
-    /// `node` for a built-in capability, else the provider's name.
-    pub provider: String,
+    /// `node` for a built-in capability, else the provider's name, shared by
+    /// the capability's units.
+    pub provider: Arc<str>,
 }
 
 impl Unit {
@@ -100,8 +108,30 @@ pub struct Catalog {
 impl Catalog {
     pub fn build(d: &Descriptor) -> Catalog {
         let mut c = Catalog::default();
+        // A capability id given twice would make `cap.action` name two
+        // actions: `list` would show one and `execute` might check the
+        // other. Neither is offered.
+        let mut count: HashMap<&str, usize> = HashMap::new();
+        for cap in &d.capabilities {
+            *count.entry(cap.id.as_str()).or_default() += 1;
+        }
+        let mut left_out: HashSet<&str> = HashSet::new();
         for cap in &d.capabilities {
             if RESERVED_CAPS.contains(&cap.id.as_str()) {
+                continue;
+            }
+            // A capability whose name is not offered is one entry, however
+            // many actions it has: its name is never copied into each.
+            let unnamed = bad_name("capability", &cap.id).or_else(|| {
+                (count[cap.id.as_str()] > 1).then(|| "named twice in the description".to_string())
+            });
+            if let Some(reason) = unnamed {
+                if left_out.insert(cap.id.as_str()) {
+                    c.broken.push(Broken {
+                        name: shown_name(&cap.id),
+                        reason,
+                    });
+                }
                 continue;
             }
             // A capability's event data and state are checked as well, so
@@ -109,6 +139,7 @@ impl Catalog {
             // does not leaves out the whole capability.
             let whole = cap_outside_subset(cap);
             let cap_description = described(&cap.summary);
+            let provider: Arc<str> = cap.provider.as_str().into();
             if cap.actions.is_empty()
                 && let Some(reason) = whole.clone()
             {
@@ -118,8 +149,15 @@ impl Catalog {
                 });
             }
             for (action, def) in &cap.actions {
+                if let Some(reason) = bad_name("action", action) {
+                    c.broken.push(Broken {
+                        name: format!("{}.{}", cap.id, shown_name(action)),
+                        reason,
+                    });
+                    continue;
+                }
                 let name = format!("{}.{action}", cap.id);
-                if let Some(reason) = bad_name(&cap.id, action).or_else(|| whole.clone()) {
+                if let Some(reason) = whole.clone() {
                     c.broken.push(Broken { name, reason });
                     continue;
                 }
@@ -143,7 +181,7 @@ impl Catalog {
                     },
                     params,
                     result: def.result.clone(),
-                    provider: cap.provider.clone(),
+                    provider: provider.clone(),
                 });
             }
         }
@@ -162,9 +200,13 @@ impl Catalog {
             .map(|i| &self.units[i])
     }
 
-    /// Why `name` (`cap.action`) is left out, when it is.
+    /// Why `name` (`cap.action`) is left out, when it or its whole
+    /// capability is.
     pub fn broken(&self, name: &str) -> Option<&Broken> {
-        self.broken.iter().find(|b| b.name == name)
+        self.broken.iter().find(|b| {
+            name.strip_prefix(b.name.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+        })
     }
 
     /// Whether `cap.action` is a unit, so it may be offered to the agent.
@@ -179,19 +221,26 @@ fn described(summary: &str) -> Arc<str> {
 }
 
 /// Names hold letters, digits, `-` and `_`: `.` joins a unit's name, so a
-/// name with one could not be split again.
-fn bad_name(cap: &str, action: &str) -> Option<String> {
-    if !valid_member_name(cap) {
+/// name with one could not be split again. The reason never repeats a long
+/// name whole.
+fn bad_name(what: &str, name: &str) -> Option<String> {
+    if name.len() > NAME_MAX {
         return Some(format!(
-            "capability name {cap:?}: letters, digits, - and _ only"
+            "{what} name of {} bytes: at most {NAME_MAX}",
+            name.len()
         ));
     }
-    if !valid_member_name(action) {
+    if !valid_member_name(name) {
         return Some(format!(
-            "action name {action:?}: letters, digits, - and _ only"
+            "{what} name {name:?}: letters, digits, - and _ only"
         ));
     }
     None
+}
+
+/// A name left out as the owner sees it: on one line and cut.
+fn shown_name(name: &str) -> String {
+    util::clip(&one_line(name), NAME_MAX)
 }
 
 /// Why the state or an event's data of `cap` is outside the subset. Each
@@ -284,7 +333,8 @@ mod tests {
     }
 
     /// A name with `.` could not be split again, so it leaves out its own
-    /// units only; `_` is a letter like the others.
+    /// units only; `_` is a letter like the others. A capability with a bad
+    /// name is left out as one entry.
     #[test]
     fn a_bad_name_leaves_out_that_capability_only() {
         let d = desc(
@@ -314,9 +364,12 @@ mod tests {
             names(&c),
             (
                 vec!["exec.run", "my_fs.list_all", "my_fs.read"],
-                vec!["a.b.go", "exec.run.all"]
+                vec!["a.b", "exec.run.all"]
             )
         );
+        // The capability is one entry, and its actions are found under it.
+        assert_eq!(c.broken("a.b.go"), Some(&c.broken[0]));
+        assert_eq!(c.broken("a.bgo"), None);
         assert_eq!(
             c.broken[0].reason,
             "capability name \"a.b\": letters, digits, - and _ only"
@@ -328,6 +381,114 @@ mod tests {
         assert_eq!(c.broken("exec.run.all"), Some(&c.broken[1]));
         assert_eq!(c.broken("exec.run"), None);
         assert!(c.offers("my_fs", "read"));
+    }
+
+    /// The bytes of names and reasons a catalog holds.
+    fn footprint(c: &Catalog) -> usize {
+        c.units
+            .iter()
+            .map(|u| u.name.len() + u.cap.len() + u.action.len())
+            .chain(c.broken.iter().map(|b| b.name.len() + b.reason.len()))
+            .sum()
+    }
+
+    /// A node's long name is not copied into each of its actions: the
+    /// capability or action is left out with a short reason, so the catalog
+    /// stays small however long the names and however many the actions.
+    #[test]
+    fn a_long_name_is_left_out_and_never_copied() {
+        let many: Vec<(String, Effect, Value)> = (0..2000)
+            .map(|i| (format!("a{i}"), Effect::Read, Value::Null))
+            .collect();
+        let actions: Vec<(&str, Effect, Value)> = many
+            .iter()
+            .map(|(n, e, p)| (n.as_str(), *e, p.clone()))
+            .collect();
+        let long = "c".repeat(16 * 1024);
+        let mut bad = "d".repeat(16 * 1024);
+        bad.push_str(".x\nmore");
+        let edge = "e".repeat(NAME_MAX);
+        let over = "f".repeat(NAME_MAX + 1);
+        let long_action = "g".repeat(16 * 1024);
+        let mut d = desc(
+            "box",
+            vec![
+                cap(&long, "", &actions),
+                cap(&bad, "", &actions),
+                cap(&edge, "", &[("go", Effect::Read, Value::Null)]),
+                cap(&over, "", &[("go", Effect::Read, Value::Null)]),
+                cap(
+                    "fs",
+                    "fs",
+                    &[
+                        ("read", Effect::Read, path()),
+                        (long_action.as_str(), Effect::Read, path()),
+                        (edge.as_str(), Effect::Read, path()),
+                    ],
+                ),
+            ],
+        );
+        // A long provider name is shared by its units, not copied.
+        d.capabilities[4].provider = "p".repeat(16 * 1024);
+        let c = Catalog::build(&d);
+        assert_eq!(
+            c.units.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
+            [format!("{edge}.go"), format!("fs.{edge}"), "fs.read".into()]
+        );
+        assert!(Arc::ptr_eq(&c.units[1].provider, &c.units[2].provider));
+        assert_eq!(c.broken.len(), 4, "{:?}", names(&c).1);
+        let reasons: Vec<&str> = c.broken.iter().map(|b| b.reason.as_str()).collect();
+        assert!(
+            reasons.contains(&"capability name of 16384 bytes: at most 64"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.contains(&"capability name of 16391 bytes: at most 64"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.contains(&"capability name of 65 bytes: at most 64"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.contains(&"action name of 16384 bytes: at most 64"),
+            "{reasons:?}"
+        );
+        for b in &c.broken {
+            assert!(b.name.len() <= 2 * NAME_MAX + 4, "{}", b.name.len());
+            assert!(!b.name.chars().any(char::is_control), "{:?}", b.name);
+        }
+        // The owner sees the start of a long name, on one line.
+        let shown: Vec<&str> = c.broken.iter().map(|b| b.name.as_str()).collect();
+        assert!(
+            shown.contains(&format!("{}…", &over[..NAME_MAX]).as_str()),
+            "{shown:?}"
+        );
+        assert!(shown.contains(&format!("fs.{}…", &long_action[..NAME_MAX]).as_str()));
+        assert!(footprint(&c) < 4096, "{}", footprint(&c));
+    }
+
+    /// A capability id given twice names two declarations with one unit
+    /// name: `list` would show one and `execute` might check the other's
+    /// params. Neither is offered; the owner sees one entry.
+    #[test]
+    fn a_capability_named_twice_is_not_offered() {
+        let level = json!({"type": "object", "properties": {"level": {"type": "integer"}}});
+        let percent = json!({"type": "object", "properties": {"percent": {"type": "integer"}},
+                             "required": ["percent"]});
+        let d = desc(
+            "box",
+            vec![
+                cap("lamp", "", &[("dim", Effect::Actuate, level)]),
+                cap("fs", "fs", &[("read", Effect::Read, path())]),
+                cap("lamp", "", &[("dim", Effect::Actuate, percent)]),
+            ],
+        );
+        let c = Catalog::build(&d);
+        assert_eq!(names(&c), (vec!["fs.read"], vec!["lamp"]));
+        assert_eq!(c.broken[0].reason, "named twice in the description");
+        assert!(c.unit("lamp.dim").is_none());
+        assert_eq!(c.broken("lamp.dim"), Some(&c.broken[0]));
     }
 
     /// A unit's hash follows what `list` tells of it, and only that: the
@@ -637,7 +798,7 @@ mod tests {
                 description: "".into(),
                 params: Value::Null,
                 result: Value::Null,
-                provider: String::new(),
+                provider: "".into(),
             })
             .collect();
         let c = Catalog {

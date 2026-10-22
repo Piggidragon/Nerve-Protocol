@@ -292,8 +292,9 @@ fn distance(a: &[char], b: &[char], most: usize) -> usize {
 }
 
 /// `body` marked as content from the nodes, as every node-written text the
-/// model reads is (a node's error is cut and named as the node's instead):
-/// `from` names whose it is.
+/// model reads is (a node's error is cut, on one line and named as the
+/// node's instead, and a schema's field in `invalid_args` is on its one
+/// line): `from` names whose it is.
 pub fn framed(from: &str, many: bool, body: &str) -> String {
     let whose = if many {
         "those machines"

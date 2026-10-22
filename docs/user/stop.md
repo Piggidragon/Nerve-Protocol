@@ -50,6 +50,7 @@ Every command also has a timeout: its `timeout_ms`, or the node's default, and
 never more than the node's maximum
 ([how long a command may run](config.md#how-long-a-command-may-run)).
 
-On Windows a timeout first asks the command to end: its console programs get Ctrl+C and its windows a close
-request. What has not ended 3 seconds later is ended with the Job Object.
-`kill`, a cancel, the end of a session and the end of its link end it at once.
+On Windows a timeout first asks the command to end: its console programs get
+Ctrl+C and its windows a close request. What has not ended 3 seconds later is
+ended with the Job Object.
+A cancel, the end of a session and the end of its link end it at once.

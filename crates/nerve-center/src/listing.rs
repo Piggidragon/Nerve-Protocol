@@ -1200,6 +1200,53 @@ mod tests {
         }
     }
 
+    /// Details stand whole in an answer or are named for another call:
+    /// counted in the text and in the data, which holds the result schemas
+    /// the text only names.
+    #[test]
+    fn details_are_given_whole_or_named_for_later() {
+        let long = |what: &str| "d".repeat(12_000) + what;
+        let params = json!({"type": "object", "properties": {"path": {"type": "string",
+            "description": long("p")}}});
+        let result = json!({"type": "object", "properties": {"a": {"type": "string",
+            "description": long("r")}}});
+        for (in_params, in_result) in [(true, false), (false, true)] {
+            let names: Vec<String> = (0..DETAILS_MAX).map(|i| format!("a{i:02}")).collect();
+            let actions: Vec<(&str, Effect, Value)> = names
+                .iter()
+                .map(|n| {
+                    let p = if in_params { params.clone() } else { path() };
+                    (n.as_str(), Effect::Read, p)
+                })
+                .collect();
+            let mut big = cap("big", "big", &actions);
+            if in_result {
+                for a in big.actions.values_mut() {
+                    a.result = result.clone();
+                }
+            }
+            let o = offer(&record("box-1", Some(desc("box-1", vec![big]))), true);
+            let asked: Vec<String> = names.iter().map(|n| format!("big.{n}")).collect();
+            let got = details(&o, &asked);
+            assert!(!got.is_error);
+            assert!(got.text.len() <= TEXT_MAX, "{}", got.text.len());
+            assert!(!got.text.contains('…'), "nothing is cut");
+            assert!(got.data.to_string().len() <= TEXT_MAX, "{in_result}");
+            let later = got.data["result"]["later"].as_array().unwrap();
+            assert!(got.listed.len() > 1 && !later.is_empty(), "{in_result}");
+            assert_eq!(got.listed.len() + later.len(), DETAILS_MAX);
+            assert_eq!(
+                got.data["result"]["capabilities"].as_array().unwrap().len(),
+                got.listed.len()
+            );
+            assert_eq!(got.listed[0], "big.a00");
+            assert!(got.text.contains(&format!(
+                "Not detailed, this answer is full: {:?}",
+                later[0].as_str().unwrap()
+            )));
+        }
+    }
+
     /// A node may name a unit at any length; one far longer than the name
     /// given is never compared, so a typo costs no time under the store's
     /// lock, whatever the node named.

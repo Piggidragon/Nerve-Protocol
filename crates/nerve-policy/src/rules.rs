@@ -607,16 +607,23 @@ pub fn escape_controls(rule: &str) -> String {
     out
 }
 
-/// Why a rule of the allow, deny or sudo list may not hold a `\t`, `\r` or
-/// `\n` written with a backslash, if it does. `rule ls` writes the tab and
-/// line breaks of a rule so ([`escape_controls`]), and a rule typed with the
-/// listed text would be a different glob: there `\n` is the letter `n`.
-pub fn check_no_written_controls(rule: &str) -> Result<(), String> {
-    if unescape_controls(rule) == rule {
+/// Refuses `rule` if it is the listed form ([`escape_controls`]) of a rule
+/// with a tab or line break: of one of the guard's (also an older text) or of
+/// an entry of `listed`, the list it goes on. A rule pasted from `rule ls` so
+/// would look like that rule and be another: there `\n` is the letter `n`
+/// (and on Windows `\` a separator). Any other text is taken as it is, so a
+/// path like `C:\tools\x.exe` is a rule on every OS.
+pub fn check_not_a_listed_form(rule: &str, listed: &[String]) -> Result<(), String> {
+    let raw = unescape_controls(rule);
+    if raw == rule
+        || !(GUARD.contains(&raw.as_str())
+            || GUARD_OLD.contains(&raw.as_str())
+            || listed.contains(&raw))
+    {
         return Ok(());
     }
     Err(format!(
-        "rule {rule:?}: a `\\t`, `\\r` or `\\n` in a glob is the letter t, r or n, not a tab or line break. Write the character itself (as `rule guard` puts the guard's rules), `[\\]` for a backslash, or `/` in a path"
+        "rule {rule:?} is how `rule ls` writes a rule with a tab or line break, not the rule: pasted so, a `\\n` is the letter n. Add the rule itself (`nerve-node rule guard` puts the guard's rules on), or give `rule rm` and `rule edit` the listed text"
     ))
 }
 
@@ -924,6 +931,36 @@ mod tests {
             "pkill -f \"cargo run -p nerve-node\"",
         ] {
             assert!(set.find("exec", "run", c).is_some(), "{c}");
+        }
+    }
+
+    /// Only the listed form of a rule with a tab or line break is refused as
+    /// a new rule; the rest is taken as it is, a Windows path too (there `\`
+    /// is a separator, and `C:\tools` has a `\t`).
+    #[test]
+    fn only_the_listed_form_of_a_rule_with_controls_is_refused() {
+        let listed = vec!["exec.run:a\nb*".to_string()];
+        for rule in GUARD {
+            let shown = escape_controls(rule);
+            let r = check_not_a_listed_form(&shown, &[]);
+            assert_eq!(r.is_err(), shown != *rule, "{shown}");
+            assert!(check_not_a_listed_form(rule, &[]).is_ok());
+        }
+        assert!(check_not_a_listed_form("exec.run:a\\nb*", &listed).is_err());
+        assert!(check_not_a_listed_form("exec.run:a\\nb*", &[]).is_ok());
+        for rule in [
+            "exec.run:type C:\\tools\\x.exe",
+            "exec.run:*C:\\Users\\nina\\repos\\*",
+            "exec.run:\"C:\\Program Files\\nodejs\\node.exe\" --version",
+            "exec.run:type C:\\\\new",
+            "fs.read:C:\\temp\\*",
+        ] {
+            validate(rule).unwrap();
+            assert!(
+                check_not_a_listed_form(rule, &[rule.to_string()]).is_ok(),
+                "{rule}"
+            );
+            assert!(check_not_a_listed_form(rule, &listed).is_ok(), "{rule}");
         }
     }
 

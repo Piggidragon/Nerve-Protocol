@@ -64,9 +64,10 @@ too. A rule with such a character is listed with `\t`, `\r` and `\n` written
 out, so `rule ls` and the app's rule lists keep one line a rule, and `rule rm`
 and `rule edit` take the entry as it is listed there (the new entry of `rule
 edit` too). `config add` and the app's add field take the character itself
-(as `rule guard` puts the guard's rules): a rule typed with a written `\n`,
-`\r` or `\t` is refused, since in a glob that is the letter, not the line
-break. Write a backslash as `[\]` or `/`, or a doubled one.
+(as `rule guard` puts the guard's rules): the listed text of a guard rule or
+of a rule already on that list is refused there, since pasted so its `\n`
+would be the letter, not the line break. Any other text is a rule as it
+stands, a Windows path such as `C:\tools\x.exe` too.
 
 The rules match the whole line, so some lines are refused that only mention
 the node: a line that stops some other service and names `nerve-node` later,

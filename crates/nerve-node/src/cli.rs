@@ -1141,7 +1141,6 @@ impl List {
                 // capability (`C:\tools\x.exe`).
                 Some((scope, _)) if scope.len() > 1 && rules::valid_scope(scope) => {
                     rules::validate(new)?;
-                    rules::check_no_written_controls(new)?;
                     Ok(new.to_string())
                 }
                 _ => self.command_rule(new, false),
@@ -1153,7 +1152,6 @@ impl List {
                     format!("sudo {new}")
                 };
                 rules::validate_command_glob(&glob)?;
-                rules::check_no_written_controls(&glob)?;
                 Ok(glob)
             }
         }
@@ -1296,6 +1294,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                     shown => (shown, rules::unescape_controls(&new)),
                 };
                 let rule = list.edited(&new)?;
+                rules::check_not_a_listed_form(&rule, l)?;
                 let Some(at) = l.iter().position(|r| *r == entry) else {
                     return Err(format!("{entry:?} is not on the {}", list.label()));
                 };
@@ -3543,11 +3542,16 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
                 };
                 // The text `rule ls` prints for a tab or line break is not
                 // one: the rule would look like the listed one and not be.
+                // Any other text is a rule as it stands (`C:\tools` too).
                 if ["allow", "deny", "sudo_allow"]
                     .iter()
                     .any(|l| key.starts_with("center.") && key.ends_with(&format!(".policy.{l}")))
                 {
-                    rules::check_no_written_controls(value)?;
+                    let listed: Vec<String> = a
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                    rules::check_not_a_listed_form(value, &listed)?;
                 }
                 a.push(literal(value));
             }
@@ -8253,34 +8257,64 @@ mod tests {
             "{:?}",
             deny()
         );
-        // A rule with a backslash and an `n` of its own is found as it is.
-        // A `\n` of the rule's own cannot be added (it would pass for a line
-        // break): `config add` refuses it, and a pair of backslashes it takes.
-        let e = run(
+        // A Windows path rule has backslashes before t, r and n: a rule as
+        // it stands, added, listed, edited and removed on every OS.
+        let paths_rules = [
+            "exec.run:type C:\\tools\\x.exe",
+            "exec.run:*C:\\Users\\nina\\repos\\*",
+            "exec.run:\"C:\\Program Files\\nodejs\\node.exe\" --version",
+        ];
+        for own in paths_rules {
+            run(&paths, &["config", "add", "center.home.policy.deny", own]).unwrap();
+            let ls = run(&paths, &["rule", "ls", "deny"]).unwrap();
+            assert!(ls.lines().any(|l| l == own), "{ls}");
+        }
+        run(
             &paths,
             &[
-                "config",
-                "add",
-                "center.home.policy.deny",
-                "exec.run:type C:\\new",
+                "rule",
+                "edit",
+                "deny",
+                paths_rules[0],
+                "exec.run:type C:\\temp\\x.exe",
             ],
         )
-        .unwrap_err();
-        assert!(e.contains("the letter t, r or n"), "{e}");
-        let before = deny();
-        let e = run(
+        .unwrap();
+        assert!(deny().iter().any(|r| r == "exec.run:type C:\\temp\\x.exe"));
+        for own in &paths_rules[1..] {
+            run(&paths, &["rule", "rm", "deny", own]).unwrap();
+            assert!(!deny().iter().any(|r| r == own));
+        }
+        run(
             &paths,
-            &["rule", "edit", "deny", guard[12], "exec.run:a\\tb"],
+            &["rule", "rm", "deny", "exec.run:type C:\\temp\\x.exe"],
         )
-        .unwrap_err();
-        assert!(e.contains("the letter t, r or n"), "{e}");
+        .unwrap();
+        // The listed text of a rule with a line break is not a rule: pasted
+        // so, its `\n` would be the letter. Refused for a guard rule and for
+        // an entry of the list, by `config add` and `rule edit`; nothing
+        // changes.
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.deny", "exec.run:a\nb*"],
+        )
+        .unwrap();
+        let before = deny();
+        for listed in [
+            nerve_policy::rules::escape_controls(guard[12]),
+            nerve_policy::rules::escape_controls(guard[13]),
+            "exec.run:a\\nb*".to_string(),
+        ] {
+            let e = run(
+                &paths,
+                &["config", "add", "center.home.policy.deny", &listed],
+            )
+            .unwrap_err();
+            assert!(e.contains("how `rule ls` writes a rule"), "{e}");
+            let e = run(&paths, &["rule", "edit", "deny", "exec.run:a\nb*", &listed]).unwrap_err();
+            assert!(e.contains("how `rule ls` writes a rule"), "{e}");
+        }
         assert_eq!(deny(), before);
-        let own = "exec.run:type C:\\\\new";
-        run(&paths, &["config", "add", "center.home.policy.deny", own]).unwrap();
-        let ls = run(&paths, &["rule", "ls", "deny"]).unwrap();
-        assert!(ls.contains(own), "{ls}");
-        run(&paths, &["rule", "rm", "deny", own]).unwrap();
-        assert!(!deny().iter().any(|r| r == own));
         // Not there: refused, nothing changes.
         let now = deny();
         let e = run(&paths, &["rule", "rm", "deny", "exec.run:nope\\n"]).unwrap_err();

@@ -390,7 +390,11 @@ fn nerve_center_and_nerve_node_work_together() {
         v["nodes"].as_array().is_some_and(|n| n.is_empty())
     });
     let listed = mcp.list(json!({}));
-    assert_eq!(listed["structuredContent"]["nodes"], json!([]), "{listed}");
+    assert_eq!(
+        listed["structuredContent"]["result"]["nodes"],
+        json!([]),
+        "{listed}"
+    );
     assert!(mcp.offered(&node_name).is_empty());
     let status = node.ok(&["status"]);
     assert!(

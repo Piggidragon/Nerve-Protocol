@@ -292,7 +292,7 @@ impl Mcp {
     /// The capabilities `list(node)` offers now; none while the node is not
     /// known or not described yet.
     pub fn offered(&mut self, node: &str) -> Vec<String> {
-        self.list(json!({"node": node}))["structuredContent"]["capabilities"]
+        self.list(json!({"node": node}))["structuredContent"]["result"]["capabilities"]
             .as_array()
             .into_iter()
             .flatten()

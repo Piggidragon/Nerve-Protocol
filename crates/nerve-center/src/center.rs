@@ -971,6 +971,14 @@ impl Center {
             if s.node_by_name(&req.name).is_some() {
                 return Err("another node already has this name");
             }
+            // `list` and `execute` find a node by its id or its name, so a
+            // name is never a node's id: it would point at that node.
+            if s.nodes.contains_key(&req.name) || req.name == node_id {
+                return Err("this name is a node's id");
+            }
+            if s.node_by_name(&node_id).is_some() {
+                return Err("another node is named like this node's id");
+            }
             s.nodes.insert(
                 node_id.clone(),
                 NodeRecord {
@@ -1526,6 +1534,10 @@ impl Center {
         let old = self.update(|s| {
             if s.nodes.values().any(|n| n.name == name && n.id != node_id) {
                 return Err("another node already has this name".to_string());
+            }
+            // As at pairing: a node's id as a name would point at that node.
+            if s.nodes.contains_key(name) {
+                return Err("this name is a node's id".to_string());
             }
             let n = s.nodes.get_mut(node_id).ok_or("no such node")?;
             Ok(std::mem::replace(&mut n.name, name.to_string()))
@@ -4368,6 +4380,48 @@ mod tests {
         );
         drop(c);
         assert_eq!(open(dir.path(), None).log().level(), Level::Error);
+    }
+
+    /// `list` and `execute` find a node by its id or its name, so neither
+    /// pairing nor a rename lets a name be a node's id, which would make it
+    /// point at that node.
+    #[test]
+    fn a_name_is_never_a_nodes_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let pair = |name: &str, key: u8| {
+            let code = c.new_pairing()["code"].as_str().unwrap().to_string();
+            c.pair(&pair_body(&code, name, key))
+        };
+        let id = |key: u8| nerve_transport::keys::node_id(&[key; 32]);
+        assert!(nerve_proto::valid_node_name(&id(7)));
+        assert_eq!(pair("box-1", 7).0, 200);
+        // Another node's id, or its own.
+        let told = pair(&id(7), 8);
+        assert_eq!(
+            told,
+            (409, json!({"error": "this name is a node's id"})),
+            "{told:?}"
+        );
+        assert_eq!(pair(&id(8), 8).0, 409);
+        // A node whose id is another node's name.
+        assert_eq!(pair(&id(9), 8).0, 200);
+        let told = pair("box-9", 9);
+        assert_eq!(
+            told,
+            (
+                409,
+                json!({"error": "another node is named like this node's id"})
+            )
+        );
+        // A rename to a node's id, its own too; another name is fine.
+        assert_eq!(
+            c.rename(&id(8), &id(7)).unwrap_err(),
+            "this name is a node's id"
+        );
+        assert!(c.rename(&id(8), &id(8)).is_err());
+        c.rename(&id(8), "box-2").unwrap();
+        assert_eq!(pair("box-9", 9).0, 200);
     }
 
     #[tokio::test]

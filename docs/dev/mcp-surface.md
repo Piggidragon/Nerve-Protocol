@@ -67,8 +67,9 @@ conversation the model asks for it, like a skill:
   misfit with `invalid_args` (`data`: `field`, `expected`) before the node
   gets it. A details answer gives each unit whole or names it for another
   call; only the units given count as listed.
-- A node is found by id first, then by name: ids come from the node's key,
-  so a node named like another's id cannot take its calls.
+- A node is found by id first, then by name. Names and ids never overlap:
+  the center refuses a name that is a node's id at pairing and at a rename,
+  so a name always points at its own node, and an id at its node.
 - Each tool refuses an argument it does not take (`invalid_args`), so a
   model that puts a capability's arguments beside `args` learns it at once
   instead of running the call without them.

@@ -88,7 +88,7 @@ Unknown fields are refused. Answers:
 | 200 | `{"center_id", "center_name", "node_id"}` | paired |
 | 400 | `{"error"}` | malformed request or name |
 | 403 | `{"error"}` | code unknown, used, expired or out of tries |
-| 409 | `{"error"}` | another node already has this name or key |
+| 409 | `{"error"}` | another node already has this name or key, the name is a node's id, or another node is named like this node's id |
 
 - A code is valid for the lifetime the owner set when it was made (10 minutes
   by default, at most 24 hours), for one successful pairing, and for 10 tries

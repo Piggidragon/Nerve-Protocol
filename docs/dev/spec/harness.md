@@ -188,9 +188,10 @@ paired nodes.
 refusal is `isError` with `error <code>: <message>`, says what to do instead,
 and sends nothing to the node.
 
-1. The node, by id, else by name (the id first, since no node can choose
-   it: a node named like another's id does not get its calls):
-   `error unknown_node`, naming the paired nodes and the one likely meant
+1. The node, by id, else by name. Names and ids never overlap: the center
+   refuses, at pairing and at a rename, a name that is a node's id, and a
+   node whose id is another node's name (protocol.md §3), so a name
+   always points at its own node. Neither found: `error unknown_node`, naming the paired nodes and the one likely meant
    (`did you mean "box-1"?`).
 2. A disabled node: `error unavailable`.
 3. The unit, as `list(node)` offers it: one that is off is `error forbidden`;

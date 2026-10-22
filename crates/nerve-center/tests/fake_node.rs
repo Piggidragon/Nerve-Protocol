@@ -1925,7 +1925,7 @@ async fn request(ws: &mut WebSocketStream<BoxIo>) -> (nerve_proto::Id, String, V
 }
 
 /// A node that offers its link for a resume, has the center's describe
-/// answered and an `exec_run` call in flight, and then loses the connection.
+/// answered and an `exec.run` call in flight, and then loses the connection.
 /// Gives the engine, the running tools/call and the invoke's id.
 async fn a_call_in_flight_on_a_dropped_link(
     r: &Running,

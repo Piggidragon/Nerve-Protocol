@@ -51,7 +51,7 @@ from `list`, when the model asks:
 | Call | Answer |
 |---|---|
 | `list()` | One line per machine: name, id, online, offline or disabled, platform, how many capabilities |
-| `list(node: "box-1")` | One line per capability of that machine: `fs.read`, `fs.write`, `exec.run` …, each with what it does |
+| `list(node: "box-1")` | One line per capability of that machine: `fs.read`, `fs.write`, `exec.run` …, each with what it does. A machine with very many capabilities gets their names alone, and those that do not fit even then are counted |
 | `list(node: "box-1", capability: ["fs.read"])` | The details: what it does, its effect, its arguments (a JSON schema) and its result. `capability` is a list, such as `["fs.read", "exec.run"]`. The center takes one name alone too, but a harness that checks calls against the tool's schema refuses it |
 
 `execute` takes the machine, the capability and its arguments:

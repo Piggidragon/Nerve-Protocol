@@ -383,18 +383,94 @@ fn offline_note(o: &Offer) -> &'static str {
 const DISABLED: &str =
     "It is disabled in the center: it offers nothing, and calls to it are refused.";
 
+/// The lines of `list(node)` that one answer holds, and the same data.
+struct Lines {
+    body: String,
+    capabilities: Vec<Value>,
+    /// Whether the lines say what each capability does.
+    summaries: bool,
+    /// The offered capabilities not shown, from the first of them on.
+    more: usize,
+    off: Vec<String>,
+    more_off: usize,
+}
+
+/// The lines of `list(node)` as far as one answer holds them, in the text
+/// and in the data. A node may offer more than that: a line is given whole
+/// or not at all, by name alone when the summaries would not all fit (a
+/// name is short, so many more fit), and what is left is counted, so the
+/// model knows the list is cut. The ones turned off come last, as they
+/// cannot be called.
+fn lines(o: &Offer) -> Lines {
+    let budget = TEXT_MAX - ANSWER_ROOM;
+    let fit = |summaries: bool| {
+        let mut body = String::new();
+        let mut capabilities = Vec::new();
+        let mut data_len = 0;
+        for u in &o.units {
+            let (line, entry) = if summaries {
+                let s = summary(u);
+                (
+                    format!("- {}: {s}\n", u.name),
+                    json!({"name": u.name, "summary": s}),
+                )
+            } else {
+                (format!("- {}\n", u.name), json!({"name": u.name}))
+            };
+            let entry_len = entry.to_string().len() + 1;
+            if body.len() + line.len() > budget || data_len + entry_len > budget {
+                break;
+            }
+            body.push_str(&line);
+            data_len += entry_len;
+            capabilities.push(entry);
+        }
+        (body, capabilities, data_len)
+    };
+    let mut summaries = true;
+    let (mut body, mut capabilities, mut data_len) = fit(true);
+    if capabilities.len() < o.units.len() {
+        summaries = false;
+        (body, capabilities, data_len) = fit(false);
+    }
+    // A name is `[A-Za-z0-9_.-]`: as long in the data, with its quotes and
+    // comma, as in the text with its comma and space.
+    let mut off = Vec::new();
+    let mut text_len = body.len();
+    for name in &o.off {
+        let len = name.len() + 4;
+        if text_len + len > budget || data_len + len > budget {
+            break;
+        }
+        text_len += len;
+        data_len += len;
+        off.push(name.clone());
+    }
+    Lines {
+        more: o.units.len() - capabilities.len(),
+        more_off: o.off.len() - off.len(),
+        body,
+        capabilities,
+        summaries,
+        off,
+    }
+}
+
 /// `list(node)`.
 pub fn units(o: &Offer) -> Answer {
-    let summaries: Vec<Value> = o
-        .units
-        .iter()
-        .map(|u| json!({"name": u.name, "summary": summary(u)}))
-        .collect();
+    let Lines {
+        mut body,
+        capabilities,
+        summaries,
+        more,
+        off,
+        more_off,
+    } = lines(o);
     let data = envelope(
         &source(&o.node.name, &o.node.id),
         false,
-        json!({"node": o.node, "described": o.described, "capabilities": summaries,
-               "off": o.off}),
+        json!({"node": o.node, "described": o.described, "capabilities": capabilities,
+               "off": off, "more": more, "more_off": more_off}),
     );
     let head = head(&o.node);
     let text = if o.node.state == State::Disabled {
@@ -407,27 +483,40 @@ pub fn units(o: &Offer) -> Answer {
     } else if o.units.is_empty() && o.off.is_empty() {
         format!("{head} It offers no capabilities.{}", offline_note(o))
     } else {
-        let mut body = String::new();
-        for (u, s) in o.units.iter().zip(&summaries) {
-            body.push_str(&format!(
-                "- {}: {}\n",
-                u.name,
-                s["summary"].as_str().unwrap_or("")
-            ));
-        }
-        if !o.off.is_empty() {
+        if !off.is_empty() || more_off > 0 {
+            let mut names = off.clone();
+            if more_off > 0 {
+                names.push(format!("{more_off} more"));
+            }
             body.push_str(&format!(
                 "Turned off by the node's owner: {}\n",
-                o.off.join(", ")
+                names.join(", ")
             ));
         }
-        format!(
-            "{head} {}, one per line: name: what it does. Call list with node and capability \
-             (a list of names) for their details.{}\n{}",
+        let how = if summaries {
+            "one per line: name: what it does"
+        } else {
+            "one per line, by name alone, as there are too many to say what each does"
+        };
+        let mut text = format!(
+            "{head} {}, {how}. Call list with node and capability (a list of names) for their \
+             details.{}\n{}",
             count(o.units.len()),
             offline_note(o),
             framed(&format!("node {:?}", o.node.name), false, body.trim_end())
-        )
+        );
+        if more > 0 {
+            text.push_str(&format!(
+                "\nNot shown, this answer is full: {more} more {}, from {:?} on.",
+                if more == 1 {
+                    "capability"
+                } else {
+                    "capabilities"
+                },
+                o.units[o.units.len() - more].name
+            ));
+        }
+        text
     };
     Answer {
         text,
@@ -535,10 +624,16 @@ pub fn details(o: &Offer, asked: &[String]) -> Answer {
         entries.push(entry);
     }
     if !later.is_empty() {
+        // These are the node's own names, which the next call must give
+        // exactly: they are quoted whole, not cut as the model's names are.
+        let whole = later
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         missing.push(format!(
-            "Not detailed, this answer is full: {0}. Call list with node {name:?} and capability \
-             [{0}] for their details.",
-            quoted(&later)
+            "Not detailed, this answer is full: {whole}. Call list with node {name:?} and \
+             capability [{whole}] for their details."
         ));
     }
     let listed: Vec<String> = entries
@@ -846,6 +941,8 @@ mod tests {
                         {"name": "fs.read", "summary": "A file's content."},
                         {"name": "fs.write", "summary": "write it"}],
                     "off": ["lamp.on"],
+                    "more": 0,
+                    "more_off": 0,
                 },
             })
         );
@@ -1223,6 +1320,10 @@ mod tests {
             "description": long("p")}}});
         let result = json!({"type": "object", "properties": {"a": {"type": "string",
             "description": long("r")}}});
+        // A capability id as long as a name may be: the units' names are
+        // longer than the model's own names an answer repeats, and the
+        // next call needs them whole.
+        let id = format!("big-{}", "x".repeat(crate::catalog::NAME_MAX - 4));
         for (in_params, in_result) in [(true, false), (false, true)] {
             let names: Vec<String> = (0..DETAILS_MAX).map(|i| format!("a{i:02}")).collect();
             let actions: Vec<(&str, Effect, Value)> = names
@@ -1232,14 +1333,14 @@ mod tests {
                     (n.as_str(), Effect::Read, p)
                 })
                 .collect();
-            let mut big = cap("big", "big", &actions);
+            let mut big = cap(&id, "big", &actions);
             if in_result {
                 for a in big.actions.values_mut() {
                     a.result = result.clone();
                 }
             }
             let o = offer(&record("box-1", Some(desc("box-1", vec![big]))), true);
-            let asked: Vec<String> = names.iter().map(|n| format!("big.{n}")).collect();
+            let asked: Vec<String> = names.iter().map(|n| format!("{id}.{n}")).collect();
             let got = details(&o, &asked);
             assert!(!got.is_error);
             assert!(got.text.len() <= TEXT_MAX, "{}", got.text.len());
@@ -1252,7 +1353,7 @@ mod tests {
                 got.data["result"]["capabilities"].as_array().unwrap().len(),
                 got.listed.len()
             );
-            assert_eq!(got.listed[0], "big.a00");
+            assert_eq!(got.listed[0], format!("{id}.a00"));
             assert!(got.text.contains(&format!(
                 "Not detailed, this answer is full: {:?}",
                 later[0].as_str().unwrap()
@@ -1272,6 +1373,110 @@ mod tests {
                 got.text
             );
         }
+    }
+
+    /// A node that offers more than one answer holds gets whole lines: by
+    /// name alone when the summaries do not all fit, in the text or in the
+    /// data, and what does not fit even then is counted, from its first
+    /// name on, so the model is told the list is cut.
+    #[test]
+    fn a_long_list_of_capabilities_is_given_in_whole_lines() {
+        let max = crate::catalog::NAME_MAX;
+        // The units of `caps` capabilities of `per` actions each, every name
+        // `width` bytes, and a summary of `said` per action.
+        let node = |caps: usize, per: usize, width: usize, said: &str| {
+            let caps: Vec<_> = (0..caps)
+                .map(|c| {
+                    let names: Vec<String> = (0..per).map(|a| format!("{a:0>width$}")).collect();
+                    let actions: Vec<(&str, Effect, Value)> = names
+                        .iter()
+                        .map(|n| (n.as_str(), Effect::Read, path()))
+                        .collect();
+                    let mut cap = cap(&format!("{c:0>width$}"), "x", &actions);
+                    for a in cap.actions.values_mut() {
+                        a.summary = said.into();
+                    }
+                    cap
+                })
+                .collect();
+            offer(&record("box-1", Some(desc("box-1", caps))), true)
+        };
+        let whole_lines = |o: &Offer, got: &Answer| {
+            assert!(!got.is_error);
+            assert!(got.text.len() <= TEXT_MAX, "{}", got.text.len());
+            assert!(got.data.to_string().len() <= TEXT_MAX);
+            assert!(!got.text.contains('…'), "nothing is cut");
+            let shown = got.data["result"]["capabilities"].as_array().unwrap();
+            let more = got.data["result"]["more"].as_u64().unwrap() as usize;
+            assert_eq!(shown.len() + more, o.units.len());
+            for (u, s) in o.units.iter().zip(shown) {
+                assert_eq!(s["name"], u.name.as_str());
+            }
+            assert!(got.text.starts_with(&format!(
+                "Node box-1 (id id-box-1): online. {} capabilities, one per line",
+                o.units.len()
+            )));
+            (shown.len(), more)
+        };
+
+        // Summaries over the text's room: the names alone fit.
+        let o = node(30, 64, 8, &"s".repeat(200));
+        let got = units(&o);
+        assert_eq!(whole_lines(&o, &got), (1920, 0));
+        assert!(got.text.contains("by name alone"), "{}", &got.text[..300]);
+        assert!(got.text.contains(&format!("\n- {}\n", o.units[7].name)));
+        assert!(
+            got.data["result"]["capabilities"][0]
+                .get("summary")
+                .is_none()
+        );
+        assert!(!got.text.contains("Not shown"));
+
+        // Summaries that fit in the text but not in the data, where every
+        // quote is escaped: the names alone again.
+        let o = node(12, 64, 4, &"\"".repeat(200));
+        let got = units(&o);
+        assert_eq!(whole_lines(&o, &got), (768, 0));
+        assert!(got.text.contains("by name alone"));
+
+        // Few enough: every line with its summary.
+        let o = node(2, 4, 4, "Reads it.");
+        let got = units(&o);
+        assert_eq!(whole_lines(&o, &got), (8, 0));
+        assert!(got.text.contains("one per line: name: what it does."));
+        assert!(got.text.contains("\n- 0000.0000: Reads it.\n"));
+
+        // Names as long as they may be, more than fit even alone: the rest
+        // is counted from the first one not shown, and so are the ones
+        // turned off, which come last.
+        let mut o = node(40, 64, max, "Reads it.");
+        let off: Vec<String> = o
+            .units
+            .drain(o.units.len() - 256..)
+            .map(|u| u.name.clone())
+            .collect();
+        o.off = off;
+        let got = units(&o);
+        let (shown, more) = whole_lines(&o, &got);
+        assert!(more > 0 && shown > 1000, "{shown} {more}");
+        assert!(
+            got.text.ends_with(&format!(
+                "\nNot shown, this answer is full: {more} more capabilities, from {:?} on.",
+                o.units[shown].name
+            )),
+            "{}",
+            &got.text[got.text.len() - 300..]
+        );
+        let last = got.text.lines().rev().nth(2).unwrap();
+        assert!(
+            last.starts_with("Turned off by the node's owner: ") && last.ends_with(" more"),
+            "{last}"
+        );
+        assert_eq!(
+            got.data["result"]["off"].as_array().unwrap().len()
+                + got.data["result"]["more_off"].as_u64().unwrap() as usize,
+            256
+        );
     }
 
     /// The distance worked out near the diagonal only, and given up when

@@ -135,8 +135,14 @@ the `result` of the envelope described below.
   capabilities}]}`.
 - `list(node)`: the node by id, else by name; one line per unit with its
   summary (its description cut at 200 characters), then the units that are
-  `off`. `structuredContent`:
-  `{node, described, capabilities: [{name, summary}], off}`.
+  `off`. Lines are given whole: when the summaries would take the answer past
+  240 KiB (in the text or in `structuredContent`), every unit is named alone,
+  without its summary, and the units that do not fit even then are counted
+  in a line `Not shown, this answer is full: N more capabilities, from "x.y"
+  on.`, as are the `off` ones past it (`N more` in their line).
+  `structuredContent`: `{node, described, capabilities: [{name, summary}],
+  off, more, more_off}`, with the names shown, `summary` only when the text
+  has it, and the counts of those not shown.
 - `list(node, capability)`: `capability` is a list of at most 32 names (a
   single name as a string is accepted too, though the schema declares the
   array).
@@ -144,8 +150,8 @@ the `result` of the envelope described below.
   the capability's, on one line and cut at 2 KiB), effect, `params` (the JSON
   schema, compact) and its result (in words; the schema in
   `structuredContent`). Details are given whole: those that would take the
-  answer past 240 KiB (in the text or in `structuredContent`) are named in a
-  line `Not detailed, this answer is full: …` and in `later`, for another
+  answer past 240 KiB (in the text or in `structuredContent`) are named, whole,
+  in a line `Not detailed, this answer is full: …` and in `later`, for another
   `list` call; only the units given count as listed (§4.3 step 4). Names that are not
   offered, or off, are named after them, a misspelt one with the offered unit
   it was likely meant to be (as in `execute`, below). When none of the names is offered, the result

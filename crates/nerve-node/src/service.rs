@@ -479,6 +479,27 @@ fn pkexec_program() -> Option<PathBuf> {
 /// This machine.
 pub struct Host;
 
+impl Host {
+    /// [`System::end_session`] for the generator at `generator` and the
+    /// linger files in `linger`. What setup wrote for the session of the
+    /// node's user (crate::keyring_setup) goes first, whether or not the user
+    /// lingers: it must not stay for the next account to get the uid.
+    fn end_session_of(&self, name: &str, generator: &Path, linger: &Path) -> Result<bool, String> {
+        let _ = std::fs::remove_file(generator);
+        if !linger.join(name).exists() {
+            return Ok(false);
+        }
+        run("loginctl", &["disable-linger", name])?;
+        // userdel refuses a user whose processes (the keyring) still run;
+        // systemctl waits until the session's manager has stopped them.
+        if let Ok(Some(a)) = self.account(name) {
+            let _ = run("systemctl", &["stop", &format!("user@{}.service", a.uid)]);
+        }
+        let _ = run("loginctl", &["terminate-user", name]);
+        Ok(true)
+    }
+}
+
 impl System for Host {
     fn is_root(&self) -> bool {
         nerve_transport::net::euid() == 0
@@ -618,20 +639,11 @@ impl System for Host {
     }
 
     fn end_session(&self, name: &str) -> Result<bool, String> {
-        // What setup wrote for the session of the node's user, when its
-        // environment needed one (crate::keyring_setup).
-        let _ = std::fs::remove_file(crate::keyring_setup::SESSION_GENERATOR);
-        if !Path::new("/var/lib/systemd/linger").join(name).exists() {
-            return Ok(false);
-        }
-        run("loginctl", &["disable-linger", name])?;
-        // userdel refuses a user whose processes (the keyring) still run;
-        // systemctl waits until the session's manager has stopped them.
-        if let Ok(Some(a)) = self.account(name) {
-            let _ = run("systemctl", &["stop", &format!("user@{}.service", a.uid)]);
-        }
-        let _ = run("loginctl", &["terminate-user", name]);
-        Ok(true)
+        self.end_session_of(
+            name,
+            Path::new(crate::keyring_setup::SESSION_GENERATOR),
+            Path::new("/var/lib/systemd/linger"),
+        )
     }
 
     fn has_pkexec(&self) -> bool {
@@ -2736,6 +2748,22 @@ pub(crate) mod tests {
         );
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("ended the session of nerve"), "{out}");
+    }
+
+    /// `uninstall` takes the session generator away, also from a user that
+    /// does not linger (the early return must not skip it).
+    #[test]
+    fn ending_the_session_removes_the_generator_it_wrote() {
+        let d = tempfile::tempdir().unwrap();
+        let gen_file = d.path().join("99-nerve-session");
+        std::fs::write(&gen_file, "#!/bin/sh\n").unwrap();
+        let linger = d.path().join("linger");
+        std::fs::create_dir(&linger).unwrap();
+        // Nobody lingers in this folder, so nothing is run.
+        assert_eq!(Host.end_session_of("nerve", &gen_file, &linger), Ok(false));
+        assert!(!gen_file.exists(), "the generator is still there");
+        // A generator that is not there is no error.
+        assert_eq!(Host.end_session_of("nerve", &gen_file, &linger), Ok(false));
     }
 
     /// The installed node is known by its folders, not by how it started.

@@ -270,11 +270,15 @@ PY
 node_runs_with_keys "after the session started again"
 
 step "5c. Without the generator the node sets the session right when it starts"
-rm -f /etc/systemd/user-environment-generators/99-nerve-session
+GENERATOR=/etc/systemd/user-environment-generators/99-nerve-session
+cp -p "$GENERATOR" "$OUT/generator"
+rm -f "$GENERATOR"
 restart_session "$OUT/session-env3"
 # The test is a test only if the session is wrong now.
 grep -qx "XDG_DATA_HOME=/home/$OWNER/.local/share" "$OUT/session-env3" || fail "the session of nerve is not wrong without the generator, so this step tests nothing"
 node_runs_with_keys "the node's own repair"
+# Back in its place, so that step 7 shows that uninstall takes it away.
+install -m 755 "$OUT/generator" "$GENERATOR"
 [ -z "$GENERATOR_FAILED" ] || fail "the generator did not keep the session of nerve right (see above)"
 
 step "6. real_account.rs: a center, a restart, a folder mode command as nerve-run"
@@ -282,6 +286,7 @@ NERVE_REAL_KEYRING=1 NERVE_REAL_OWNER=$OWNER \
   "$TESTS" --ignored --exact --nocapture the_installed_node_with_its_keys_in_the_keyring_runs_folder_commands_as_nerve_run
 
 step "7. uninstall --purge"
+[ -e "$GENERATOR" ] || fail "the generator is not there before uninstall, so its removal would show nothing"
 owners_sudo "$BIN" uninstall --purge | tee "$OUT/uninstall"
 if id nerve >/dev/null 2>&1; then fail "the account nerve is still there"; fi
 if id nerve-run >/dev/null 2>&1; then fail "the account nerve-run is still there"; fi
@@ -289,7 +294,7 @@ if id nerve-run >/dev/null 2>&1; then fail "the account nerve-run is still there
 [ ! -e /etc/systemd/system/nerve-node.service ] || fail "the unit is still there"
 [ ! -e /var/lib/nerve ] || fail "the node's home is still there"
 [ ! -e "/run/user/$NERVE_UID" ] || fail "nerve's session is still there"
-[ ! -e /etc/systemd/user-environment-generators/99-nerve-session ] || fail "the session generator is still there"
+[ ! -e "$GENERATOR" ] || fail "uninstall left the session generator"
 
 step "Done"
 summary "- the keyring path end to end: passed"

@@ -351,7 +351,10 @@ its environment, in `/` and with no input:
 - `loginctl enable-linger <user>`: the user keeps a session with its own
   D-Bus from boot on, and D-Bus starts GNOME Keyring there when the node
   asks;
-- when the user's service manager has another user's `XDG_RUNTIME_DIR`, bus
+- for the installed node's own user `nerve` only (by its name and the comment
+  `install` gives it; a node run by hand keeps its user's session and XDG
+  folders as they are, and `setup` only sets a wrong runtime folder or bus right there),
+  when the user's service manager has another user's `XDG_RUNTIME_DIR`, bus
   or XDG folders from the system-wide environment of the login
   (`/etc/environment`, which `30-systemd-environment-d-generator` hands to the
   manager): `systemctl --user set-environment` of the user's own, a restart of

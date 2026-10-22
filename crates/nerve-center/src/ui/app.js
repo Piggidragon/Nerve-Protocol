@@ -578,7 +578,7 @@ function nodeCard(n) {
       : el("p", { class: "meta" }, "Offers nothing yet."),
     broken.length
       ? el("div", { class: "broken" },
-        el("p", { class: "meta" }, "Not offered to the agent, since the center cannot check them:"),
+        el("p", { class: "meta" }, "Not offered to the agent:"),
         broken.map((b) => el("p", { class: "meta" }, el("code", { class: "mono" }, b.name), ` ${b.reason}`)))
       : null,
     el("div", { class: "actions" },

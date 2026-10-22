@@ -1837,17 +1837,24 @@ impl Center {
                 // is left out on its own (`Catalog`); the rest stays usable.
                 Ok(d) => {
                     let broken = self.update(|s| {
-                        s.nodes.get_mut(&link.node_id).map(|n| {
-                            n.set_descriptor(d);
-                            n.catalog.broken.clone()
-                        })
+                        let n = s.nodes.get_mut(&link.node_id)?;
+                        n.set_descriptor(d);
+                        let first = n.catalog.broken.first()?.clone();
+                        Some((first, n.catalog.broken.len()))
                     });
-                    for b in broken.unwrap_or_default() {
+                    // One line however many: a node may leave out thousands,
+                    // and the overview lists them all.
+                    if let Some((b, count)) = broken {
+                        let more = if count > 1 {
+                            format!(" (and {} more, listed in the overview)", count - 1)
+                        } else {
+                            String::new()
+                        };
                         self.note(
                             Level::Warn,
                             Some(&link.node_id),
                             format!(
-                                "the center leaves out {} of the node's description: {}",
+                                "the center leaves out {} of the node's description: {}{more}",
                                 b.name, b.reason
                             ),
                         );
@@ -1969,11 +1976,17 @@ impl Center {
                 .map(|n| {
                     let link = links.get(&n.id).filter(|l| l.is_live());
                     let d = n.descriptor.as_ref();
+                    // Whether the agent is offered anything of a capability:
+                    // one whose every action was left out is listed for the
+                    // owner, but the `nodes` tool does not name it.
+                    let offered: BTreeSet<&str> =
+                        n.catalog.units.iter().map(|u| u.cap.as_str()).collect();
                     let caps: Vec<Value> = d
                         .map(|d| {
                             d.capabilities
                                 .iter()
-                                .map(|c| json!({"id": c.id, "profile": c.profile, "exposure": c.exposure, "summary": c.summary}))
+                                .map(|c| json!({"id": c.id, "profile": c.profile, "exposure": c.exposure, "summary": c.summary,
+                                                "offered": offered.contains(c.id.as_str())}))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -2283,19 +2296,39 @@ impl Center {
         sess.calls.fetch_add(1, Ordering::SeqCst);
         let started = Instant::now();
         let out = self.call_inner(sess, route, args).await;
+        let failed = out.as_ref().err().map(|CallError::Rpc(e)| e);
+        self.count_call(sess, route, failed, started);
+        out
+    }
+
+    /// A call the MCP side refused before `call` (its arguments do not fit
+    /// the unit, or the unit is gone): counted and logged as a failed call
+    /// of the unit, as when the node refused it, so the owner still sees a
+    /// model that keeps getting its arguments wrong.
+    pub fn refused(&self, sess: &Arc<Session>, route: &Route, e: RpcError) -> CallError {
+        sess.calls.fetch_add(1, Ordering::SeqCst);
+        self.count_call(sess, route, Some(&e), Instant::now());
+        CallError::Rpc(e)
+    }
+
+    /// The log line and statistics of a call that worked or `failed`.
+    fn count_call(
+        &self,
+        sess: &Arc<Session>,
+        route: &Route,
+        failed: Option<&RpcError>,
+        started: Instant,
+    ) {
         let ms = started.elapsed().as_millis() as u64;
         // A call that returned outside content taints the session, so the
         // model's "only tainted sessions" scope and its state can take it in.
-        if out.is_ok() && self.checker().taint_on() && checker::taints(route.effect) {
+        if failed.is_none() && self.checker().taint_on() && checker::taints(route.effect) {
             sess.set_tainted();
             self.changed(Change::Sessions);
         }
-        let code = match &out {
-            Ok(_) => None,
-            Err(CallError::Rpc(e)) => Some(e.kind().as_str().to_string()),
-        };
+        let code = failed.map(|e| e.kind().as_str().to_string());
         // A call that worked is in the node's audit log, not here.
-        if let Err(CallError::Rpc(e)) = &out {
+        if let Some(e) = failed {
             self.log_failed_call(route, e, started.elapsed());
         }
         self.update_soon(|s| {
@@ -2315,7 +2348,6 @@ impl Center {
                 *d.errors.entry(code.clone()).or_default() += 1;
             }
         });
-        out
     }
 
     async fn call_inner(

@@ -1226,6 +1226,9 @@ mod tests {
         let card = &card[..card.find("\n}\n").unwrap()];
         assert!(card.contains("const broken = n.broken || [];"), "{card}");
         assert!(card.contains("broken.length"), "{card}");
+        // A neutral heading: a unit may be left out for its name as well
+        // as for a schema the center cannot check.
+        assert!(card.contains("\"Not offered to the agent:\""), "{card}");
         assert!(
             card.contains("broken.map((b) =>")
                 && card.contains("b.name")

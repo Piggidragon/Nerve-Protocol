@@ -40,7 +40,8 @@ pub struct Unit {
 /// A unit the center leaves out, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Broken {
-    /// `cap.action`.
+    /// `cap.action`, or the capability's id when a schema of a capability
+    /// without actions is outside the subset.
     pub name: String,
     pub reason: String,
 }
@@ -61,9 +62,21 @@ impl Catalog {
             if RESERVED_CAPS.contains(&cap.id.as_str()) {
                 continue;
             }
+            // A capability's event data and state are checked as well, so
+            // every schema the node publishes keeps to the subset; one that
+            // does not leaves out the whole capability.
+            let whole = cap_outside_subset(cap);
+            if cap.actions.is_empty()
+                && let Some(reason) = whole.clone()
+            {
+                c.broken.push(Broken {
+                    name: cap.id.clone(),
+                    reason,
+                });
+            }
             for (action, def) in &cap.actions {
                 let name = format!("{}.{action}", cap.id);
-                if let Some(reason) = bad_name(&cap.id, action) {
+                if let Some(reason) = bad_name(&cap.id, action).or_else(|| whole.clone()) {
                     c.broken.push(Broken { name, reason });
                     continue;
                 }
@@ -94,15 +107,18 @@ impl Catalog {
     }
 
     /// The unit `name` (`cap.action`); none for a broken or unknown one.
+    /// Found by halving, since the tools are built by asking for each unit
+    /// of every node, under the store's lock.
     pub fn unit(&self, name: &str) -> Option<&Unit> {
-        self.units.iter().find(|u| u.name == name)
+        self.units
+            .binary_search_by(|u| u.name.as_str().cmp(name))
+            .ok()
+            .map(|i| &self.units[i])
     }
 
     /// Whether `cap.action` is a unit, so it may be offered to the agent.
     pub fn offers(&self, cap: &str, action: &str) -> bool {
-        self.units
-            .iter()
-            .any(|u| u.cap == cap && u.action == action)
+        self.unit(&format!("{cap}.{action}")).is_some()
     }
 }
 
@@ -120,6 +136,23 @@ fn bad_name(cap: &str, action: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// Why the state or an event's data of `cap` is outside the subset.
+fn cap_outside_subset(cap: &nerve_proto::Capability) -> Option<String> {
+    if !cap.state.is_null()
+        && let Err(e) = schema::check(&cap.state, Role::Result)
+    {
+        return Some(format!("state: {e}"));
+    }
+    cap.events.iter().find_map(|(name, ev)| {
+        if ev.data.is_null() {
+            return None;
+        }
+        schema::check(&ev.data, Role::Result)
+            .err()
+            .map(|e| format!("event {name}: {e}"))
+    })
 }
 
 /// Why the schemas of an action are outside the subset the center checks
@@ -298,6 +331,102 @@ mod tests {
             c.unit("lamp.state").unwrap().result["properties"]["on"],
             json!({"type": "boolean"})
         );
+    }
+
+    /// Event data and state are published schemas too: one outside the
+    /// subset leaves out every action of its capability, and a capability
+    /// without actions is named on its own.
+    #[test]
+    fn a_broken_event_or_state_leaves_out_its_capability() {
+        let mut lamp = cap(
+            "lamp",
+            "",
+            &[
+                ("on", Effect::Actuate, json!({"type": "object"})),
+                ("off", Effect::Actuate, json!({"type": "object"})),
+            ],
+        );
+        lamp.state = json!({"$ref": "#/x"});
+        let mut door = cap("door", "", &[("open", Effect::Actuate, path())]);
+        door.events.insert(
+            "opened".into(),
+            nerve_proto::descriptor::EventDecl {
+                summary: "It opened.".into(),
+                implicit: false,
+                data: json!({"oneOf": [{"type": "string"}]}),
+            },
+        );
+        let mut bell = cap("bell", "", &[]);
+        bell.events = door.events.clone();
+        let mut fine = cap("fine", "", &[("go", Effect::Read, path())]);
+        fine.state = json!({"type": "object", "properties": {"on": {"type": "boolean"}}});
+        fine.events.insert(
+            "went".into(),
+            nerve_proto::descriptor::EventDecl {
+                summary: "It went.".into(),
+                implicit: false,
+                data: json!({"type": "integer"}),
+            },
+        );
+        let c = Catalog::build(&desc("box", vec![lamp, door, bell, fine]));
+        assert_eq!(
+            names(&c),
+            (
+                vec!["fine.go"],
+                vec!["bell", "door.open", "lamp.off", "lamp.on"]
+            )
+        );
+        let reason = |n: &str| {
+            c.broken
+                .iter()
+                .find(|b| b.name == n)
+                .unwrap()
+                .reason
+                .clone()
+        };
+        assert!(
+            reason("lamp.on").starts_with("state: "),
+            "{}",
+            reason("lamp.on")
+        );
+        assert!(
+            reason("door.open").starts_with("event opened: ")
+                && reason("door.open").contains("oneOf"),
+            "{}",
+            reason("door.open")
+        );
+        assert_eq!(reason("bell"), reason("door.open"));
+    }
+
+    /// The tools are built by asking for every unit of every node under the
+    /// store's lock, so finding one must not scan them all: with a hundred
+    /// thousand units a scan each would take minutes.
+    #[test]
+    fn many_units_are_found_without_a_scan_each() {
+        let units: Vec<Unit> = (0..100_000)
+            .map(|i| Unit {
+                name: format!("c{i:06}.a"),
+                cap: format!("c{i:06}"),
+                action: "a".into(),
+                effect: Effect::Read,
+                summary: String::new(),
+                params: Value::Null,
+                result: Value::Null,
+                provider: String::new(),
+            })
+            .collect();
+        let c = Catalog {
+            units,
+            broken: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        for u in &c.units {
+            assert!(c.offers(&u.cap, &u.action));
+        }
+        assert!(!c.offers("c", "a"));
+        assert!(c.unit("c050000.a").is_some());
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
     }
 
     /// The node's own descriptor, in every mode, is whole in the catalog: a

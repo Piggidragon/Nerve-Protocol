@@ -515,8 +515,24 @@ async fn overview(r: &Running) -> Value {
     serde_json::from_slice(&resp.body).unwrap()
 }
 
+/// The center's log lines that hold `text`.
+fn log_lines(c: &nerve_center::center::Center, text: &str) -> Vec<String> {
+    let q = nerve_transport::log::Query {
+        text: Some(text.into()),
+        limit: 1000,
+        ..Default::default()
+    };
+    c.log_json(&q)["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["msg"].as_str().unwrap().to_string())
+        .collect()
+}
+
 /// A capability whose name a tool could not carry is left out on its own:
-/// the node's other capabilities stay tools, and the owner sees why.
+/// the node's other capabilities stay tools, and the owner sees why. The
+/// agent's `nodes` tool does not name it, and the log says it once.
 #[tokio::test]
 async fn only_the_capability_with_a_bad_name_is_left_out() {
     let dir = tempfile::tempdir().unwrap();
@@ -526,16 +542,45 @@ async fn only_the_capability_with_a_bad_name_is_left_out() {
     let (ws, _) = handshake(&r, &key).await;
     let mut d = descriptor(&key, "box-1");
     d["capabilities"][0]["id"] = json!("my_fs");
+    d["capabilities"][0]["actions"]["list"] = d["capabilities"][0]["actions"]["read"].clone();
     let _seen = serve(ws, d);
     let c = r.center.clone();
     wait_for(|| (!c.tools().is_empty()).then_some(())).await;
     let names: Vec<String> = c.tools().into_iter().map(|t| t.name).collect();
     assert_eq!(names, ["exec_run"]);
     let ov = overview(&r).await;
+    let reason = "capability name \"my_fs\": letters, digits and - only, no _";
     assert_eq!(
         ov["nodes"][0]["broken"],
-        json!([{"name": "my_fs.read",
-                "reason": "capability name \"my_fs\": letters, digits and - only, no _"}])
+        json!([{"name": "my_fs.list", "reason": reason},
+               {"name": "my_fs.read", "reason": reason}])
+    );
+    // The overview still lists it for the owner, as not offered.
+    assert_eq!(ov["nodes"][0]["capabilities"][0]["id"], "my_fs");
+    assert_eq!(ov["nodes"][0]["capabilities"][0]["offered"], false);
+    let e = Engine::new(&r.center, "test");
+    let listed = rpc(
+        &e,
+        1,
+        "tools/call",
+        json!({"name": "nodes", "arguments": {}}),
+    )
+    .await;
+    let listed = listed["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(listed.contains("offers exec"), "{listed}");
+    assert!(!listed.contains("my_fs"), "{listed}");
+    // One line for both, however many there are.
+    let lines = wait_for(|| {
+        let l = log_lines(&c, "leaves out");
+        (!l.is_empty()).then_some(l)
+    })
+    .await;
+    assert_eq!(
+        lines,
+        [format!(
+            "the center leaves out my_fs.list of the node's description: {reason} \
+             (and 1 more, listed in the overview)"
+        )]
     );
     r.stop().await;
 }
@@ -613,6 +658,20 @@ async fn wrong_args_are_refused_before_the_node() {
             .is_err(),
         "the node received something"
     );
+    // The owner sees the refusals in the log and the statistics, as when
+    // the node refused them.
+    let lines = log_lines(&c, "fs.read failed");
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines[0].starts_with("fs.read failed (invalid_args)")
+            && lines[0].contains("path: expected"),
+        "{lines:?}"
+    );
+    let stats = c.stats_json();
+    let day = &stats["nodes"]["box-1"];
+    assert_eq!(day["calls"]["fs.read"]["count"], 3, "{stats}");
+    assert_eq!(day["calls"]["fs.read"]["errors"], 3, "{stats}");
+    assert_eq!(day["errors"]["invalid_args"], 3, "{stats}");
     // Fitting arguments go through.
     let done = run(&e, "box-1", "fs.read", json!({"path": "/x"})).await;
     assert_ne!(done["result"]["isError"], true, "{done}");

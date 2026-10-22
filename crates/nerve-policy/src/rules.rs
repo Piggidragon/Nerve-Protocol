@@ -415,20 +415,23 @@ macro_rules! end_ps {
 /// may remove any of them.
 pub const GUARD: &[&str] = &[
     // By name where a command starts: the line's start, after `;`, `&`,
-    // `|` or `(`, and after `sudo`; then the line's end, a space or a quote.
-    "exec.run:{,*[;&|(] ,*[;&|(],*sudo }nerve-node{,-desktop}{,.exe}{,[ \"']*}",
-    // By a path that ends in the program: `/usr/local/bin/nerve-node`,
-    // `C:\Program Files\Nerve\nerve-node-desktop.exe`.
-    "exec.run:*[/\\]nerve-node{,-desktop}{,.exe}{,[ \"']*}",
-    "exec.run:*/run/nerve-node{,/*,[ \"']*}",
+    // `|`, `(` or a line break (with its indent), and after `sudo`; then the
+    // line's end, a space, a tab, a line break or a quote.
+    concat!(
+        "exec.run:{,*[;&|(\r\n]}",
+        ws!(),
+        "{,*sudo }nerve-node{,-desktop}{,.exe}{,[ \t\r\n\"']*}"
+    ),
+    "exec.run:*[/\\]nerve-node{,-desktop}{,.exe}{,[ \t\r\n\"']*}",
+    "exec.run:*/run/nerve-node{,/*,[ \t\r\n\"']*}",
     "exec.run:*[/\\][/\\].[/\\]pipe[/\\]nerve-node*",
-    "exec.run:*/etc/nerve{,/*,[ \"']*}",
-    "exec.run:*/var/lib/nerve{,/*,[ \"']*}",
-    "exec.run:*.config/nerve{,/*,[ \"']*}",
-    "exec.run:*.local/state/nerve{,/*,[ \"']*}",
+    "exec.run:*/etc/nerve{,/*,[ \t\r\n\"']*}",
+    "exec.run:*/var/lib/nerve{,/*,[ \t\r\n\"']*}",
+    "exec.run:*.config/nerve{,/*,[ \t\r\n\"']*}",
+    "exec.run:*.local/state/nerve{,/*,[ \t\r\n\"']*}",
     // `C:\ProgramData\Nerve`, `%ProgramData%\Nerve`, `$env:ProgramData\Nerve`:
     // the line's `\` is matched as `/` on Windows.
-    "exec.run:*[Pp]rogram[Dd]ata*/[Nn]erve{,/*,[ \"']*}",
+    "exec.run:*[Pp]rogram[Dd]ata*/[Nn]erve{,/*,[ \t\r\n\"']*}",
     // Stopping, restarting, disabling or killing the node's service or
     // process, by its name, with the same line starts (and the program's path).
     // Reading it stays allowed: `systemctl status`, `sc query`, `Get-Service`.
@@ -554,6 +557,61 @@ pub const GUARD: &[&str] = &[
     "fs.write:/var/lib/nerve/*",
     "fs.write:/?/ProgramData/Nerve/*",
 ];
+
+/// The texts of [`GUARD`] rules from before a line break ended a command,
+/// which `rule guard` takes off a deny list when it puts the new ones on.
+pub const GUARD_OLD: &[&str] = &[
+    "exec.run:{,*[;&|(] ,*[;&|(],*sudo }nerve-node{,-desktop}{,.exe}{,[ \"']*}",
+    "exec.run:*[/\\]nerve-node{,-desktop}{,.exe}{,[ \"']*}",
+    "exec.run:*/run/nerve-node{,/*,[ \"']*}",
+    "exec.run:*/etc/nerve{,/*,[ \"']*}",
+    "exec.run:*/var/lib/nerve{,/*,[ \"']*}",
+    "exec.run:*.config/nerve{,/*,[ \"']*}",
+    "exec.run:*.local/state/nerve{,/*,[ \"']*}",
+    "exec.run:*[Pp]rogram[Dd]ata*/[Nn]erve{,/*,[ \"']*}",
+];
+
+/// `rule` with its tab, carriage return and line feed written `\t`, `\r` and
+/// `\n`, as `rule ls` and the app show it: a rule of the guard holds them
+/// (they end a command in a script), and a listing keeps one line a rule.
+pub fn escape_controls(rule: &str) -> String {
+    let mut out = String::with_capacity(rule.len());
+    for c in rule.chars() {
+        match c {
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The reverse of [`escape_controls`]: `\t`, `\r` and `\n` become the
+/// character. A `\\` pair is kept as it is, so `[/\\]n` stays. A rule that
+/// has a `\n` of its own (a path `C:\new`) is not for this: the callers use
+/// it only on an entry that is not on the list as it stands.
+pub fn unescape_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('n') => out.push('\n'),
+            Some(o) => {
+                out.push('\\');
+                out.push(o);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
 
 /// The rules of [`GUARD`] that `deny` lacks.
 pub fn guard_missing(deny: &[String]) -> Vec<&'static str> {
@@ -718,6 +776,22 @@ mod tests {
             "sed -i s/a/b/ ~/.config/nerve/node.toml",
             "ls $HOME/.local/state/nerve",
             "type %ProgramData%/Nerve/config/node.toml",
+            // A line break or a tab ends a command and its name like a space,
+            // and a script line may be indented.
+            "cd /tmp\nnerve-node status",
+            "cd /tmp\r\nnerve-node status",
+            "nerve-node\necho x",
+            "nerve-node\r\n",
+            "echo hi\n  nerve-node status",
+            "echo hi\n\tsudo nerve-node audit",
+            "/usr/local/bin/nerve-node\tstatus",
+            "/usr/local/bin/nerve-node\nls",
+            "ls /run/nerve-node\n",
+            "cat /etc/nerve\nls",
+            "cat /var/lib/nerve\tx",
+            "cat ~/.config/nerve\r\nls",
+            "ls $HOME/.local/state/nerve\n",
+            "type %ProgramData%/Nerve\r\ndir",
         ] {
             assert!(run(c), "should be refused: {c}");
         }
@@ -747,6 +821,63 @@ mod tests {
         }
         let have = vec![GUARD[0].to_string(), "exec.run:rm *".to_string()];
         assert_eq!(guard_missing(&have), GUARD[1..].to_vec());
+    }
+
+    /// The guard's rules before a line break ended a command let a second
+    /// line through; the new texts do not. `rule guard` replaces the old ones.
+    #[test]
+    fn the_old_guard_texts_missed_a_line_break_and_are_replaced() {
+        let home = Path::new("/home/alice");
+        let old = RuleSet::new(
+            &GUARD_OLD.iter().map(|g| g.to_string()).collect::<Vec<_>>(),
+            home,
+        );
+        let new = RuleSet::new(
+            &GUARD.iter().map(|g| g.to_string()).collect::<Vec<_>>(),
+            home,
+        );
+        for c in [
+            "cd /tmp\nnerve-node status",
+            "nerve-node\necho x",
+            "echo hi\n  nerve-node status",
+            "/usr/local/bin/nerve-node\nls",
+            "ls /run/nerve-node\n",
+            "cat /etc/nerve\nls",
+            "cat /var/lib/nerve\tx",
+            "cat ~/.config/nerve\r\nls",
+            "ls $HOME/.local/state/nerve\n",
+            "type %ProgramData%/Nerve\r\ndir",
+        ] {
+            assert!(old.find("exec", "run", c).is_none(), "old guard: {c}");
+            assert!(new.find("exec", "run", c).is_some(), "new guard: {c}");
+        }
+        // What the old texts refused, the new ones refuse.
+        for c in [
+            "nerve-node status",
+            "sudo nerve-node audit",
+            "ls /etc/nerve/x",
+        ] {
+            assert!(old.find("exec", "run", c).is_some(), "old guard: {c}");
+            assert!(new.find("exec", "run", c).is_some(), "new guard: {c}");
+        }
+        for o in GUARD_OLD {
+            validate(o).unwrap();
+            assert!(!GUARD.contains(o), "{o} is current");
+        }
+    }
+
+    #[test]
+    fn controls_are_written_out_and_read_back() {
+        for rule in GUARD {
+            let shown = escape_controls(rule);
+            assert!(!shown.contains(['\t', '\r', '\n']), "{shown}");
+            assert_eq!(unescape_controls(&shown), *rule);
+        }
+        assert_eq!(escape_controls("a\tb\r\nc"), "a\\tb\\r\\nc");
+        assert_eq!(unescape_controls("a\\tb\\r\\nc"), "a\tb\r\nc");
+        // A pair of backslashes stays, and so does a lone one.
+        assert_eq!(unescape_controls("[/\\\\]n \\x \\"), "[/\\\\]n \\x \\");
+        assert_eq!(escape_controls("fs.read:/a b/*"), "fs.read:/a b/*");
     }
 
     /// The guard also refuses a command that stops, restarts, disables or

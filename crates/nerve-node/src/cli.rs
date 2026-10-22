@@ -1197,6 +1197,21 @@ impl List {
     }
 }
 
+/// The entry of `list` that `text` names: `text` itself, or the entry that
+/// `rule ls` prints as `text` (its tab, carriage return and line feed written
+/// `\t`, `\r`, `\n`). Else `text`.
+fn shown_entry(list: &[String], text: &str) -> String {
+    if list.iter().any(|r| r == text) {
+        return text.to_string();
+    }
+    let raw = rules::unescape_controls(text);
+    if raw != text && list.contains(&raw) {
+        raw
+    } else {
+        text.to_string()
+    }
+}
+
 /// `rule add|rm|ls`.
 async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<(), String> {
     match c {
@@ -1231,8 +1246,10 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                 let name = e.name.clone();
                 let l = list.of(&mut e.policy);
                 // An entry copied from `ls` goes as it is, so rules for
-                // files and other actions can be removed too. The arguments
-                // of `add` stand for the command rule they made.
+                // files and other actions can be removed too (also one with
+                // a line break, which `ls` writes `\n`). The arguments of
+                // `add` stand for the command rule they made.
+                let command = shown_entry(l, &command);
                 let made = match &action {
                     Some(a) => list.action_rule(a, &command, wildcard),
                     None => list.command_rule(&command, wildcard),
@@ -1267,9 +1284,16 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             new,
             center,
         } => {
-            let rule = list.edited(&new)?;
+            let done = std::sync::Mutex::new((String::new(), String::new()));
             let name = edit_center(paths, &center, |e| {
                 let l = list.of(&mut e.policy);
+                // The entry as `ls` prints it, with its line breaks written
+                // `\n`: the new entry is written so too.
+                let (entry, new) = match shown_entry(l, &entry) {
+                    shown if shown == entry => (entry.clone(), new.clone()),
+                    shown => (shown, rules::unescape_controls(&new)),
+                };
+                let rule = list.edited(&new)?;
                 let Some(at) = l.iter().position(|r| *r == entry) else {
                     return Err(format!("{entry:?} is not on the {}", list.label()));
                 };
@@ -1284,9 +1308,11 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                     i += 1;
                     i - 1 == at || *r != rule
                 });
+                *done.lock().unwrap() = (entry, rule);
                 Ok(())
             })
             .await?;
+            let (entry, rule) = done.into_inner().unwrap();
             let _ = writeln!(
                 out,
                 "{name}: the {} {entry:?} is {rule:?} now",
@@ -1294,26 +1320,38 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             );
         }
         RuleCmd::Guard { center } => {
-            let added = std::sync::Mutex::new(0usize);
+            let added = std::sync::Mutex::new((0usize, 0usize));
             let name = edit_center(paths, &center, |e| {
-                let missing = nerve_policy::rules::guard_missing(&e.policy.deny);
+                // The guard's older texts go: the new ones replace them.
+                let mut deny: Vec<String> = e
+                    .policy
+                    .deny
+                    .iter()
+                    .filter(|r| !nerve_policy::rules::GUARD_OLD.contains(&r.as_str()))
+                    .cloned()
+                    .collect();
+                let replaced = e.policy.deny.len() - deny.len();
+                let missing = nerve_policy::rules::guard_missing(&deny);
                 if missing.is_empty() {
                     return Err(format!(
                         "{} has every deny rule of the guard already",
                         e.name
                     ));
                 }
-                *added.lock().unwrap() = missing.len();
-                e.policy
-                    .deny
-                    .extend(missing.into_iter().map(str::to_string));
+                *added.lock().unwrap() = (missing.len(), replaced);
+                deny.extend(missing.into_iter().map(str::to_string));
+                e.policy.deny = deny;
                 Ok(())
             })
             .await?;
-            let added = added.into_inner().unwrap();
+            let (added, replaced) = added.into_inner().unwrap();
+            let replaced = match replaced {
+                0 => String::new(),
+                n => format!(" ({n} of an older text replaced)"),
+            };
             let _ = writeln!(
                 out,
-                "{name}: added {added} deny rules of the guard; commands that name this node's programs, service, socket or folders are forbidden"
+                "{name}: added {added} deny rules of the guard{replaced}; commands that name this node's programs, service, socket or folders are forbidden"
             );
         }
         RuleCmd::Ls { list, center } => {
@@ -1326,7 +1364,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                     let _ = writeln!(out, "{name}: nothing on the {}", list.label());
                 }
                 for r in entries.iter() {
-                    let _ = writeln!(out, "{r}");
+                    let _ = writeln!(out, "{}", rules::escape_controls(r));
                 }
             } else {
                 // All three: each line says which list it is on.
@@ -1334,7 +1372,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                 for list in [List::Allow, List::Deny, List::Sudo] {
                     for r in list.of(&mut policy).iter() {
                         any = true;
-                        let _ = writeln!(out, "{}  {r}", list.word());
+                        let _ = writeln!(out, "{}  {}", list.word(), rules::escape_controls(r));
                     }
                 }
                 if !any {
@@ -8162,6 +8200,81 @@ mod tests {
         }
         assert_eq!(policy(), now);
         assert_eq!(changes(), n);
+    }
+
+    /// A rule of the guard holds a line break; `rule ls` writes it `\n` so
+    /// a listing keeps a line a rule, and `rule rm` and `rule edit` take the
+    /// entry as `ls` printed it.
+    #[test]
+    fn rule_ls_writes_line_breaks_out_and_rm_and_edit_take_them_back() {
+        let (_d, paths) = setup(&["home"]);
+        let deny = || load(&paths).centers[0].policy.deny.clone();
+        let guard = nerve_policy::rules::GUARD;
+        assert!(guard.iter().any(|g| g.contains('\n')));
+        run(&paths, &["rule", "guard"]).unwrap();
+        let ls = run(&paths, &["rule", "ls", "deny"]).unwrap();
+        assert_eq!(ls.lines().count(), deny().len(), "{ls}");
+        for (line, rule) in ls.lines().zip(deny()) {
+            assert_eq!(line, nerve_policy::rules::escape_controls(&rule));
+            assert!(!line.contains(['\t', '\r']), "{line:?}");
+        }
+        assert!(ls.contains("\\r\\n"), "{ls}");
+        let all = run(&paths, &["rule", "ls"]).unwrap();
+        assert_eq!(all.lines().count(), deny().len(), "{all}");
+        assert!(all.lines().all(|l| l.starts_with("deny  ")), "{all}");
+        // The entry as `ls` printed it is removed; the raw one too.
+        let shown = nerve_policy::rules::escape_controls(guard[9]);
+        assert_ne!(shown, guard[9]);
+        let out = run(&paths, &["rule", "rm", "deny", &shown]).unwrap();
+        assert!(out.contains("removed"), "{out}");
+        assert!(!deny().iter().any(|r| r == guard[9]));
+        run(&paths, &["rule", "rm", "deny", guard[10]]).unwrap();
+        assert!(!deny().iter().any(|r| r == guard[10]));
+        // Edit: the entry and the new one both as `ls` prints them.
+        let shown = nerve_policy::rules::escape_controls(guard[11]);
+        let new = "exec.run:systemctl stop nerve-node\\n*";
+        let out = run(&paths, &["rule", "edit", "deny", &shown, new]).unwrap();
+        assert!(out.contains("now"), "{out}");
+        assert!(!deny().iter().any(|r| r == guard[11]));
+        assert!(
+            deny()
+                .iter()
+                .any(|r| r == "exec.run:systemctl stop nerve-node\n*"),
+            "{:?}",
+            deny()
+        );
+        // A rule with a backslash and an `n` of its own is found as it is.
+        let own = "exec.run:type C:\\new\\x";
+        run(&paths, &["config", "add", "center.home.policy.deny", own]).unwrap();
+        let ls = run(&paths, &["rule", "ls", "deny"]).unwrap();
+        assert!(ls.contains(own), "{ls}");
+        run(&paths, &["rule", "rm", "deny", own]).unwrap();
+        assert!(!deny().iter().any(|r| r == own));
+        // Not there: refused, nothing changes.
+        let now = deny();
+        let e = run(&paths, &["rule", "rm", "deny", "exec.run:nope\\n"]).unwrap_err();
+        assert!(e.contains("is not on"), "{e}");
+        assert_eq!(deny(), now);
+    }
+
+    /// `rule guard` takes the guard's older texts off when it puts the new
+    /// ones on.
+    #[test]
+    fn rule_guard_replaces_the_older_texts() {
+        let (_d, paths) = setup(&["home"]);
+        let deny = || load(&paths).centers[0].policy.deny.clone();
+        for old in nerve_policy::rules::GUARD_OLD {
+            run(&paths, &["config", "add", "center.home.policy.deny", old]).unwrap();
+        }
+        let out = run(&paths, &["rule", "guard"]).unwrap();
+        assert!(out.contains("of an older text replaced"), "{out}");
+        let d = deny();
+        for old in nerve_policy::rules::GUARD_OLD {
+            assert!(!d.iter().any(|r| r == old), "{old}");
+        }
+        for g in nerve_policy::rules::GUARD {
+            assert_eq!(d.iter().filter(|r| r == g).count(), 1, "{g}");
+        }
     }
 
     /// `rule add --action` makes the rule an audit button makes for an entry

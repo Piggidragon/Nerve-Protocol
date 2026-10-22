@@ -56,6 +56,11 @@ The Windows commands match in any case (`STOP-SERVICE`, `NET STOP`,
 `sc stop Nerve-Node`, `taskkill /IM NERVE-NODE.EXE`), as Windows reads them.
 The rules see a line break or a tab after a name or before a command as they
 see a space or `;`, so the second line of a script counts, with its indent.
+That holds for the rules that name the node's programs, sockets and folders
+too. A rule with such a character is listed with `\t`, `\r` and `\n` written
+out, so `rule ls` and the app's rule lists keep one line a rule, and `rule rm`
+and `rule edit` take the entry as it is listed there (the new entry of `rule
+edit` too).
 
 The rules match the whole line, so some lines are refused that only mention
 the node: a line that stops some other service and names `nerve-node` later,
@@ -71,7 +76,8 @@ nerve-node rule guard --center lab   # puts back the ones a pairing lacks
 ```
 
 A pairing made before the guard has none: `rule guard` adds them, and the
-desktop app offers it on **Permissions**.
+desktop app offers it on **Permissions**. It also takes off the older text of
+a rule that the guard has changed, and puts the new one in its place.
 
 The guard catches an agent's mistakes, such as an agent that tries to give
 itself more rights. It does not stop a command written to get around it (a

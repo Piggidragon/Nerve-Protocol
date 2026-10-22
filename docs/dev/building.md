@@ -57,9 +57,13 @@ once from scratch.
 A test that needs more than a hosted runner has (the node installed as a
 service, an administrator account, a virtual disk, the system keyring) is
 `#[ignore = "<reason>"]`: every run lists it as ignored with its reason, and it
-is run by hand on a Windows test machine with `cargo test -- --ignored`. The
-Windows job also skips by name the tests that fail on Windows today; the comment
-in the workflow says which and why, and the skip goes when the test is fixed.
+is run by hand on a test machine with `cargo test -- --ignored`. The `keyring`
+job runs two of them, in `crates/nerve-node/tests/real_account.rs`, as root on
+hosted Ubuntu 22.04 and 24.04 runners (`.github/scripts/keyring-end-to-end.sh`):
+the installed node with its keys in the keyring, and `folder` mode as
+`nerve-run`. The Windows job also skips by name the tests that fail on Windows
+today; the comment in the workflow says which and why, and the skip goes when
+the test is fixed.
 
 The action checker's tests that need a real model or download are
 `#[ignore]` too, and name what they need

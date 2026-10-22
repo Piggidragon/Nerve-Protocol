@@ -47,8 +47,10 @@ every call to them by the calling center's policy.
 3. **A center is a trust domain.** A node pairs with any number of centers and
    keeps their policy, sessions, audit entries and settings apart. A center
    cannot learn whether another center exists.
-4. **Default deny.** A new pairing allows nothing. A decision is allowed or
-   forbidden. Nothing waits for a person to answer.
+4. **Default deny.** A new pairing reaches nothing of the owner's: it starts
+   in `folder` mode without a folder (on the installed Linux node its commands
+   have only `nerve-run`'s home, `/tmp` and `/var/tmp`). A decision is
+   allowed or forbidden. Nothing waits for a person to answer.
 5. **MCP is the only harness interface.** No harness names, tool names,
    session formats or hooks appear in the protocol, the center or the node.
 6. **The center is a gate and a router.** It has no agent loop, no memory and

@@ -41,8 +41,10 @@ in to the [web UI](web-ui.md).
 
 ## The tools the model gets
 
-Tools follow what the nodes allow. A new machine allows nothing, so the model
-sees only `nodes`.
+Tools follow what the nodes allow. A new pairing is in `folder` mode, so the
+model gets the file tools at once, and `exec_run` where the machine can
+confine a command; a call reaches only the folders you give the machine (on
+the installed Linux node also `nerve-run`'s home, `/tmp` and `/var/tmp`).
 
 | Tool | Does |
 |---|---|

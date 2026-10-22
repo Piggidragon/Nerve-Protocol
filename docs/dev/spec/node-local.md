@@ -430,7 +430,7 @@ shell = "/bin/bash"         # for exec.run; the platform shell by default
 allow_root = false
 sudo = "off"                # off | on: the sudo switch (§4); off when missing
 sudo_path = "/usr/bin/sudo" # optional; `sudo` from PATH by default
-user = "alice"              # optional: the account commands and the sudo switch run as (§1)
+user = "alice"              # optional, Windows: the account commands and the sudo switch run as on the installed node (§1)
 secret_storage = "file"     # file | keyring: where the node keeps its keys (§1)
 
 [limits]
@@ -658,9 +658,8 @@ the keyring, and changes nothing (`node.toml`, the keyring); a proxy without
 either works, and its `proxy set` deletes the entry of an earlier call, as it
 does anywhere. Reading is as consistent: with headers named in `node.toml`
 (set before the install) the link stops with `bad proxy:` and the same reason
-(in the center's status and in the log; on Windows `status` does not ask the
-node, whose pipe takes folder changes only, so it shows no link status there
-and the log is the only place), and
+(in the center's status and in the log; on Windows `status` asks the node over
+its pipe, as on Linux), and
 `proxy ls` shows it, both without asking the keyring: an entry may be in the
 administrator's Credential Manager, but the service does not find it, so
 `proxy ls` must not call the values good.
@@ -1178,7 +1177,7 @@ Methods:
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `config.accept` | | takes `node.toml` as it is after it was refused, and signs it (§1) |
-| `folder.add` | `center`, `path`, `access` | `folder add`, done by the node so that it is judged as the account commands run as (`exec::settle`): the path is followed a link at a time and must resolve to itself, the folder is stored at that place with `access` (replacing the entry there) and recorded in `policy.places`; `{stored, recorded, mode, counts}` (`counts`: whether the
+| `folder.add` | `center`, `path`, `access` | `folder add`, done by the node so that it is judged as the owner (`exec::settle`): the path is followed a link at a time and must resolve to itself, the folder is stored at that place with `access` (replacing the entry there) and recorded in `policy.places`; `{stored, recorded, mode, counts}` (`counts`: whether the
 center's folders hold its commands, in folder mode or as `nerve-run`). An error, with nothing changed, when the path crosses a link inside a `w` folder of any center, leads nowhere, or changed while it was looked at. Where the node cannot tell either (a folder it may not look into, or a `w` folder it cannot resolve) the folder is stored as given, `recorded` is false, and a record it had stays. The CLI uses it whenever a node runs |
 | `folder.grants` | | the installed Linux node brings the folder ACLs in line at once (§Folder ACLs) and answers what that left: `{errors, stale, failed, skipped}`; `null` elsewhere. `folder add`, `set` and `rm` ask it |
 | `reload` | | rereads `node.toml`; only a file the node signed is applied (§1) |

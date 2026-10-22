@@ -23,7 +23,9 @@ for it.
    ```
 
 2. Switch sudo on. The node must be running. It asks for your own sudo
-   password, which shows that you may run commands as root on this machine:
+   password, which shows that you may run commands as root on this machine
+   (on the node installed as a service on Linux with `sudo` in front, as this
+   command stays root's):
 
    ```sh
    nerve-node sudo on

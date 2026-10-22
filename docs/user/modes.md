@@ -131,8 +131,8 @@ beside the new one (`folder rm` it). Then add the folder again with its rights.
 On the [installed node](service.md) on Linux the CLI runs as the node's own
 user (`nerve`), which may not look into your home or resolve a folder there,
 so it cannot judge the links on a path there. With the node running,
-`folder add` is therefore done by the node, which looks as the account the
-commands run as: it follows the path, refuses a link inside a `w` folder as
+`folder add` is therefore done by the node, which looks as you, the owner:
+it follows the path, refuses a link inside a `w` folder as
 above, and stores and records the real place (the command says so when that
 is not the path you gave). A folder it stored at the place a link leads to is
 listed there: give `folder rm` and `folder set` the path `folder ls` shows,
@@ -140,7 +140,7 @@ since the CLI cannot see the link. Given the link, they say `is not a
 folder of this center` and add that the account cannot look into the path and
 which path to use, naming the folders of the center that could be it. With no
 node running, or where the node cannot tell either (a `w` folder it cannot
-resolve, or no account chosen), the folder is stored as given and not recorded, a record it had stays, and
+resolve, or a node without an owner), the folder is stored as given and not recorded, a record it had stays, and
 `folder add` says so (`note: … is stored as given and not recorded …`): start
 the node, and add the folder again. Check for links (`find <folder> -type l`
 on Linux, `dir /AL /S <folder>` on Windows) before you take `w` off the folder
@@ -530,9 +530,10 @@ folders.
   --no-hardlinks`. Or remove them (delete `node_modules` or `.venv`) before
   you add, change or remove the folder.
 
-`nerve-node status` does not ask the running node on Windows yet
-([platforms](platforms.md#the-control-pipe)). The node names its
-confinement when it starts, in its output and its [log](logs.md):
+`nerve-node status` shows a running node's confinement (`daemon: running
+(confinement appcontainer)`): on Windows it asks the node over its
+[control pipe](platforms.md#the-control-pipe). The node also names it when it
+starts, in its output and its [log](logs.md):
 `node daemon running (…, confinement appcontainer, …)`. The center sees it in
 the node's `exec` state, `confinement appcontainer`, or `none` on the
 installed service.

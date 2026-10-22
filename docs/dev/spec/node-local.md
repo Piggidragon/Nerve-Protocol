@@ -41,8 +41,13 @@ later install by root keeps a root owner without asking; `--owner=none`
 leaves the node without an owner. Where an install changes the owner (or
 `nerve-run`'s uid), it first stops the service and takes `nerve-run`'s
 entries off every grant the ACL record names, as root (`acl::remove_all`, as
-`uninstall`), and the record goes; where not all come off, the owner stays
-and the service starts again. Then what runs as the owner
+`uninstall`), after every step that can refuse, and the record goes; where
+not all come off, the owner stays, the record marks every grant failed (so
+the restarted node walks each again) and the service starts again where it
+ran or was starting; a later failure starts it again too. `acl::sync` keeps
+the grants of earlier accounts that did not come off in `Record::left`,
+walks them at each sync and refuses `nerve-run`'s commands while one is
+left; `remove_all` takes them off. Then what runs as the owner
 runs as root (uid 0, root's groups, `HOME` root's, no `no_new_privs`, the
 capabilities of root's exec), and the account check below is skipped for
 it; `nerve-run`'s commands are unchanged. No other account with uid 0 is an

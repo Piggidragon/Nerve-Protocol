@@ -48,12 +48,17 @@ called, `install` puts it in place as `/usr/local/bin/nerve-node`.
    answer is no unless you type `y` or `yes`
    ([root as the owner](#root-as-the-owner)). On a no it keeps the owner an
    earlier install named, or has none: then only root changes the node and
-   `user` mode runs no command. Where the owner changes, `install` first
-   stops the service and takes `nerve-run`'s entries off every folder the
-   earlier owner gave it, as `uninstall` does; the node gives the folders
-   again for the new owner when it starts. Where not all of them come off,
-   the owner stays as it was, the service runs again, and `install` says
-   what failed.
+   `user` mode runs no command. Where the owner changes, `install`, once
+   the steps that can refuse are through (right before step 6), stops the
+   service and takes `nerve-run`'s entries off every folder the earlier
+   owner gave it, as `uninstall` does; the node gives the folders again for
+   the new owner when it starts. Without a new owner it gives `nerve-run`
+   no folders: `folder ls` still lists them, but `folder` mode and
+   `allowlist` mode reach only what every account may. Where not all
+   entries come off, the owner stays as it was, its node walks every
+   folder again when it starts, the service runs again where it ran, and
+   `install` says what failed. A later step that fails starts the stopped
+   service again too.
 5. Copies the program to `/usr/local/bin/nerve-node`.
 6. Writes the polkit files that let the owner start and stop the service
    ([below](#start-and-stop)).
@@ -77,7 +82,9 @@ nerve-node install --owner=none            # root is the owner no longer
 ```
 
 At a terminal `install` asks `Make root the owner of this node? [y/N]`, and
-says before it what a yes and a no do on this node. It asks only where both
+says before it what a yes and a no do on this node, and which centers have
+the [settings grant](settings-grant.md) already: with root as the owner they
+can run commands as root. The flags' install says the same. It asks only where both
 its input and its output are a terminal, and not with `--json`. Elsewhere (a
 script, piped input, output to a file, the desktop app) nothing is asked and
 the answer is no at once, unless you give both flags; `install` then says on
@@ -88,6 +95,8 @@ another account, which makes that account the owner.
 Once root is the owner, it stays the owner at every later `install` by root,
 at a terminal or not, and is not asked again. `install --owner=none` takes
 it back and leaves the node without an owner (it does so for any owner);
+the node then gives `nerve-run` none of the folders you gave, so `folder`
+mode reaches them no more (step 4 above);
 `sudo nerve-node install` from another account makes that account the owner.
 `update` keeps the owner.
 

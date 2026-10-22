@@ -241,6 +241,11 @@ async fn root_is_the_owner_only_when_it_says_so() {
         "{text}"
     );
     assert!(text.contains("mode user, as root"), "{text}");
+    // The settings grant gives a center root here, and says so.
+    let warning = "Warning: root is the owner of this node, so";
+    let (ok, said) = sh(Command::new(BIN).args(["center", "grant", "settings", "write"]));
+    assert!(ok && said.contains(warning), "{said}");
+    assert!(sh(Command::new(BIN).args(["center", "grant", "settings", "off"])).0);
 
     // User mode runs as root, with root's home.
     let mut conn = linked(&mut center).await;
@@ -327,6 +332,10 @@ async fn root_is_the_owner_only_when_it_says_so() {
         said.contains("the owner of the node changes, so took nerve-run's access"),
         "{said}"
     );
+    assert!(
+        said.contains("without an owner the node gives nerve-run no folders"),
+        "{said}"
+    );
     assert_eq!(owner_in_unit(), None);
     for p in [work, data.as_path()] {
         assert!(!has_entry(p, &run_uid), "{}", acl(p));
@@ -377,9 +386,20 @@ async fn root_is_the_owner_only_when_it_says_so() {
     assert_eq!(out(&r), "alice's\n", "{r}");
     drop(conn);
     assert!(has_entry(&a, &run_uid), "{}", acl(&a));
+    // On alice's node the settings grant warns of nothing, but root, made
+    // the owner, is told that the center has it.
+    let (ok, said) = sh(Command::new(BIN).args(["center", "grant", "settings", "write"]));
+    assert!(ok && !said.contains(warning), "{said}");
     let (ok, said) =
         sh(Command::new(&exe).args(["install", "--owner=root", "--accept-root-owner"]));
     assert!(ok, "{said}");
+    assert!(
+        said.contains(
+            "has the settings grant already, so with root as the owner it can run commands as root"
+        ),
+        "{said}"
+    );
+    assert!(sh(Command::new(BIN).args(["center", "grant", "settings", "off"])).0);
     assert!(
         said.contains("the owner of the node changes, so took nerve-run's access"),
         "{said}"

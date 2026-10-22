@@ -926,7 +926,39 @@ pub const ROOT: &str = "root";
 
 /// What root as the owner means, said before the question and in the
 /// install's steps.
-pub const ROOT_OWNER_MEANS: &str = "commands of user mode, and of allowlist mode as the owner, run as root: they can do everything on this machine, change and read Nerve itself, its keys included, and nothing in Nerve can hold them back (its guard and checks only catch mistakes). Folder mode and allowlist mode run as nerve-run, as on any node";
+pub const ROOT_OWNER_MEANS: &str = "commands of user mode, and of allowlist mode as the owner, run as root: they can do everything on this machine, change and read Nerve itself, its keys included, and nothing in Nerve can hold them back (its guard and checks only catch mistakes). Folder mode and allowlist mode run as nerve-run, as on any node, but a center with the settings grant can switch itself to user mode and so run as root";
+
+/// The centers of the node at `paths` that have the settings grant, which
+/// may switch themselves to user mode: where root is the owner, to root.
+/// None where the config cannot be read.
+fn settings_granted(paths: &NodePaths) -> Vec<String> {
+    let secrets = crate::secrets::NodeSecrets::for_cli(paths);
+    nerve_policy::settings::SettingsStore::peek_with(&paths.config_file(), &secrets)
+        .map(|cfg| {
+            cfg.centers
+                .iter()
+                .filter(|c| c.settings == nerve_policy::config::SettingsGrant::Write)
+                .map(|c| c.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What root as the owner means for the centers that have the settings
+/// grant already (`granted`), said with [`ROOT_OWNER_MEANS`]; nothing
+/// without one.
+fn granted_note(granted: &[String]) -> String {
+    match granted {
+        [] => String::new(),
+        [one] => format!(
+            " {one} has the settings grant already, so with root as the owner it can run commands as root."
+        ),
+        many => format!(
+            " {} have the settings grant already, so with root as the owner they can run commands as root.",
+            many.join(", ")
+        ),
+    }
+}
 
 /// [`install`] in a terminal: `input` answers the question whether to
 /// install a system keyring, asked when the node's keys are to be in one
@@ -1057,14 +1089,6 @@ fn install_steps(
         crate::account::RUN_USER
     ));
     let owner = owner_of_install(layout, sys, invoker, root, steps)?;
-    #[cfg(target_os = "linux")]
-    {
-        let owner_uid = match owner.as_deref() {
-            Some(name) => sys.account(name)?.map(|a| a.uid),
-            None => None,
-        };
-        drop_earlier_grants(layout, sys, run.uid, owner_uid, steps)?;
-    }
     let in_keyring = crate::secrets::stated_storage(&layout.paths) == SecretStorage::Keyring;
     let real = |p: &Path| std::fs::canonicalize(p).ok();
     if real(exe).is_some() && real(exe) == real(&layout.bin) {
@@ -1087,12 +1111,36 @@ fn install_steps(
             "the node's keys are in the system keyring of {USER}, and it answers"
         ));
     }
-    put_polkit(layout, sys, owner.as_deref(), steps)?;
-    write_file(
-        &layout.unit,
-        layout.unit_text(owner.as_deref()).as_bytes(),
-        0o644,
-    )?;
+    // After the last step that refuses for a reason of its own: what
+    // follows only writes the node's files and starts it.
+    #[cfg(target_os = "linux")]
+    let stopped = {
+        let owner_uid = match owner.as_deref() {
+            Some(name) => sys.account(name)?.map(|a| a.uid),
+            None => None,
+        };
+        drop_earlier_grants(layout, sys, &account, run.uid, owner_uid, steps)?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let stopped = false;
+    let r = start_installed(layout, sys, owner.as_deref(), steps);
+    // A node stopped for the owner change runs again, whatever failed.
+    if r.is_err() && stopped {
+        let _ = sys.systemctl(&["start", UNIT_NAME]);
+    }
+    r
+}
+
+/// The last steps of `install`: the polkit files and the unit for `owner`,
+/// and the service started with them.
+fn start_installed(
+    layout: &Layout,
+    sys: &dyn System,
+    owner: Option<&str>,
+    steps: &mut Steps,
+) -> Result<(), String> {
+    put_polkit(layout, sys, owner, steps)?;
+    write_file(&layout.unit, layout.unit_text(owner).as_bytes(), 0o644)?;
     steps.did(format!("wrote the service unit {}", layout.unit.display()));
     sys.systemctl(&["daemon-reload"])?;
     sys.systemctl(&["enable", UNIT_NAME])?;
@@ -1112,26 +1160,33 @@ fn install_steps(
 /// entries off, and a node without an owner keeps none at all: they would
 /// stay, also on a uid freed later. The record goes with them, and the node
 /// gives the grants again for the new owner when it starts. The service
-/// stops first, so that the node of the earlier owner does not give them
-/// again meanwhile; where not all came off, it runs again as it was and
-/// install changes the owner not.
+/// stops first, also one that waits to start again after a failure, so that
+/// no node of the earlier owner gives them again meanwhile. Where not all
+/// came off, the owner stays as it was, the record marks every grant to be
+/// walked again (crate::acl::retry_all), as the walk took off what it
+/// could, and the node runs again where it ran. `Ok(true)` says the service
+/// was stopped here and ran before. `user` is the node's user, whose the
+/// record is.
 #[cfg(target_os = "linux")]
 fn drop_earlier_grants(
     layout: &Layout,
     sys: &dyn System,
+    user: &Account,
     run: u32,
     owner: Option<u32>,
     steps: &mut Steps,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let record = crate::acl::record_file(&layout.paths);
-    let Some(had) = crate::acl::recorded(&record) else {
-        return Ok(());
+    let Some((had, left)) = crate::acl::recorded(&record) else {
+        return Ok(false);
     };
-    if had.run == run && Some(had.owner) == owner {
-        return Ok(());
+    if had.run == run && Some(had.owner) == owner && !left {
+        return Ok(false);
     }
-    let running = layout.unit.exists() && sys.unit_state()?.state == "running";
-    if running {
+    let mut ran = false;
+    if layout.unit.exists() {
+        ran = matches!(sys.unit_state()?.state.as_str(), "running" | "starting");
+        // Also cancels a start systemd waits to make after a failure.
         sys.systemctl(&["stop", UNIT_NAME])?;
         steps.did(format!(
             "stopped the service {UNIT_NAME}, as the owner of the node changes"
@@ -1143,20 +1198,33 @@ fn drop_earlier_grants(
         crate::account::of_uid(owner).map_or((0, 0), |a| (a.uid, a.gid))
     });
     if !r.stale.is_empty() {
-        if running {
+        // The node of the earlier owner, which runs again, puts back what
+        // the walk took off.
+        let retry =
+            crate::acl::retry_all(&record).and_then(|()| sys.give(&record, user.uid, user.gid));
+        if ran {
             let _ = sys.systemctl(&["start", UNIT_NAME]);
         }
+        let retry = match retry {
+            Ok(()) => String::new(),
+            Err(e) => format!(" ({e}; the next change of a folder makes it give them again)"),
+        };
         return Err(format!(
-            "the owner of the node changes, but the access of nerve-run to the folders the earlier owner gave it could not all be taken off: {}; the owner stays as it was: run `{} install` again once that is fixed",
+            "the owner of the node changes, but the access of nerve-run to the folders the earlier owner gave it could not all be taken off: {}; the owner stays as it was, and its node gives the folders again when it starts{retry}: run `{} install` again once that is fixed",
             r.errors.join("; "),
             layout.edition.program
         ));
     }
+    let next = if owner.is_some() {
+        "the node gives the folders again for the new owner when it starts"
+    } else {
+        "without an owner the node gives nerve-run no folders, so folder mode and allowlist mode reach only what every account may"
+    };
     steps.did(format!(
-        "the owner of the node changes, so {}; the node gives the folders again for the new owner when it starts",
+        "the owner of the node changes, so {}; {next}",
         gave_to_owner(r.not_given)
     ));
-    Ok(())
+    Ok(ran)
 }
 
 /// The system account `name` (`what` says what it is for), made with its
@@ -1217,7 +1285,8 @@ fn ask_root_owner(
     };
     let _ = writeln!(
         out,
-        "install runs as root, not through sudo from another account. Root can be the owner of this node: then {ROOT_OWNER_MEANS}. {now}"
+        "install runs as root, not through sudo from another account. Root can be the owner of this node: then {ROOT_OWNER_MEANS}.{} {now}",
+        granted_note(&settings_granted(&layout.paths))
     );
     let yes =
         crate::cli::ask(input, out, "Make root the owner of this node? [y/N] ").unwrap_or_default();
@@ -1278,7 +1347,8 @@ fn owner_of_install(
     };
     if account.uid == 0 {
         steps.did(format!(
-            "Warning: root is the owner of the node, as you confirmed: {ROOT_OWNER_MEANS}"
+            "Warning: root is the owner of the node, as you confirmed: {ROOT_OWNER_MEANS}.{}",
+            granted_note(&settings_granted(&layout.paths))
         ));
     } else {
         steps.did(format!(
@@ -3139,6 +3209,11 @@ pub(crate) mod tests {
                 out.contains("the owner of the node changes, so took nerve-run's access to the folders given to it off again"),
                 "{out}"
             );
+            assert_eq!(
+                out.contains("without an owner the node gives nerve-run no folders"),
+                after.is_none(),
+                "{out}"
+            );
             let calls = sys.calls()[before..].to_vec();
             let at = |c: &str| calls.iter().position(|x| x == c).unwrap();
             assert!(
@@ -3179,7 +3254,8 @@ pub(crate) mod tests {
         );
         assert!(out.contains("as the owner of the node changes"), "{out}");
         assert_eq!(owner_of_unit(&l).as_deref(), Some("alice"));
-        assert!(crate::acl::record_file(&l.paths).exists());
+        let record = crate::acl::record_file(&l.paths);
+        assert!(record.exists());
         assert_eq!(
             sys.calls()[before..],
             [
@@ -3187,6 +3263,146 @@ pub(crate) mod tests {
                 format!("systemctl start {UNIT_NAME}")
             ]
         );
+        // The walk took off what it could, so alice's node walks every grant
+        // again when it starts, as one that failed.
+        let alice = crate::acl::Who { run, owner: 4242 };
+        let want = [crate::acl::Granted {
+            path: folder.clone(),
+            access: nerve_policy::config::Access::ALL,
+        }];
+        assert!(crate::acl::behind(&record, &want, alice, true));
+        // A service that does not run is stopped all the same, which also
+        // ends a start systemd waits to make, and is not started after.
+        sys.systemctl(&["stop", UNIT_NAME]).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let before = sys.calls().len();
+        let (r, _) = install_by(&l, &sys, ROOT, RootOwner::Accepted, None);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(r.is_err());
+        assert_eq!(
+            sys.calls()[before..],
+            [format!("systemctl stop {UNIT_NAME}")]
+        );
+    }
+
+    /// The owner changes only once nothing else refuses: a keyring that
+    /// does not answer stops install before the service stops and before
+    /// the grants come off. Where a later step fails, the node that was
+    /// stopped runs again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_owner_change_leaves_the_node_running() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(&d.path().join("keyring"));
+        install_by(&l, &sys, "alice", RootOwner::Ask, None)
+            .0
+            .unwrap();
+        let folder = l.home.with_file_name("granted");
+        let Some(run) = granted(&l, &sys, &folder) else {
+            return;
+        };
+        let mut store = SettingsStore::open_with(
+            l.paths.config_file(),
+            Box::new(crate::secrets::NodeSecrets::new(&l.paths)),
+            AuditLog::new(l.paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                c.machine.secret_storage = SecretStorage::Keyring;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let before = sys.calls().len();
+        let k = crate::keyring_setup::tests::FakeKeyring::new(false);
+        let e = install_asking(
+            &l,
+            &sys,
+            &k,
+            None,
+            RootOwner::Accepted,
+            Path::new("/bin/true"),
+            ROOT,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(e.contains("no system keyring answers"), "{e}");
+        assert!(sys.calls()[before..].is_empty(), "{:?}", sys.calls());
+        assert!(crate::acl::record_file(&l.paths).exists());
+        assert!(crate::acl::access_entry(&folder.join("data.txt"), run).is_some());
+        assert_eq!(owner_of_unit(&l).as_deref(), Some("alice"));
+        // The node does not answer after the change: it is started again.
+        sys.starts.set(false);
+        let before = sys.calls().len();
+        let (r, _) = install_by(&l, &sys, ROOT, RootOwner::Accepted, None);
+        assert!(r.is_err());
+        let calls = sys.calls()[before..].to_vec();
+        assert_eq!(calls[0], format!("systemctl stop {UNIT_NAME}"), "{calls:?}");
+        assert_eq!(
+            calls.last(),
+            Some(&format!("systemctl start {UNIT_NAME}")),
+            "{calls:?}"
+        );
+    }
+
+    /// The question and the step that make root the owner name the centers
+    /// that have the settings grant already: they can make themselves root.
+    #[test]
+    fn root_is_told_of_the_centers_with_the_settings_grant() {
+        assert!(ROOT_OWNER_MEANS.contains(
+            "a center with the settings grant can switch itself to user mode and so run as root"
+        ));
+        assert_eq!(granted_note(&[]), "");
+        let one = granted_note(&["home".into()]);
+        assert!(one.contains("home has the settings grant already"), "{one}");
+        let two = granted_note(&["home".into(), "work".into()]);
+        assert!(two.contains("home, work have the settings grant"), "{two}");
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        install_by(&l, &sys, "alice", RootOwner::Ask, None)
+            .0
+            .unwrap();
+        let mut store = SettingsStore::open_with(
+            l.paths.config_file(),
+            Box::new(crate::secrets::NodeSecrets::new(&l.paths)),
+            AuditLog::new(l.paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                for (name, settings) in [
+                    ("home", nerve_policy::config::SettingsGrant::Write),
+                    ("work", nerve_policy::config::SettingsGrant::Off),
+                ] {
+                    c.centers.push(nerve_policy::CenterEntry {
+                        name: name.into(),
+                        url: "http://127.0.0.1:1".into(),
+                        pin: None,
+                        center_id: format!("id-{name}"),
+                        node_id: "n".into(),
+                        settings,
+                        paused: false,
+                        revoked: false,
+                        unknown: false,
+                        public_key: None,
+                        key_rotations: 0,
+                        pin_rotations: 0,
+                        old_pin: None,
+                        policy: Default::default(),
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        assert_eq!(settings_granted(&l.paths), ["home"]);
+        let note = granted_note(&["home".into()]);
+        let (r, out) = install_by(&l, &sys, ROOT, RootOwner::Ask, Some("y\n"));
+        r.unwrap();
+        assert_eq!(out.matches(note.trim()).count(), 2, "{out}");
     }
 
     /// Without a terminal, `--owner=root --accept-root-owner` makes root the

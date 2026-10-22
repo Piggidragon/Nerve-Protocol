@@ -1,9 +1,9 @@
 # The checks on every pull request, and on main after a merge: fmt, clippy and
 # the whole test suite, on Linux and on Windows, the tests that differ on
 # musl, the C library of the released Linux programs, and the installed node
-# with its keys in the system keyring on Ubuntu 22.04 and 24.04, whose kernels
-# are older than 7.1. The release workflow runs the same fmt, clippy and tests
-# on Linux before it builds anything
+# with its keys in the system keyring on the Ubuntu 22.04 and 24.04 runners,
+# whose kernels are older than 7.1 (6.8 and 7.0). The release workflow runs
+# the same fmt, clippy and tests on Linux before it builds anything
 # (docs/dev/releasing.md), but nothing there runs the Windows tests: its
 # Windows job only builds.
 #
@@ -139,17 +139,24 @@ jobs:
 
   # The node keeps its keys in the system keyring on every Linux kernel, and
   # folder mode runs as the account `nerve-run` (issue #135). That used to be
-  # refused below Linux 7.1; the machines people run are older (Ubuntu 22.04
-  # has 5.15, 24.04 has 6.x), so this job installs the node on both and takes
-  # the whole path an owner takes: the real-account test, then `setup` in a
-  # terminal answering yes to the keyring, the keys moving out of their
-  # files, a restart, `status`, a folder mode command as `nerve-run`, and
-  # `uninstall --purge`. The runner is a disposable virtual machine, so the
-  # script (.github/scripts/keyring-end-to-end.sh) may install the node, make
+  # refused below Linux 7.1, so this job installs the node on the two Ubuntu
+  # runners and takes the whole path an owner takes: the real-account test,
+  # then `setup` in a terminal answering yes to the keyring, the keys moving
+  # out of their files, a restart of the keyring's session and of the node,
+  # `status`, a folder mode command as `nerve-run`, and `uninstall --purge`.
+  # The kernels are GitHub's Azure kernels, not the ones the distributions
+  # ship: 6.8 on ubuntu-22.04 and 7.0 on ubuntu-24.04 at the time of writing,
+  # both with Landlock. So the 5.15 kernel of a 22.04 install, and a kernel
+  # without Landlock, are not tested here (the second only on a test VM); the
+  # script fails when a runner gets a kernel of 7.1 or later, so the job
+  # cannot go on passing while it tests nothing below 7.1. The runner is a
+  # disposable virtual machine, so the script
+  # (.github/scripts/keyring-end-to-end.sh) may install the node, make
   # accounts and a keyring, and break them; it sets up nothing a real machine
-  # would not have, except the owner it needs (a person who installs).
-  # The runner kernel decides what is tested, so the job prints it. The node is
-  # built on the runner it runs on (the glibc differs), hence one cache each.
+  # would not have, except the owner it needs (a person who installs) and a
+  # system-wide environment that names another user's session, as the
+  # runner image's does. The node is built on the runner it runs on (the
+  # glibc differs), hence one cache each.
   keyring:
     name: Installed node, keyring and folder mode (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

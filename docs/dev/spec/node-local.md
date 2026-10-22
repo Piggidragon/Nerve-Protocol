@@ -351,6 +351,18 @@ its environment, in `/` and with no input:
 - `loginctl enable-linger <user>`: the user keeps a session with its own
   D-Bus from boot on, and D-Bus starts GNOME Keyring there when the node
   asks;
+- when the user's service manager has another user's `XDG_RUNTIME_DIR`, bus
+  or XDG folders from the system-wide environment of the login
+  (`/etc/environment`, which `30-systemd-environment-d-generator` hands to the
+  manager): `systemctl --user set-environment` of the user's own, a restart of
+  the units that took the wrong ones (`dbus.service`, GNOME Keyring's unit,
+  whichever of its two names exists), and the user environment generator
+  `/etc/systemd/user-environment-generators/99-nerve-session` (it runs after
+  that one and prints the user's own for that user only; `uninstall` removes
+  it). The node does the same `set-environment` and restart when it starts
+  with its keys in the keyring, which covers a session that started again
+  without the generator. The XDG folders are set, not unset: what a
+  generator gave the manager is not an `unset-environment`'s to remove;
 - a login keyring for the user in GNOME Keyring's plain format,
   `~/.local/share/keyrings/login.keyring`, that opens without a password. A
   login keyring that is there is left as it is.

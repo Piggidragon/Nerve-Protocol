@@ -204,6 +204,10 @@ pub fn ensure(
     );
     let _ = writeln!(
         out,
+        "Where this machine's /etc/environment names another user's runtime folder or XDG folders (as a CI runner's does), keyring and bus of {name} would start in those; then nerve-node also writes {SESSION_GENERATOR}, which gives {name}'s session its own at every start."
+    );
+    let _ = writeln!(
+        out,
         "Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in {}, readable by {name} as the key files are; the node keeps centers out of it as it does out of the key files, except a command you let a center run outside folder mode that asks the keyring itself (secret-tool and the like). It becomes the default keyring of {name}: any other program of {name} that keeps a secret in the system keyring keeps it there, unencrypted too.",
         store.display()
     );
@@ -333,9 +337,12 @@ impl Keyring for HostKeyring {
         if repair_session(who)? {
             let _ = writeln!(
                 out,
-                "set the session of {} to its own runtime folder and bus",
+                "set the session of {} to its own runtime folder, bus and XDG folders",
                 who.name
             );
+            // The manager reads the same environment at its next start.
+            write_session_generator(who)?;
+            let _ = writeln!(out, "wrote {SESSION_GENERATOR}");
         }
         if make_login_keyring(who)? {
             let _ = writeln!(
@@ -579,30 +586,33 @@ pub fn wrong_session_vars(environment: &str, who: &Account) -> Vec<String> {
         .collect()
 }
 
-/// The per-user folders the XDG specification names, which a program
-/// looks in before it looks in its home.
-const XDG_USER_DIRS: [&str; 4] = [
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_STATE_HOME",
+/// The per-user folders the XDG specification names, with the default of
+/// each below a home.
+const XDG_USER_DIRS: [(&str, &str); 4] = [
+    ("XDG_CONFIG_HOME", ".config"),
+    ("XDG_DATA_HOME", ".local/share"),
+    ("XDG_CACHE_HOME", ".cache"),
+    ("XDG_STATE_HOME", ".local/state"),
 ];
 
 /// The variables of [`XDG_USER_DIRS`] that the `show-environment` text
 /// `environment` sets to a folder outside the home of `who` (the same
 /// system-wide environment as in [`wrong_session_vars`] can name another
-/// user's `~/.config`): to unset, so that the defaults in the home of `who`
-/// apply.
-pub fn foreign_user_dirs(environment: &str, who: &Account) -> Vec<&'static str> {
+/// user's `~/.config`), as `NAME=value` to set to the default in the home of
+/// `who`. They are set, not unset: what the login's environment generators
+/// give the manager stays in `show-environment` after an `unset-environment`,
+/// and GNOME Keyring looks for its keyrings in `XDG_DATA_HOME`.
+pub fn wrong_user_dirs(environment: &str, who: &Account) -> Vec<String> {
     XDG_USER_DIRS
         .into_iter()
-        .filter(|k| {
+        .filter(|(k, _)| {
             environment.lines().any(|l| {
                 l.strip_prefix(k)
                     .and_then(|r| r.strip_prefix('='))
                     .is_some_and(|v| !v.is_empty() && !Path::new(v).starts_with(&who.home))
             })
         })
+        .map(|(k, d)| format!("{k}={}", who.home.join(d).display()))
         .collect()
 }
 
@@ -621,32 +631,26 @@ fn units_to_restart(exists: impl Fn(&str) -> bool) -> Vec<&'static str> {
     .collect()
 }
 
-/// Puts the environment of the session of `who` right in its service
-/// manager ([`wrong_session_vars`], [`foreign_user_dirs`]) and starts its
-/// session bus and keyring again, which began with the wrong one.
-/// `Ok(true)` when it had to.
+/// Puts the environment of the session of `who` right in its service manager
+/// ([`wrong_session_vars`], [`wrong_user_dirs`]) and starts its session bus
+/// and keyring again, which began with the wrong one. `Ok(true)` when it had
+/// to. It lasts as long as the manager runs: the next one reads the same
+/// system-wide environment ([`write_session_generator`] is what keeps it).
 fn repair_session(who: &Account) -> Result<bool, String> {
     let Ok(environment) = user_systemctl(who, &["show-environment"]) else {
         return Ok(false);
     };
-    let wrong = wrong_session_vars(&environment, who);
-    let foreign = foreign_user_dirs(&environment, who);
-    if wrong.is_empty() && foreign.is_empty() {
+    let mut wrong = wrong_session_vars(&environment, who);
+    wrong.extend(wrong_user_dirs(&environment, who));
+    if wrong.is_empty() {
         return Ok(false);
     }
     let fail = |what: &str, e: Option<String>| {
         format!("{what} for {} failed: {}", who.name, e.unwrap_or_default())
     };
-    if !wrong.is_empty() {
-        let mut set = vec!["set-environment"];
-        set.extend(wrong.iter().map(String::as_str));
-        user_systemctl(who, &set).map_err(|e| fail("systemctl --user set-environment", e))?;
-    }
-    if !foreign.is_empty() {
-        let mut unset = vec!["unset-environment"];
-        unset.extend(foreign);
-        user_systemctl(who, &unset).map_err(|e| fail("systemctl --user unset-environment", e))?;
-    }
+    let mut set = vec!["set-environment"];
+    set.extend(wrong.iter().map(String::as_str));
+    user_systemctl(who, &set).map_err(|e| fail("systemctl --user set-environment", e))?;
     // The bus starts at the first program that asks, and the keyring at the
     // bus's: they may be up already. try-restart leaves a unit that does
     // not run alone; one that does not exist is not asked for.
@@ -659,6 +663,77 @@ fn repair_session(who: &Account) -> Result<bool, String> {
         user_systemctl(who, &restart).map_err(|e| fail("systemctl --user try-restart", e))?;
     }
     Ok(true)
+}
+
+/// Before the node first asks its keyring: puts the session of the node's
+/// user right ([`repair_session`]) when the system-wide environment of the
+/// login gave its service manager another user's folders again (a reboot, a
+/// restart of the session). Where the user lingers, the session may still be
+/// coming up, and is waited for. `Ok(true)` when it had to.
+pub fn repair_for_start() -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        // A desktop's session is the desktop's.
+        if graphical_env(|k| std::env::var_os(k)) {
+            return Ok(false);
+        }
+        let who = me()?;
+        let lingers = Path::new("/var/lib/systemd/linger")
+            .join(&who.name)
+            .exists();
+        if lingers {
+            wait_for_session(&who)?;
+        } else if !Path::new(&format!("/run/user/{}/bus", who.uid)).exists() {
+            return Ok(false);
+        }
+        repair_session(&who)
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(false)
+}
+
+/// The folder of the user environment generators, which every user's
+/// service manager runs, in lexical order, as that user.
+const GENERATORS: &str = "/etc/systemd/user-environment-generators";
+
+/// The generator that keeps the session of the node's user right.
+pub const SESSION_GENERATOR: &str = "/etc/systemd/user-environment-generators/99-nerve-session";
+
+/// The text of the generator for `who`: it prints, for the session of `who`
+/// and no other, its runtime folder, bus and XDG folders. It runs after
+/// `30-systemd-environment-d-generator`, which reads `/etc/environment`, so
+/// what it prints wins, at every start of the manager.
+pub fn session_generator_text(who: &Account) -> String {
+    let id = system_program("id").unwrap_or_else(|| PathBuf::from("/usr/bin/id"));
+    let mut text = format!(
+        "#!/bin/sh\n# Written by `nerve-node setup`; `nerve-node uninstall` removes it.\n# The session of {name} keeps its own runtime folder, bus and XDG folders\n# where /etc/environment names another user's.\n[ \"$({id} -u)\" = \"{uid}\" ] || exit 0\n",
+        name = who.name,
+        uid = who.uid,
+        id = id.display()
+    );
+    let mut vars = session_vars(who);
+    vars.extend(XDG_USER_DIRS.map(|(k, d)| (k, who.home.join(d).display().to_string())));
+    for (k, v) in vars {
+        // In single quotes, a quote in a value ended and written again.
+        text.push_str(&format!("echo '{k}={}'\n", v.replace('\'', r"'\''")));
+    }
+    text
+}
+
+/// Writes [`SESSION_GENERATOR`] as root, so that the session of `who` is
+/// right again at every start of its manager.
+fn write_session_generator(who: &Account) -> Result<(), String> {
+    let sh = system_program("sh").ok_or("there is no sh")?;
+    let script = r#"mkdir -p "$1" && printf '%s' "$3" > "$2.new" && chmod 755 "$2.new" && mv -f "$2.new" "$2""#;
+    as_root(&[
+        sh.display().to_string(),
+        "-c".into(),
+        script.into(),
+        "nerve-node".into(),
+        GENERATORS.into(),
+        SESSION_GENERATOR.into(),
+        session_generator_text(who),
+    ])
 }
 
 /// The login keyring GNOME Keyring opens without a password: its plain text
@@ -1005,26 +1080,71 @@ pub(crate) mod tests {
     }
 
     /// Another user's `~/.config` in the session manager's environment (a
-    /// runner image's `/etc/environment`) is unset; the user's own folders
-    /// and the unset ones are left.
+    /// runner image's `/etc/environment`) is set to the user's own; the
+    /// user's own folders and the unset ones are left.
     #[test]
-    fn a_session_manager_with_anothers_config_folder_is_unset() {
+    fn a_session_manager_with_anothers_config_folder_is_set_right() {
         let who = Account {
             uid: 999,
             ..nerve(Path::new("/var/lib/nerve"))
         };
         let env = "PATH=/usr/bin\nXDG_CONFIG_HOME=/home/runner/.config\nXDG_DATA_HOME=/var/lib/nerve/.local/share\nXDG_CACHE_HOME=\nXDG_STATE_HOME=/home/runner/.local/state\nXDG_DATA_DIRS=/usr/share\n";
         assert_eq!(
-            foreign_user_dirs(env, &who),
-            ["XDG_CONFIG_HOME", "XDG_STATE_HOME"]
+            wrong_user_dirs(env, &who),
+            [
+                "XDG_CONFIG_HOME=/var/lib/nerve/.config",
+                "XDG_STATE_HOME=/var/lib/nerve/.local/state"
+            ]
         );
-        assert!(foreign_user_dirs("XDG_DATA_HOME=/var/lib/nerve/.local/share\n", &who).is_empty());
+        assert_eq!(
+            wrong_user_dirs("XDG_DATA_HOME=/home/runner/.local/share\n", &who),
+            ["XDG_DATA_HOME=/var/lib/nerve/.local/share"],
+            "GNOME Keyring looks for its keyrings there"
+        );
+        assert!(wrong_user_dirs("XDG_DATA_HOME=/var/lib/nerve/.local/share\n", &who).is_empty());
         // A folder that only starts like the home is another's.
         assert_eq!(
-            foreign_user_dirs("XDG_CONFIG_HOME=/var/lib/nerve-run/.config\n", &who),
-            ["XDG_CONFIG_HOME"]
+            wrong_user_dirs("XDG_CONFIG_HOME=/var/lib/nerve-run/.config\n", &who),
+            ["XDG_CONFIG_HOME=/var/lib/nerve/.config"]
         );
-        assert!(foreign_user_dirs("PATH=/usr/bin\n", &who).is_empty());
+        assert!(wrong_user_dirs("PATH=/usr/bin\n", &who).is_empty());
+    }
+
+    /// The generator that keeps the session right at every start of its
+    /// manager prints the user's folders for that user and nothing for
+    /// another.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_session_generator_speaks_for_its_user_only() {
+        let run = |uid: u32| {
+            let who = Account {
+                uid,
+                ..nerve(Path::new("/var/lib/nerve"))
+            };
+            let d = tempfile::tempdir().unwrap();
+            let f = d.path().join("gen");
+            std::fs::write(&f, session_generator_text(&who)).unwrap();
+            let sh = system_program("sh").unwrap();
+            let o = std::process::Command::new(sh).arg(&f).output().unwrap();
+            assert!(o.status.success());
+            String::from_utf8(o.stdout).unwrap()
+        };
+        let mine = nerve_transport::net::euid();
+        let said = run(mine);
+        let mut lines: Vec<&str> = said.lines().collect();
+        lines.sort();
+        let mut want = vec![
+            format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{mine}/bus"),
+            format!("XDG_RUNTIME_DIR=/run/user/{mine}"),
+            "XDG_CONFIG_HOME=/var/lib/nerve/.config".into(),
+            "XDG_DATA_HOME=/var/lib/nerve/.local/share".into(),
+            "XDG_CACHE_HOME=/var/lib/nerve/.cache".into(),
+            "XDG_STATE_HOME=/var/lib/nerve/.local/state".into(),
+        ];
+        want.sort();
+        assert_eq!(lines, want, "{said}");
+        // Every other user's manager runs it too, and gets nothing from it.
+        assert_eq!(run(mine + 1), "");
     }
 
     /// GNOME Keyring 40 (Ubuntu 22.04) has `gnome-keyring.service` and no

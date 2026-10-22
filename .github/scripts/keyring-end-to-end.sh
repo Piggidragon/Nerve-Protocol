@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # The installed node on a real Linux, on this machine's kernel (issue #135):
 # its keys in the system keyring, and folder mode as `nerve-run`. Run as root
-# on a machine that may be changed and broken (a CI runner, a test VM); CI
-# runs it on Ubuntu 22.04 (kernel 5.15) and 24.04 (6.x), where the keyring
-# used to be refused below Linux 7.1.
+# on a machine that may be changed and broken (a CI runner, a test VM). The
+# keyring used to be refused below Linux 7.1, so the script refuses a kernel
+# of 7.1 or later (the job would prove nothing new there) unless
+# KEYRING_E2E_ANY_KERNEL=1. CI runs it on the Ubuntu 22.04 and 24.04 runners,
+# whose kernels are 6.8 and 7.0 at the time of writing (GitHub's Azure kernels;
+# neither is the 5.15 of a 22.04 install), both with Landlock: the case
+# without Landlock, and the 5.15 kernel, are not tested there.
 #
 #   NERVE_NODE_REAL=<the nerve-node to install>
 #   REAL_ACCOUNT_TEST=<the real_account test program>
@@ -15,9 +19,14 @@
 #    owner's sudo), run `setup` in a terminal and answer yes to the keyring,
 #    which installs GNOME Keyring, a session for `nerve` and a login keyring
 #    (crates/nerve-node/src/keyring_setup.rs); check that the keys moved out of
-#    their files; the second test of real_account.rs pairs a center, restarts
-#    the node and runs a folder mode command as nerve-run, which cannot reach
-#    the node's bus or keyring folder; `uninstall --purge` takes it all away.
+#    their files; restart the session of nerve, as a reboot does, and check
+#    the node starts again with its keys; the second test of real_account.rs
+#    pairs a center, restarts the node and runs a folder mode command as
+#    nerve-run, which cannot reach the node's bus or keyring folder;
+#    `uninstall --purge` takes it all away.
+# The system-wide /etc/environment of the machine is given another user's
+# runtime folder, bus and XDG folders first, as a runner image has: the
+# session of nerve must keep its own.
 #
 # What this machine lacks compared to a desktop, and the node does not make
 # up: nothing the node needs. A desktop's keyring is started by the user's
@@ -72,6 +81,7 @@ cleanup() {
   # What a failed run leaves: the node, the accounts, the owner.
   if [ -e "$BIN" ]; then "$BIN" uninstall --purge >/dev/null 2>&1 || true; fi
   userdel -r "$OWNER" >/dev/null 2>&1 || true
+  [ ! -e "$OUT/environment" ] || cp "$OUT/environment" /etc/environment
   rm -rf "$OUT" "$INSTALL_FROM"
   exit "$code"
 }
@@ -86,6 +96,16 @@ echo "LSMs:     $LSM"
 echo "Landlock: $LANDLOCK"
 grep -E '^(PRETTY_NAME)=' /etc/os-release || true
 summary "- kernel \`$KERNEL\`, Landlock: $LANDLOCK (\`$LSM\`)"
+# Below 7.1 the keyring used to be refused; from 7.1 on this run no longer
+# shows that it works there. The runner image has moved on: say so, loudly.
+KMAJOR=${KERNEL%%.*}
+KMINOR=${KERNEL#*.}; KMINOR=${KMINOR%%[!0-9]*}
+if [ "$KMAJOR" -gt 7 ] || { [ "$KMAJOR" -eq 7 ] && [ "$KMINOR" -ge 1 ]; }; then
+  msg="the kernel is $KERNEL, 7.1 or later: this job no longer tests a kernel below 7.1 (issue #135); it needs an older machine"
+  echo "::error::$msg"
+  summary "- **$msg**"
+  [ "${KEYRING_E2E_ANY_KERNEL:-}" = 1 ] || fail "$msg (KEYRING_E2E_ANY_KERNEL=1 runs it anyway)"
+fi
 
 step "The owner"
 # Not a system account: it has a home and a password, and is in sudo, as the
@@ -114,6 +134,25 @@ grep -q 'file' "$OUT/storage"
 NERVE_UID=$(id -u nerve)
 [ ! -e "/run/user/$NERVE_UID/bus" ] || fail "nerve has a session bus already"
 
+step "2b. A system-wide environment that names another user's session"
+# What a runner image's /etc/environment does (it names the runner's own
+# XDG_RUNTIME_DIR and XDG_CONFIG_HOME); here the owner's, with its data and
+# cache folders too: GNOME Keyring keeps its keyrings in XDG_DATA_HOME.
+cp /etc/environment "$OUT/environment"
+OWNER_UID=$(id -u "$OWNER")
+cat >> /etc/environment <<ENV
+XDG_RUNTIME_DIR=/run/user/$OWNER_UID
+DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$OWNER_UID/bus
+XDG_CONFIG_HOME=/home/$OWNER/.config
+XDG_DATA_HOME=/home/$OWNER/.local/share
+XDG_CACHE_HOME=/home/$OWNER/.cache
+XDG_STATE_HOME=/home/$OWNER/.local/state
+ENV
+# secret-tool, to ask nerve's keyring as any program of nerve would.
+if ! command -v secret-tool >/dev/null; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libsecret-tools >/dev/null
+fi
+
 step "3. setup at a terminal, yes to the keyring"
 # The questions: the node's name (Enter), where the keys go (keyring), the
 # offer to install a keyring (y), a pairing link (Enter).
@@ -135,6 +174,16 @@ grep -q '"usable": *true' "$OUT/storage" || fail "the node says the keyring is n
 [ -S "/run/user/$NERVE_UID/bus" ] || fail "nerve has no session bus"
 # GNOME Keyring holds them, as nerve's own secret service.
 ls -la /var/lib/nerve/.local/share/keyrings/
+[ -f /var/lib/nerve/.local/share/keyrings/login.keyring ] || fail "no login keyring in nerve's home"
+# nerve's session got its own folders although /etc/environment names the
+# owner's, and any program of nerve finds the keyring there.
+nerve_env() { runuser -u nerve -- env -i HOME=/var/lib/nerve "XDG_RUNTIME_DIR=/run/user/$NERVE_UID" "$@"; }
+nerve_env systemctl --user show-environment | tee "$OUT/session-env"
+grep -qx "XDG_RUNTIME_DIR=/run/user/$NERVE_UID" "$OUT/session-env" || fail "the session of nerve has another runtime folder"
+grep -qx "XDG_DATA_HOME=/var/lib/nerve/.local/share" "$OUT/session-env" || fail "the session of nerve has another data folder"
+printf 'a secret' | nerve_env secret-tool store --label=nerve-ci nerve-ci probe || fail "secret-tool cannot store in the keyring of nerve"
+[ "$(nerve_env secret-tool lookup nerve-ci probe)" = "a secret" ] || fail "secret-tool does not find what it stored"
+nerve_env secret-tool clear nerve-ci probe
 
 step "5. The node starts again with the keys from the keyring"
 systemctl restart nerve-node
@@ -157,6 +206,31 @@ assert status["keyring_failed"] is False, status
 assert "folder_commands_off" not in status or status["folder_commands_off"] is None, status
 PY
 
+step "5b. The session of nerve starts again, as at a reboot"
+# Its service manager reads /etc/environment again; the keyring and the node
+# must find their folders as before.
+systemctl restart "user@$NERVE_UID.service"
+for _ in $(seq 1 60); do [ -S "/run/user/$NERVE_UID/bus" ] && break; sleep 1; done
+[ -S "/run/user/$NERVE_UID/bus" ] || fail "nerve has no session bus after its session started again"
+nerve_env systemctl --user show-environment | tee "$OUT/session-env2"
+grep -qx "XDG_RUNTIME_DIR=/run/user/$NERVE_UID" "$OUT/session-env2" || fail "the restarted session of nerve has another runtime folder"
+grep -qx "XDG_DATA_HOME=/var/lib/nerve/.local/share" "$OUT/session-env2" || fail "the restarted session of nerve has another data folder"
+systemctl restart nerve-node
+for _ in $(seq 1 60); do
+  as_owner status 2>/dev/null | grep -q 'daemon: running' && break
+  sleep 1
+done
+as_owner --json status | tee "$OUT/status-json2"
+python3 - "$OUT/status-json2" <<'PY' || fail "the node does not run with its keys in the keyring after the session started again"
+import json, sys
+text = open(sys.argv[1]).read()
+status = json.loads(text[text.index("{"):])
+status = status.get("data", status)
+assert status["keyring_failed"] is False, status
+PY
+printf 'a secret' | nerve_env secret-tool store --label=nerve-ci nerve-ci probe || fail "secret-tool cannot store after the session started again"
+nerve_env secret-tool clear nerve-ci probe
+
 step "6. real_account.rs: a center, a restart, a folder mode command as nerve-run"
 NERVE_REAL_KEYRING=1 NERVE_REAL_OWNER=$OWNER \
   "$TESTS" --ignored --exact --nocapture the_installed_node_with_its_keys_in_the_keyring_runs_folder_commands_as_nerve_run
@@ -169,6 +243,7 @@ if id nerve-run >/dev/null 2>&1; then fail "the account nerve-run is still there
 [ ! -e /etc/systemd/system/nerve-node.service ] || fail "the unit is still there"
 [ ! -e /var/lib/nerve ] || fail "the node's home is still there"
 [ ! -e "/run/user/$NERVE_UID" ] || fail "nerve's session is still there"
+[ ! -e /etc/systemd/user-environment-generators/99-nerve-session ] || fail "the session generator is still there"
 
 step "Done"
 summary "- the keyring path end to end: passed"

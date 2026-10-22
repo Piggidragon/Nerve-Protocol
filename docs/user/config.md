@@ -283,7 +283,12 @@ keeps refusing, when the settings say `keyring`). `y` installs GNOME Keyring
 and what it needs (nothing it only recommends) with the system's package
 manager (apt, dnf or pacman), keeps a session for the node's user from boot
 on, makes a login keyring for it without a password, and checks that it
-answers. These steps run as root: the programs from the system's own
+answers. If this machine's `/etc/environment` names another user's runtime
+folder, bus or XDG folders (a CI runner's does), the session of the node's user
+would start GNOME Keyring in those: setup sets them right and writes
+`/etc/systemd/user-environment-generators/99-nerve-session`, which keeps them
+right at every start of that session (`uninstall` removes it), and the node
+sets them right again when it starts. These steps run as root: the programs from the system's own
 folders, by their full path, with a fixed environment, in `/`, and without
 your input. `install` asks the same when an earlier install's settings say
 `keyring` and it runs in a terminal.

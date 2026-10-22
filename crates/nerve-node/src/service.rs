@@ -618,6 +618,9 @@ impl System for Host {
     }
 
     fn end_session(&self, name: &str) -> Result<bool, String> {
+        // What setup wrote for the session of the node's user, when its
+        // environment needed one (crate::keyring_setup).
+        let _ = std::fs::remove_file(crate::keyring_setup::SESSION_GENERATOR);
         if !Path::new("/var/lib/systemd/linger").join(name).exists() {
             return Ok(false);
         }

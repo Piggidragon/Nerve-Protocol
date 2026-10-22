@@ -16,13 +16,14 @@
 //! with a home, the owner> cargo test -p nerve-node --test real_account --
 //! --ignored --nocapture`
 //!
-//! The second test is the other half of issue #135, on a kernel of any age:
+//! The second test is the other half of issue #135, on a kernel of any age
+//! (CI runs it on the 6.8 and 7.0 kernels of its Ubuntu 22.04 and 24.04
+//! runners; the case without Landlock only on a test VM):
 //! the installed node with its keys in the system keyring pairs a center,
 //! starts again with the key it keeps there, and still runs a folder mode
 //! command as `nerve-run`, which reaches neither the node's session bus nor
 //! its keyring folder. It expects the node installed and `setup` done with the
-//! keyring (`.github/scripts/keyring-end-to-end.sh` does both, CI runs it on
-//! Ubuntu 22.04 and 24.04): `NERVE_REAL_KEYRING=1 NERVE_REAL_OWNER=<the owner>
+//! keyring (`.github/scripts/keyring-end-to-end.sh` does both): `NERVE_REAL_KEYRING=1 NERVE_REAL_OWNER=<the owner>
 //! ... --ignored --exact the_installed_node_with_its_keys_in_the_keyring_runs_folder_commands_as_nerve_run`.
 
 #![cfg(target_os = "linux")]
@@ -555,6 +556,65 @@ except OSError as e:
     std::fs::remove_dir_all(&base).unwrap();
 }
 
+/// The program a confined command runs to reach the node's bus and keyring
+/// folder: it says `refused` only for "Permission denied", and `failed` for
+/// a path that is not there, so that a moved keyring cannot pass as isolated.
+fn reach_py(bus: &str, keyring: &str) -> String {
+    format!(
+        r#"import errno, socket
+for what, f in [
+    ("bus", lambda: socket.socket(socket.AF_UNIX).connect("{bus}")),
+    ("keyrings", lambda: open("{keyring}").read()),
+]:
+    try:
+        f()
+        print(what, "reached")
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EPERM):
+            print(what, "refused:", e.strerror)
+        else:
+            print(what, "failed:", e.strerror)
+"#
+    )
+}
+
+/// `reach_py` tells a path it may not enter from one that is not there.
+#[test]
+fn the_reach_program_requires_permission_denied() {
+    use std::os::unix::fs::PermissionsExt;
+    if nerve_transport::net::euid() == 0 {
+        // Root reaches everything; the test is for the person who runs it.
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let closed = d.path().join("closed");
+    std::fs::create_dir(&closed).unwrap();
+    std::fs::write(closed.join("login.keyring"), "x").unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let open = d.path().join("open.keyring");
+    std::fs::write(&open, "x").unwrap();
+    let run = |bus: &Path, keyring: &Path| {
+        let py = d.path().join("reach.py");
+        std::fs::write(
+            &py,
+            reach_py(bus.to_str().unwrap(), keyring.to_str().unwrap()),
+        )
+        .unwrap();
+        sh(Command::new("python3").arg(&py)).1
+    };
+    let gone = d.path().join("no-bus");
+    let said = run(&gone, &closed.join("login.keyring"));
+    assert!(said.contains("bus failed: No such file"), "{said}");
+    assert!(
+        said.contains("keyrings refused: Permission denied"),
+        "{said}"
+    );
+    let said = run(&gone, &d.path().join("moved.keyring"));
+    assert!(said.contains("keyrings failed: No such file"), "{said}");
+    assert!(run(&gone, &open).contains("keyrings reached"));
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 /// The keys of an installed node whose `setup` moved them into the system
 /// keyring (issue #135): no file holds one, the node starts again with the
 /// key it keeps there, and a folder mode command runs as `nerve-run`, which
@@ -597,24 +657,15 @@ async fn the_installed_node_with_its_keys_in_the_keyring_runs_folder_commands_as
     let nerve_uid = nerve_uid.trim();
     std::fs::write(base.join("who.sh"), "#!/bin/sh\nid -un\n").unwrap();
     // What a command that wants the keys would try: the node's session bus,
-    // and the folder GNOME Keyring keeps them in.
-    std::fs::write(
-        base.join("reach.py"),
-        format!(
-            r#"import socket
-for what, f in [
-    ("bus", lambda: socket.socket(socket.AF_UNIX).connect("/run/user/{nerve_uid}/bus")),
-    ("keyrings", lambda: open("/var/lib/nerve/.local/share/keyrings/login.keyring").read()),
-]:
-    try:
-        f()
-        print(what, "reached")
-    except OSError as e:
-        print(what, "refused:", e.strerror)
-"#
-        ),
-    )
-    .unwrap();
+    // and the folder GNOME Keyring keeps them in. Both must be there, or a
+    // refusal would prove nothing.
+    let bus = format!("/run/user/{nerve_uid}/bus");
+    let keyring = "/var/lib/nerve/.local/share/keyrings/login.keyring";
+    assert!(
+        Path::new(&bus).exists() && Path::new(keyring).exists(),
+        "nothing to reach: {bus} and {keyring} must exist"
+    );
+    std::fs::write(base.join("reach.py"), reach_py(&bus, keyring)).unwrap();
     let chmod = |p: &Path, m: &str| assert!(sh(Command::new("chmod").arg(m).arg(p)).0);
     assert!(
         sh(Command::new("chown")
@@ -655,7 +706,8 @@ for what, f in [
     let r = run(&mut conn, &base, "python3 reach.py").await.unwrap();
     let said = out(&r);
     assert!(
-        said.contains("bus refused") && said.contains("keyrings refused"),
+        said.contains("bus refused: Permission denied")
+            && said.contains("keyrings refused: Permission denied"),
         "{r}"
     );
     drop(conn);

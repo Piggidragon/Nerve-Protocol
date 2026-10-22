@@ -36,7 +36,8 @@ provider desk: lamp.dim left out: params: /properties/level/oneOf: oneOf: altern
 ```
 
 The second line is an action the node left out (below); `nerve-node status
---json` has them as `broken`.
+--json` has them as `broken`. A reason is one line, cut after 300
+characters, since it holds names from the program's schemas.
 
 The check tells programs apart, not users: another program of your user can
 still make the allowed one attach for it. Allow only programs you trust.

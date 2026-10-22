@@ -87,9 +87,9 @@ that does not match `Host` are refused (403).
   anything else in a name becomes `-`. Names longer than 64 are cut and get a
   short hash; clashes get `_2`, `_3`.
 - An action whose schemas are outside the subset of protocol.md §6.1 is not
-  a tool either. The center keeps what it left out, with the reason, for
-  the owner (`broken` of the node in `GET /api/overview`, §7); the agent
-  never sees it.
+  a tool either. The center keeps what it left out, with the reason (one
+  line of at most 300 characters), for the owner (`broken` of the node in
+  `GET /api/overview`, §7); the agent never sees it.
 - Before a call goes to its node, the center checks its arguments (less
   `node`) against the action's `params`. Arguments that do not fit are
   `isError` with `error invalid_args: <field>: expected <what>` (`error

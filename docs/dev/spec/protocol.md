@@ -629,6 +629,8 @@ in the subset when:
   them: of `minimum` and `exclusiveMinimum` the tighter counts (the same for
   the upper pair), and for `integer` there must be a whole number between
   them. Each value of `enum` and the `const` keeps to the schema's bounds.
+  With both, the `const` is one of the `enum`; the other `enum` values need
+  not equal it.
 - The arguments schema's root is `{"type": "object", …}`. It nests at most 3
   levels deep, a result, event data or state at most 4: the root is level 1,
   and a property's or an array's items schema is one level below its

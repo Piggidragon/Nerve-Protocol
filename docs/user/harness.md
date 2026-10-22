@@ -62,9 +62,10 @@ sees only `nodes`.
   marked as disabled.
 - A paired machine that is offline keeps its tools. A call to it fails with
   `unavailable`.
-- An action whose name or argument schema the center cannot handle is not a
-  tool, even with an allow rule. The center's web UI lists it with the reason
-  on the Overview, under **Not offered to the agent** ([web UI](web-ui.md#overview)).
+- An action whose name or schemas (arguments or result) the center cannot
+  handle is not a tool, even with an allow rule. The center's web UI lists
+  it with the reason on the Overview, under **Not offered to the agent**
+  ([web UI](web-ui.md#overview)).
 
 ## What a result looks like
 

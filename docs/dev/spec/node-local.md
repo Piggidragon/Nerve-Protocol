@@ -1460,8 +1460,9 @@ program of a desktop user cannot attach there yet.
 ### While it is attached
 
 The answer is `{"ok": {"name", "capabilities": [ids], "broken": [{name,
-reason}]}}`, `broken` naming each action left out as `cap.action`, and the
-connection stays. The node reads the provider's lines while it writes its own, so a
+reason}]}}`, `broken` naming each action left out as `cap.action` (the
+reason is one line of at most 300 characters, since it holds the
+provider's own names), and the connection stays. The node reads the provider's lines while it writes its own, so a
 provider may answer one call before it reads the next. The node lists each
 capability in every center's descriptor with
 `provider: <name>` and cuts it by that center's policy as its own (§3): `caps`

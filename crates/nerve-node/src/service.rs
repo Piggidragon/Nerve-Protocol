@@ -3168,7 +3168,7 @@ pub(crate) mod tests {
         }
         use std::os::unix::fs::PermissionsExt;
         let sub = folder.join("sub");
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
         let before = sys.calls().len();
         let (r, out) = install_by(&l, &sys, ROOT, RootOwner::Accepted, None);
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();

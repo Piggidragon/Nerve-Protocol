@@ -65,6 +65,7 @@ pub(super) async fn changed(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> 
 /// Whether the command runs with `--json` and without a form of its own
 /// ([`changed`]): its output is printed only once it is done, so it may not
 /// ask a question on it.
+#[cfg_attr(windows, allow(dead_code))]
 pub(super) fn active() -> bool {
     ALSO.try_with(|_| ()).is_ok()
 }

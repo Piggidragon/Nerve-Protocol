@@ -3,7 +3,11 @@
 //! `--owner=root --accept-root-owner`; piped input and a no leave the node
 //! without one, so `user` mode runs nothing. With root as the owner a
 //! `user` mode command, and one of `allowlist` mode as the owner, runs as
-//! root; `folder` mode still runs as `nerve-run`. For a test machine only,
+//! root; `folder` mode still runs as `nerve-run`. A later install keeps
+//! root, `--owner=none` takes it back, and an install that changes the
+//! owner (root to none, alice to root) takes nerve-run's entries off the
+//! earlier owner's files first, so none stays on them, also after
+//! `uninstall` frees its uid. For a test machine only,
 //! as root and without sudo: it installs the node as a service and removes
 //! it again.
 //!
@@ -57,17 +61,37 @@ fn sh(cmd: &mut Command) -> (bool, String) {
     typing(cmd, "")
 }
 
-/// `install` of `exe` with `args` at a terminal (`script` gives it one),
-/// answering `answer`.
-fn install_at_a_terminal(exe: &Path, args: &str, answer: &str) -> (bool, String) {
+/// The shell line `line` at a terminal (`script` gives it one), answering
+/// `answer`; given up after a minute, as a question nobody sees would wait.
+fn at_a_terminal(line: &str, answer: &str) -> (bool, String) {
     typing(
-        Command::new("script").args([
-            "-qec",
-            &format!("{} install {args}", exe.display()),
-            "/dev/null",
-        ]),
+        Command::new("timeout").args(["60", "script", "-qec", line, "/dev/null"]),
         answer,
     )
+}
+
+/// `install` of `exe` with `args` at a terminal, answering `answer`.
+fn install_at_a_terminal(exe: &Path, args: &str, answer: &str) -> (bool, String) {
+    at_a_terminal(&format!("{} install {args}", exe.display()), answer)
+}
+
+/// The ACL of `path` with numeric ids (`getfacl -n`).
+fn acl(path: &Path) -> String {
+    let (ok, text) = sh(Command::new("getfacl").args(["-n", "-p"]).arg(path));
+    assert!(ok, "{text}");
+    text
+}
+
+/// Whether `path` has an entry for the uid `uid` (a line of [`id_u`]).
+fn has_entry(path: &Path, uid: &str) -> bool {
+    acl(path).contains(&format!("user:{}:", uid.trim()))
+}
+
+/// `id -u <name>`.
+fn id_u(name: &str) -> String {
+    let (ok, uid) = sh(Command::new("id").args(["-u", name]));
+    assert!(ok, "{uid}");
+    uid
 }
 
 fn owner_in_unit() -> Option<String> {
@@ -133,6 +157,29 @@ async fn root_is_the_owner_only_when_it_says_so() {
     assert!(said.contains("Warning: no owner"), "{said}");
     assert!(said.contains("--owner=root --accept-root-owner"), "{said}");
     assert_eq!(owner_in_unit(), None);
+    // With --json, or with its output in a file, install asks nothing even
+    // at a terminal, and waits for nothing: the answer is no at once, and
+    // stderr says which flags make root the owner.
+    let no_question =
+        "here the answer is no. `--owner=root --accept-root-owner` makes root the owner";
+    let started = std::time::Instant::now();
+    let (ok, said) = at_a_terminal(&format!("{} --json install", exe.display()), "");
+    assert!(ok, "{said}");
+    assert!(!said.contains(question), "{said}");
+    assert!(said.contains(no_question), "{said}");
+    let log = Path::new("/var/tmp/nrv151-install.log");
+    let (ok, said) = at_a_terminal(
+        &format!("{} install > {}", exe.display(), log.display()),
+        "",
+    );
+    assert!(ok, "{said}");
+    assert!(said.contains(no_question), "{said}");
+    let logged = std::fs::read_to_string(log).unwrap();
+    assert!(!logged.contains(question), "{logged}");
+    assert!(logged.contains("Warning: no owner"), "{logged}");
+    let _ = std::fs::remove_file(log);
+    assert!(started.elapsed() < Duration::from_secs(50), "it waited");
+    assert_eq!(owner_in_unit(), None);
     // At a terminal, a no: no owner either, and user mode runs nothing.
     let (ok, said) = install_at_a_terminal(&exe, "", "n\n");
     assert!(ok, "{said}");
@@ -149,6 +196,10 @@ async fn root_is_the_owner_only_when_it_says_so() {
     let work = Path::new("/srv/nrv151");
     let _ = std::fs::remove_dir_all(work);
     std::fs::create_dir_all(work).unwrap();
+    // Root's own file, which only the grant opens to nerve-run.
+    let data = work.join("data.txt");
+    std::fs::write(&data, "root's data\n").unwrap();
+    assert!(sh(Command::new("chmod").arg("600").arg(&data)).0);
     let secret = Path::new("/srv/nrv151-secret");
     std::fs::write(secret, "nobody's\n").unwrap();
     assert!(sh(Command::new("chown").args(["nobody:nogroup"]).arg(secret)).0);
@@ -225,19 +276,128 @@ async fn root_is_the_owner_only_when_it_says_so() {
     let r = run(&mut conn, work, &format!("cat {}", secret.display())).await;
     let shown = r.as_ref().map(out).unwrap_or_else(|e| e.clone());
     assert!(!shown.contains("nobody's"), "{shown}");
+    let r = run(&mut conn, work, "cat data.txt").await.unwrap();
+    assert_eq!(out(&r), "root's data\n", "{r}");
+    let run_uid = id_u("nerve-run");
+    assert!(has_entry(&data, &run_uid), "{}", acl(&data));
     drop(conn);
 
-    // Without a terminal, the flags keep root the owner; without them an
-    // install drops it.
+    // Without a terminal, the flags keep root the owner, and so does an
+    // install without them, at a terminal or not: root confirmed it before,
+    // and is not asked again.
     let (ok, said) =
         sh(Command::new(&exe).args(["install", "--owner=root", "--accept-root-owner"]));
     assert!(ok, "{said}");
     assert!(!said.contains(question), "{said}");
     assert_eq!(owner_in_unit().as_deref(), Some("root"));
+    let stays = "root stays the owner of the node, as confirmed at an earlier install";
     let (ok, said) = sh(Command::new(&exe).arg("install"));
     assert!(ok, "{said}");
-    assert!(said.contains("root is no longer the owner"), "{said}");
+    assert!(said.contains(stays), "{said}");
+    let (ok, said) = install_at_a_terminal(&exe, "", "\n");
+    assert!(ok, "{said}");
+    assert!(!said.contains(question), "{said}");
+    assert!(said.contains(stays), "{said}");
+    assert_eq!(owner_in_unit().as_deref(), Some("root"));
+    // The grant was not touched.
+    assert!(has_entry(&data, &run_uid), "{}", acl(&data));
+
+    // A stopped node says root is the owner too.
+    assert!(sh(Command::new(BIN).args(["service", "stop"])).0);
+    let st = status();
+    assert_eq!(st["daemon"], "not running", "{st}");
+    assert_eq!(st["owner_is_root"], true, "{st}");
+    let (_, text) = sh(Command::new(BIN).arg("status"));
+    assert!(
+        text.contains("daemon: not running")
+            && text.contains("owner: root is the owner: commands of user mode"),
+        "{text}"
+    );
+    assert!(sh(Command::new(BIN).args(["service", "start"])).0);
+
+    // --owner=none takes root back. The owner changes, so nerve-run's
+    // entries come off root's files first, and the record goes.
+    let (ok, said) = sh(Command::new(&exe).args(["install", "--owner=none"]));
+    assert!(ok, "{said}");
+    assert!(
+        said.contains("root is no longer the owner of the node, as --owner=none says"),
+        "{said}"
+    );
+    assert!(
+        said.contains("the owner of the node changes, so took nerve-run's access"),
+        "{said}"
+    );
     assert_eq!(owner_in_unit(), None);
+    for p in [work, data.as_path()] {
+        assert!(!has_entry(p, &run_uid), "{}", acl(p));
+    }
+    assert!(!Path::new("/var/lib/nerve/state/acl.json").exists());
+    // The review's case: the folder goes, and no folder-mode command of the
+    // center reads it any more.
+    let (ok, said) = sh(Command::new(BIN).args(["folder", "rm", "/srv/nrv151"]));
+    assert!(ok, "{said}");
+    let mut conn = linked(&mut center).await;
+    let r = run(&mut conn, Path::new("/tmp"), "cat /srv/nrv151/data.txt").await;
+    let shown = r.as_ref().map(out).unwrap_or_else(|e| e.clone());
+    assert!(!shown.contains("root's data"), "{shown}");
+    drop(conn);
+
+    // An owner alice, then root: alice's entries come off before root is
+    // the owner, so folder mode still runs, and uninstall leaves no entry
+    // of the freed uid on alice's files.
+    let alice = "nrv151alice";
+    let _ = sh(Command::new("userdel").args(["-r", alice]));
+    assert!(sh(Command::new("useradd").args(["-m", alice])).0);
+    let proj = PathBuf::from(format!("/home/{alice}/proj"));
+    std::fs::create_dir_all(&proj).unwrap();
+    let a = proj.join("a.txt");
+    std::fs::write(&a, "alice's\n").unwrap();
+    assert!(sh(Command::new("chmod").arg("600").arg(&a)).0);
+    assert!(
+        sh(Command::new("chown")
+            .args(["-R", &format!("{alice}:{alice}")])
+            .arg(&proj))
+        .0
+    );
+    // As through alice's sudo: typing() takes SUDO_USER away, env puts it
+    // back for install alone.
+    let (ok, said) = sh(Command::new("env")
+        .arg(format!("SUDO_USER={alice}"))
+        .arg(&exe)
+        .arg("install"));
+    assert!(ok, "{said}");
+    assert_eq!(owner_in_unit().as_deref(), Some(alice), "{said}");
+    let (ok, said) = sh(Command::new(BIN)
+        .args(["folder", "add"])
+        .arg(&proj)
+        .arg("+rwx"));
+    assert!(ok, "{said}");
+    let mut conn = linked(&mut center).await;
+    let r = run(&mut conn, &proj, "cat a.txt").await.unwrap();
+    assert_eq!(out(&r), "alice's\n", "{r}");
+    drop(conn);
+    assert!(has_entry(&a, &run_uid), "{}", acl(&a));
+    let (ok, said) =
+        sh(Command::new(&exe).args(["install", "--owner=root", "--accept-root-owner"]));
+    assert!(ok, "{said}");
+    assert!(
+        said.contains("the owner of the node changes, so took nerve-run's access"),
+        "{said}"
+    );
+    assert_eq!(owner_in_unit().as_deref(), Some("root"));
+    assert!(!has_entry(&a, &run_uid), "{}", acl(&a));
+    let mut conn = linked(&mut center).await;
+    let r = run(&mut conn, Path::new("/tmp"), "id -un").await;
+    assert_eq!(r.as_ref().map(out).as_deref(), Ok("nerve-run\n"), "{r:?}");
+    let r = run(
+        &mut conn,
+        Path::new("/tmp"),
+        &format!("cat {}", a.display()),
+    )
+    .await;
+    let shown = r.as_ref().map(out).unwrap_or_else(|e| e.clone());
+    assert!(!shown.contains("alice's"), "{shown}");
+    drop(conn);
 
     // Removed again, with everything it made.
     let (ok, said) = sh(Command::new(BIN).args(["uninstall", "--purge"]));
@@ -247,6 +407,8 @@ async fn root_is_the_owner_only_when_it_says_so() {
     assert!(!Path::new("/etc/nerve").exists());
     assert!(!Path::new("/var/lib/nerve").exists());
     assert!(!Path::new(UNIT).exists());
+    assert!(!has_entry(&a, &run_uid), "{}", acl(&a));
     let _ = std::fs::remove_dir_all(work);
     let _ = std::fs::remove_file(secret);
+    let _ = sh(Command::new("userdel").args(["-r", alice]));
 }

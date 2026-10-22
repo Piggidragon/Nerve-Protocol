@@ -183,14 +183,20 @@ impl Ui {
 
     fn session_of(&self, req: &Request) -> Option<String> {
         let token = cookie(req, COOKIE)?;
-        let mut s = self.sessions.lock().unwrap();
-        s.retain(|_, v| {
-            v.created.elapsed() < SESSION_TTL
-                && v.via.as_deref().is_none_or(|h| {
-                    crate::mcp::token_hash_ok(&self.center, self.env_token.as_deref(), h)
-                })
-        });
-        s.contains_key(&token).then_some(token)
+        let via = {
+            let mut s = self.sessions.lock().unwrap();
+            s.retain(|_, v| v.created.elapsed() < SESSION_TTL);
+            s.get(&token)?.via.clone()
+        };
+        // Checked with the sessions unlocked: the check reads the center's
+        // state, and a request that waits for it holds up no other.
+        if let Some(h) = via
+            && !crate::mcp::token_hash_ok(&self.center, self.env_token.as_deref(), &h)
+        {
+            self.sessions.lock().unwrap().remove(&token);
+            return None;
+        }
+        Some(token)
     }
 
     /// Starts a session; `via` is the SHA-256 (hex) of the token that logged in.

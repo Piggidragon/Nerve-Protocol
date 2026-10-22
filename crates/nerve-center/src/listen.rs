@@ -34,6 +34,8 @@ pub struct Server {
     /// rotation of the key (docs/dev/spec/protocol.md §4.10) changes it
     /// while the listener runs.
     tls: Option<Center>,
+    /// Open connections at most ([`MAX_CONNECTIONS`]).
+    slots: usize,
 }
 
 impl Server {
@@ -57,7 +59,18 @@ impl Server {
             ));
         }
         let tls = (!plain).then(|| center.clone());
-        Ok(Server { listener, tls })
+        Ok(Server {
+            listener,
+            tls,
+            slots: MAX_CONNECTIONS,
+        })
+    }
+
+    /// Fewer open connections, so a test can fill them.
+    #[cfg(test)]
+    fn with_slots(mut self, n: usize) -> Server {
+        self.slots = n;
+        self
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -73,7 +86,7 @@ impl Server {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let handler = Arc::new(handler);
-        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let slots = Arc::new(Semaphore::new(self.slots));
         loop {
             let Ok(permit) = slots.clone().acquire_owned().await else {
                 return;
@@ -172,5 +185,75 @@ async fn connect(center: Center, mut io: BoxIo, req: Request) {
             None,
             &format!("a WebSocket upgrade failed: {e}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A peer that asks for an answer and reads none of it gives its
+    /// connection back after the write's timeout, so the next one is
+    /// served: with every slot held by such peers the port answered
+    /// nobody, for good (issue #150).
+    #[tokio::test]
+    async fn a_peer_that_reads_nothing_gives_its_slot_back() {
+        let dir = tempfile::tempdir().unwrap();
+        nerve_transport::init_crypto();
+        let center = Center::open(crate::center::Options {
+            state_dir: dir.path().to_path_buf(),
+            name: None,
+            public_url: "http://127.0.0.1:7443".into(),
+            log: None,
+            log_level: None,
+        })
+        .unwrap();
+        let server = Server::bind("127.0.0.1:0", &center, true)
+            .await
+            .unwrap()
+            .with_slots(1);
+        let addr = server.local_addr();
+        // More than the kernel buffers of both ends hold.
+        let big = Arc::new(vec![b'x'; 32 * 1024 * 1024]);
+        let task = tokio::spawn(server.run(move |mut io, _| {
+            let big = big.clone();
+            async move {
+                let Ok(req) = http::read_request(&mut io, 0).await else {
+                    return;
+                };
+                let body = if req.path == "/big" {
+                    big.to_vec()
+                } else {
+                    b"ok".to_vec()
+                };
+                let _ = Response::new(200, "text/plain", body).write(&mut io).await;
+            }
+        }));
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.set_recv_buffer_size(4096).unwrap();
+        let mut stuck = sock.connect(addr).await.unwrap();
+        stuck
+            .write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        // Let the server start its answer, which fills both buffers.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let t = Instant::now();
+        let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
+        next.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(http::HEAD_TIMEOUT * 3, next.read_to_end(&mut answer))
+            .await
+            .expect("the next peer was never served")
+            .unwrap();
+        assert!(answer.starts_with(b"HTTP/1.1 200"), "{answer:?}");
+        assert!(answer.ends_with(b"ok"));
+        assert!(t.elapsed() < http::HEAD_TIMEOUT * 2, "{:?}", t.elapsed());
+        drop(stuck);
+        task.abort();
     }
 }

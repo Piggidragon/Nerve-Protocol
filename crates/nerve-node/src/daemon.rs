@@ -1796,12 +1796,6 @@ async fn answer(
     peer: nerve_transport::ctl::Peer,
 ) -> nerve_transport::ctl::Reply {
     if !nerve_transport::ctl::token_ok(token, req.token.as_deref()) {
-        // `update` of 0.0.2 asks `status` without a token to wait for the
-        // restarted node, and puts the old program back when it does not
-        // answer `ok`. That a node runs tells nothing the socket does not.
-        if req.method == "status" {
-            return nerve_transport::ctl::Reply::Ok(json!({"running": true}));
-        }
         return nerve_transport::ctl::Reply::Err(NO_TOKEN.into());
     }
     match req.method.as_str() {
@@ -3160,34 +3154,17 @@ mod tests {
     }
 
     /// What `install`, `update` and `setup` run to wait for the node they
-    /// restarted: with the token, and as `update` of 0.0.2 sent it, without.
-    /// A node that does not answer them makes `update` put the old program
-    /// back.
+    /// restarted, with the token. A node that does not answer it makes
+    /// `update` put the old program back.
     #[tokio::test]
     async fn the_installers_find_the_node_they_restarted() {
         use crate::service::System;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let (_d, daemon) = daemon().await;
-        let paths = daemon.paths().clone();
-        let p = paths.clone();
+        let p = daemon.paths().clone();
         tokio::task::spawn_blocking(move || crate::service::Host.wait_running(&p))
             .await
             .unwrap()
             .unwrap();
-        // 0.0.2 counts the node as running when the reply holds `"ok"`.
-        let stream = tokio::net::UnixStream::connect(paths.ctl_socket())
-            .await
-            .unwrap();
-        let (r, mut w) = stream.into_split();
-        w.write_all(b"{\"method\":\"status\",\"params\":{}}\n")
-            .await
-            .unwrap();
-        let mut line = String::new();
-        tokio::io::BufReader::new(r)
-            .read_line(&mut line)
-            .await
-            .unwrap();
-        assert!(line.contains("\"ok\""), "{line}");
         daemon.stop().await;
     }
 
@@ -3215,7 +3192,7 @@ mod tests {
         assert_eq!(v["locked"], false);
         // ... a request without it, or with another, is refused for every
         // method, though it comes from the node's own user and below no
-        // command. Only `status` is answered, with nothing of the config.
+        // command.
         let ask = |method: &'static str, given: Option<&'static str>| {
             let socket = socket.clone();
             async move {
@@ -3237,13 +3214,17 @@ mod tests {
             }
         };
         for given in [None, Some("wrong"), Some("short"), Some("")] {
-            for method in ["config.read", "config.write", "sudo.status", "owner.check"] {
+            for method in [
+                "status",
+                "config.read",
+                "config.write",
+                "sudo.status",
+                "owner.check",
+            ] {
                 let reply = ask(method, given).await;
                 let error = reply["error"].as_str().unwrap_or_default();
                 assert!(error.starts_with("refused"), "{method} {given:?}: {reply}");
             }
-            let reply = ask("status", given).await;
-            assert_eq!(reply, json!({"ok": {"running": true}}), "{given:?}");
         }
         // A new start makes a new token, and a stop takes the file away.
         let mut opts = NodeOptions::new(daemon.paths().clone());

@@ -494,11 +494,12 @@ async fn a_command_cannot_read_the_config_over_the_control_socket() {
     assert!(!shown.contains(CENTER_SHOWN), "{r}");
     assert!(shown.contains("refused"), "{r}");
     assert_ne!(r["exit_code"], 0, "{r}");
-    // `status` is answered without the token, but only that a node runs.
+    // `status` is refused without the token too.
     let r = run_command(&mut conn, &work, &nerve(&o, "status")).await;
     let shown = format!("{}{}", r["stdout"], r["stderr"]);
     assert!(!shown.contains(CENTER_SHOWN), "{r}");
-    assert!(shown.contains("running"), "{r}");
+    assert!(shown.contains("refused"), "{r}");
+    assert_ne!(r["exit_code"], 0, "{r}");
     node.stop().await;
 }
 

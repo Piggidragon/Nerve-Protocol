@@ -668,9 +668,8 @@ impl Ctl {
         }) else {
             return;
         };
-        // The flags come first and the name behind `--`: a name that starts
-        // with `-` (the CLI refuses new ones, an old file may hold one) is
-        // then no flag.
+        // The flags come first and the name behind `--`, so the name is
+        // never read as a flag.
         let mut set_centers = vec!["relay".into(), "set-centers".into()];
         for c in centers {
             set_centers.push(format!("--center={c}"));

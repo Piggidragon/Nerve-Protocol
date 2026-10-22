@@ -88,9 +88,10 @@ program (`env X=1 sudo ...`, `timeout 30 sudo ...`).
 nerve-node rule guard --center lab   # puts back the ones a pairing lacks
 ```
 
-A pairing made before the guard has none: `rule guard` adds them, and the
-desktop app offers it on **Permissions**. It also takes off the older text of
-a rule that the guard has changed, and puts the new one in its place.
+A pairing that lacks some of them (you removed them) gets them back with
+`rule guard`, and the desktop app offers it on **Permissions**. It also takes
+off the older text of a rule that the guard has changed, and puts the new one
+in its place.
 
 The guard catches an agent's mistakes, such as an agent that tries to give
 itself more rights. It does not stop a command written to get around it (a

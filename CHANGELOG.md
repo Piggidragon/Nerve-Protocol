@@ -73,6 +73,13 @@
 
 - New built-in blocklist entries keep an agent off the node it runs on: running `nerve-node` or `nerve-node-desktop`, a command that names the node's socket, pipe, config or state folder, and a write into those folders (ids `nerve-node`, `nerve-node-desktop`, `nerve-node-socket`, `nerve-node-folders`, `fs-nerve-…`). They catch mistakes, not commands written to get past them.
 
+### No migrations before 0.1.0 ([#144](https://github.com/Piggidragon/Nerve-Protocol/issues/144))
+
+- Until the first 0.1.0 release nobody runs Nerve, so the code that read or upgraded what older versions wrote is gone; from 0.1.0 on, migrations come as they are needed.
+- The node's control socket refuses `status` without its token too (it answered `update` of 0.0.2).
+- `update` on Windows replaces the program and restarts the service only: it no longer registers the Event Log source or names an owner for an install made before there were any.
+- The center reads the action checker's blocklist by the built-ins' ids only, no longer the list without ids that #130 saved.
+
 ## 0.0.5
 
 ### The action checker

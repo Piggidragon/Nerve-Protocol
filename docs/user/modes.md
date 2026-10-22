@@ -119,19 +119,14 @@ link leads to now.
 with the [settings grant](settings-grant.md) cannot add or change entries of
 it, and one goes only with its folder.
 
-Not every folder is recorded. Folders added before the node kept this record
-have no entry, and neither have folders a center sets and folders you write
-into `node.toml` with `config set`. The node follows wherever their path
-leads, and the cautions about links below hold for them. To record such a
+Not every folder is recorded. Folders a center sets and folders you write into
+`node.toml` with `config set` have no entry. The node follows wherever their
+path leads, and the cautions about links below hold for them. To record such a
 folder, first check that its path is not a link now (`ls -ld <path>`,
 `dir /AL <path>`, `find <path> -type l`): `folder add` follows a link outside
 the `w` folders and stores the place it leads to, and then the old entry stays
-beside the new one (`folder rm` it). Then add the folder again with its
-rights. `nerve-node config get
-center.<name>.policy.places` lists the recorded ones. A node from before this
-record refuses a `node.toml` that has `places`: remove the key
-(`nerve-node config unset center.<name>.policy.places`) before you go back to
-it.
+beside the new one (`folder rm` it). Then add the folder again with its rights.
+`nerve-node config get center.<name>.policy.places` lists the recorded ones.
 
 On the [installed node](service.md) on Linux the CLI runs as the node's own
 user (`nerve`), which may not look into your home or resolve a folder there,

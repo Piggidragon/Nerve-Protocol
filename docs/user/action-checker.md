@@ -8,9 +8,8 @@ permissive (a machine with nothing allowed still allows nothing).
 It is set up in the web UI, on the **Action checker** page. Its settings are
 in the center's state (`state.json`), so they survive a restart and are in a
 backup; the model endpoint's token and the local model are not
-([below](#the-decision-model)). A center that had no checker settings yet, such
-as one that ran 0.0.4, starts with the blocklist on and its default entries,
-so a call an earlier center passed to the machine may now be refused.
+([below](#the-decision-model)). A new center starts with the blocklist on and
+its default entries.
 
 ## The order
 
@@ -188,12 +187,10 @@ The **Per machine** part of the page has a card for each paired machine. In it:
 
 A refusal says whether the entry or switch behind it was the one for every
 machine or this machine's own, and so does its line on the Audit page, so you
-know which one to change. A state from before these settings reads as it did:
-every entry for every machine, every machine following the center's switches.
-A machine that is no longer paired but still named in the settings is listed
-too, with **Forget its settings**. **Remove** of the local model also sets a
-machine that had the model on for itself back to *As the center*, so it does
-not refuse every call for want of a model.
+know which one to change. A machine that is no longer paired but still named in
+the settings is listed too, with **Forget its settings**. **Remove** of the
+local model also sets a machine that had the model on for itself back to *As
+the center*, so it does not refuse every call for want of a model.
 
 ## Allow rules
 

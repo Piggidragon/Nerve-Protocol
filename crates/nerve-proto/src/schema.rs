@@ -407,19 +407,116 @@ fn node<'a>(
         });
     }
     // Bounds that no value can meet are a mistake in the schema, not a
-    // refusal of every call.
-    for (lo, hi) in [
-        ("minimum", "maximum"),
-        ("minLength", "maxLength"),
-        ("minItems", "maxItems"),
-    ] {
+    // refusal of every call: neither a pair of them nor a value of enum or
+    // const outside them.
+    for (lo, hi) in [("minLength", "maxLength"), ("minItems", "maxItems")] {
         if let (Some(Value::Number(l)), Some(Value::Number(h))) = (m.get(lo), m.get(hi))
             && cmp_num(l, h) == Some(Ordering::Greater)
         {
             return Err(fail(lo, format!("{lo} is above {hi}")));
         }
     }
+    if let (Some(l), Some(h)) = num_bounds(m) {
+        let integer = types.is_some_and(|t| t.ty == Ty::Integer);
+        let empty = if integer {
+            l.first_integer() > h.last_integer()
+        } else {
+            match cmp_num(l.n, h.n) {
+                Some(Ordering::Greater) => true,
+                Some(Ordering::Equal) => l.exclusive || h.exclusive,
+                _ => false,
+            }
+        };
+        if empty {
+            let what = if integer { "integer" } else { "number" };
+            return Err(fail(
+                l.word,
+                format!("{} and {} leave no {what} between them", l.word, h.word),
+            ));
+        }
+    }
+    let values = [
+        (
+            "enum",
+            m.get("enum").and_then(Value::as_array).map(Vec::as_slice),
+        ),
+        ("const", m.get("const").map(std::slice::from_ref)),
+    ];
+    for (word, values) in values {
+        if let Some(x) = values.into_iter().flatten().find(|x| !fits(m, x)) {
+            return Err(fail(
+                word,
+                format!("{x} does not keep to the schema's other keywords"),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// A numeric bound of a schema: its keyword, its number, and whether the
+/// number itself is out (`exclusiveMinimum`, `exclusiveMaximum`).
+#[derive(Clone, Copy)]
+struct Bound<'a> {
+    word: &'static str,
+    n: &'a Number,
+    exclusive: bool,
+}
+
+impl Bound<'_> {
+    /// The least integer a lower bound lets through.
+    fn first_integer(self) -> i128 {
+        match (int(self.n), self.exclusive) {
+            (Some(i), false) => i,
+            (Some(i), true) => i + 1,
+            (None, false) => self.n.as_f64().unwrap_or(f64::NAN).ceil() as i128,
+            (None, true) => self.n.as_f64().unwrap_or(f64::NAN).floor() as i128 + 1,
+        }
+    }
+
+    /// The greatest integer an upper bound lets through.
+    fn last_integer(self) -> i128 {
+        match (int(self.n), self.exclusive) {
+            (Some(i), false) => i,
+            (Some(i), true) => i - 1,
+            (None, false) => self.n.as_f64().unwrap_or(f64::NAN).floor() as i128,
+            (None, true) => self.n.as_f64().unwrap_or(f64::NAN).ceil() as i128 - 1,
+        }
+    }
+}
+
+/// The lower and the upper numeric bound of `m` that a value has to meet:
+/// `fits` applies all four keywords, so of `minimum` and `exclusiveMinimum`
+/// the larger one counts, and the exclusive one when they are equal (the
+/// same for the upper pair).
+fn num_bounds(m: &Map<String, Value>) -> (Option<Bound<'_>>, Option<Bound<'_>>) {
+    let bound = |word: &'static str, exclusive: bool| {
+        m.get(word)
+            .and_then(Value::as_number)
+            .map(|n| Bound { word, n, exclusive })
+    };
+    fn tighter<'a>(a: Option<Bound<'a>>, b: Option<Bound<'a>>, lower: bool) -> Option<Bound<'a>> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(match cmp_num(a.n, b.n) {
+                Some(Ordering::Equal) if b.exclusive => b,
+                Some(Ordering::Less) if lower => b,
+                Some(Ordering::Greater) if !lower => b,
+                _ => a,
+            }),
+            (a, b) => a.or(b),
+        }
+    }
+    (
+        tighter(
+            bound("minimum", false),
+            bound("exclusiveMinimum", true),
+            true,
+        ),
+        tighter(
+            bound("maximum", false),
+            bound("exclusiveMaximum", true),
+            false,
+        ),
+    )
 }
 
 /// The length of `v` as compact JSON text, counted without building it. The
@@ -450,26 +547,63 @@ fn text_len(v: &Value, limit: usize) -> usize {
     n
 }
 
+/// A JSON number as an exact integer, if it is one.
+fn int(n: &Number) -> Option<i128> {
+    n.as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from))
+}
+
 /// Compares two JSON numbers, exactly when both are integers.
 fn cmp_num(a: &Number, b: &Number) -> Option<Ordering> {
-    let int = |n: &Number| {
-        n.as_i64()
-            .map(i128::from)
-            .or_else(|| n.as_u64().map(i128::from))
-    };
     match (int(a), int(b)) {
         (Some(x), Some(y)) => Some(x.cmp(&y)),
         _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
     }
 }
 
-/// `field` with `name` below it, as a dotted path.
-fn join(field: &str, name: &str) -> String {
-    if field.is_empty() {
-        name.into()
-    } else {
-        format!("{field}.{name}")
+/// One step of the path to a field: a property's name or an item's index.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Name(&'a str),
+    Index(usize),
+}
+
+/// The dotted path of `steps` (`entries[2].name`), and `name` below it.
+fn path(steps: &[Step], name: Option<&str>) -> String {
+    let mut out = String::new();
+    for step in steps.iter().copied().chain(name.map(Step::Name)) {
+        match step {
+            Step::Name(n) if out.is_empty() => out.push_str(n),
+            Step::Name(n) => {
+                out.push('.');
+                out.push_str(n);
+            }
+            Step::Index(i) => out.push_str(&format!("[{i}]")),
+        }
     }
+    out
+}
+
+/// What `validate` has left to look at.
+enum Todo<'a> {
+    /// `value` against `schema`, at the path of the first `depth` steps and
+    /// then `step`.
+    One {
+        schema: &'a Value,
+        value: &'a Value,
+        depth: usize,
+        step: Option<Step<'a>>,
+    },
+    /// The items of an array from `next` on, each against `schema`. An
+    /// array is taken one item at a time, so a long one costs no more
+    /// memory than a short one.
+    Items {
+        schema: &'a Value,
+        values: &'a [Value],
+        next: usize,
+        depth: usize,
+    },
 }
 
 /// Whether `args` fit `schema`, a schema that passed `check`. The first
@@ -477,16 +611,50 @@ fn join(field: &str, name: &str) -> String {
 /// Keywords `check` refuses are not looked at, so an unchecked schema is not
 /// a reliable guard.
 pub fn validate(schema: &Value, args: &Value) -> Result<(), ArgError> {
-    let mut stack = vec![(schema, args, String::new())];
-    while let Some((s, v, field)) = stack.pop() {
+    // The path to the value at hand; a field's path is only written out
+    // when it does not fit.
+    let mut steps: Vec<Step> = Vec::new();
+    let mut stack = vec![Todo::One {
+        schema,
+        value: args,
+        depth: 0,
+        step: None,
+    }];
+    while let Some(todo) = stack.pop() {
+        let (s, v, depth, step) = match todo {
+            Todo::One {
+                schema,
+                value,
+                depth,
+                step,
+            } => (schema, value, depth, step),
+            Todo::Items {
+                schema,
+                values,
+                next,
+                depth,
+            } => {
+                if next + 1 < values.len() {
+                    stack.push(Todo::Items {
+                        schema,
+                        values,
+                        next: next + 1,
+                        depth,
+                    });
+                }
+                (schema, &values[next], depth, Some(Step::Index(next)))
+            }
+        };
+        steps.truncate(depth);
+        steps.extend(step);
         let Some(m) = s.as_object() else { continue };
         if !fits(m, v) {
             return Err(ArgError {
-                field,
+                field: path(&steps, None),
                 expected: expected(m),
             });
         }
-        let mut next = Vec::new();
+        let depth = steps.len();
         match v {
             Value::Object(o) => {
                 let props = m.get("properties").and_then(Value::as_object);
@@ -498,15 +666,23 @@ pub fn validate(schema: &Value, args: &Value) -> Result<(), ArgError> {
                             .and_then(Value::as_object)
                             .map_or_else(|| "a value".into(), expected);
                         return Err(ArgError {
-                            field: join(&field, name),
+                            field: path(&steps, Some(name)),
                             expected: format!("{what} (required)"),
                         });
                     }
                 }
                 let closed = m.get("additionalProperties") == Some(&Value::Bool(false));
+                // At most one entry per property the schema names, so this
+                // stays small however many fields the value has.
+                let mut next = Vec::new();
                 for (k, x) in o {
                     match props.and_then(|p| p.get(k)) {
-                        Some(s) => next.push((s, x, join(&field, k))),
+                        Some(s) => next.push(Todo::One {
+                            schema: s,
+                            value: x,
+                            depth,
+                            step: Some(Step::Name(k)),
+                        }),
                         None if closed => {
                             let known: Vec<&str> = props
                                 .into_iter()
@@ -519,26 +695,29 @@ pub fn validate(schema: &Value, args: &Value) -> Result<(), ArgError> {
                                 format!("no field of this name; known: {}", known.join(", "))
                             };
                             return Err(ArgError {
-                                field: join(&field, k),
+                                field: path(&steps, Some(k)),
                                 expected,
                             });
                         }
                         None => {}
                     }
                 }
+                stack.extend(next.into_iter().rev());
             }
             Value::Array(a) => {
-                if let Some(items) = m.get("items") {
-                    next.extend(
-                        a.iter()
-                            .enumerate()
-                            .map(|(i, x)| (items, x, format!("{field}[{i}]"))),
-                    );
+                if let Some(items) = m.get("items")
+                    && !a.is_empty()
+                {
+                    stack.push(Todo::Items {
+                        schema: items,
+                        values: a,
+                        next: 0,
+                        depth,
+                    });
                 }
             }
             _ => {}
         }
-        stack.extend(next.into_iter().rev());
     }
     Ok(())
 }
@@ -608,11 +787,6 @@ fn expected(m: &Map<String, Value>) -> String {
 
 /// The bounds of `m` for a value of type `ty`, as words to follow its noun.
 fn bounds(ty: Ty, m: &Map<String, Value>) -> String {
-    let num = |word: &str| {
-        m.get(word)
-            .and_then(Value::as_number)
-            .map(Number::to_string)
-    };
     let count = |word: &str| m.get(word).and_then(Value::as_u64);
     let sized = |lo: Option<u64>, hi: Option<u64>, unit: &str| {
         let unit = |n: u64| {
@@ -632,20 +806,29 @@ fn bounds(ty: Ty, m: &Map<String, Value>) -> String {
     };
     match ty {
         Ty::Integer | Ty::Number => {
-            let (lo, hi) = (num("minimum"), num("maximum"));
-            if let (Some(l), Some(h)) = (&lo, &hi) {
-                return format!(" from {l} to {h}");
+            // The bounds a value has to meet, so the words never name a
+            // range the refused value is inside.
+            let (lo, hi) = num_bounds(m);
+            if let (Some(l), Some(h)) = (lo, hi)
+                && !l.exclusive
+                && !h.exclusive
+            {
+                return format!(" from {} to {}", l.n, h.n);
             }
             let mut parts = Vec::new();
             if let Some(l) = lo {
-                parts.push(format!("{l} or more"));
-            } else if let Some(l) = num("exclusiveMinimum") {
-                parts.push(format!("above {l}"));
+                parts.push(if l.exclusive {
+                    format!("above {}", l.n)
+                } else {
+                    format!("{} or more", l.n)
+                });
             }
             if let Some(h) = hi {
-                parts.push(format!("{h} or less"));
-            } else if let Some(h) = num("exclusiveMaximum") {
-                parts.push(format!("below {h}"));
+                parts.push(if h.exclusive {
+                    format!("below {}", h.n)
+                } else {
+                    format!("{} or less", h.n)
+                });
             }
             match parts.first() {
                 None => String::new(),
@@ -719,6 +902,15 @@ mod tests {
             json!({"type": "string", "examples": ["x"]}),
             json!({"type": "string", "x-nerve-path": "read"}),
             json!({"type": ["string", "null"], "x-nerve-path": "write"}),
+            // Bounds with something between them.
+            json!({"type": "number", "minimum": 5, "maximum": 5}),
+            json!({"type": "number", "exclusiveMinimum": 1, "exclusiveMaximum": 2}),
+            json!({"type": "integer", "exclusiveMinimum": 1, "exclusiveMaximum": 3}),
+            json!({"type": "integer", "minimum": 1.5, "maximum": 2.5}),
+            json!({"type": "integer", "minimum": 0, "exclusiveMinimum": 3, "maximum": 4}),
+            json!({"type": "integer", "minimum": 1, "enum": [1, 2]}),
+            json!({"type": ["integer", "null"], "minimum": 1, "enum": [1, null]}),
+            json!({"type": "string", "maxLength": 3, "const": "abc"}),
         ];
         for s in inner {
             assert_eq!(check(&with(s.clone()), Role::Params), Ok(()), "{s}");
@@ -857,7 +1049,52 @@ mod tests {
             (
                 "minimum",
                 json!({"type": "integer", "minimum": 3, "maximum": 2}),
-                "above maximum",
+                "minimum and maximum leave no integer",
+            ),
+            (
+                "minimum",
+                json!({"type": "number", "minimum": 3, "maximum": 2}),
+                "leave no number",
+            ),
+            (
+                "exclusiveMinimum",
+                json!({"type": "integer", "exclusiveMinimum": 5, "maximum": 5}),
+                "exclusiveMinimum and maximum leave no integer",
+            ),
+            (
+                "minimum",
+                json!({"type": "integer", "minimum": 5, "exclusiveMaximum": 5}),
+                "minimum and exclusiveMaximum leave no integer",
+            ),
+            (
+                "exclusiveMinimum",
+                json!({"type": "number", "exclusiveMinimum": 5, "exclusiveMaximum": 5}),
+                "leave no number",
+            ),
+            (
+                "exclusiveMinimum",
+                json!({"type": "number", "minimum": 5, "exclusiveMinimum": 5, "maximum": 5}),
+                "leave no number",
+            ),
+            (
+                "exclusiveMinimum",
+                json!({"type": "integer", "exclusiveMinimum": 1, "exclusiveMaximum": 2}),
+                "leave no integer",
+            ),
+            (
+                "minimum",
+                json!({"type": "integer", "minimum": 1.2, "maximum": 1.8}),
+                "leave no integer",
+            ),
+            (
+                "enum",
+                json!({"type": "integer", "minimum": 5, "enum": [5, 1]}),
+                "1 does not keep to",
+            ),
+            (
+                "const",
+                json!({"type": "string", "maxLength": 2, "const": "abc"}),
+                "does not keep to",
             ),
             (
                 "minLength",
@@ -1261,6 +1498,50 @@ mod tests {
             "exit",
             "an integer, or null",
         );
+    }
+
+    /// When both bounds of a side are given, the words name the one a value
+    /// has to meet, so they never describe a range the refused value is in.
+    #[test]
+    fn expected_names_the_bounds_that_apply() {
+        for (s, value, want) in [
+            (
+                json!({"type": "integer", "minimum": 0, "exclusiveMinimum": 3}),
+                2,
+                "an integer above 3",
+            ),
+            (
+                json!({"type": "integer", "minimum": 0, "maximum": 10, "exclusiveMaximum": 5}),
+                7,
+                "an integer of 0 or more and below 5",
+            ),
+            (
+                json!({"type": "integer", "minimum": 3, "exclusiveMinimum": 3, "maximum": 9}),
+                3,
+                "an integer above 3 and 9 or less",
+            ),
+            (
+                json!({"type": "integer", "minimum": 4, "exclusiveMinimum": 3, "maximum": 9}),
+                3,
+                "an integer from 4 to 9",
+            ),
+            (
+                json!({"type": "number", "maximum": 2, "exclusiveMaximum": 9}),
+                3,
+                "a number of 2 or less",
+            ),
+        ] {
+            let s = with(s);
+            assert_eq!(check(&s, Role::Params), Ok(()), "{s}");
+            assert_eq!(
+                validate(&s, &json!({"a": value})),
+                Err(ArgError {
+                    field: "a".into(),
+                    expected: want.into()
+                }),
+                "{s}"
+            );
+        }
     }
 
     #[test]

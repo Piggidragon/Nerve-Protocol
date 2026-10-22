@@ -348,15 +348,16 @@ fn same_program(running: &Path, allowed: &Path) -> Result<bool, String> {
 
 /// Why an action's schemas are outside the subset a center checks, if they
 /// are. A missing `params` takes any arguments, a missing `result` says
-/// nothing of the result.
+/// nothing of the result. The reason is brief: `status`, the hello answer
+/// and the log repeat it, and it holds the provider's own names.
 fn outside_subset(params: &Value, result: &Value) -> Option<String> {
     if let Err(e) = schema::check(params, Role::Params) {
-        return Some(format!("params: {e}"));
+        return Some(schema::brief(&format!("params: {e}")));
     }
     if !result.is_null()
         && let Err(e) = schema::check(result, Role::Result)
     {
-        return Some(format!("result: {e}"));
+        return Some(schema::brief(&format!("result: {e}")));
     }
     None
 }
@@ -634,6 +635,36 @@ mod tests {
             e.contains("no action") && e.contains("fan.spin: params"),
             "{e}"
         );
+    }
+
+    /// The reason names the provider's own property names, so `status`
+    /// shows it as one line of its own, cut.
+    #[test]
+    fn the_reason_for_leaving_out_an_action_is_one_short_line() {
+        let long = "/".repeat(4000);
+        let frag = json!([{"id": "lamp", "actions": {
+            "on": {"effect": "write"},
+            "dim": {"effect": "write", "params": {"type": "object", "properties": {
+                "x\nprovider other attached: fake\u{1b}[2J": {"type": "string", "pattern": "a"}}}},
+            "get": {"effect": "read", "result": {"type": "object", long: 1}}}}]);
+        let (_, broken) = capabilities("desk", fragment(frag), &BTreeSet::new()).unwrap();
+        let names: Vec<&str> = broken.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["lamp.dim", "lamp.get"]);
+        for b in &broken {
+            assert!(!b.reason.chars().any(char::is_control), "{b:?}");
+            assert!(
+                b.reason.chars().count() <= schema::BRIEF_MAX + 1,
+                "{}",
+                b.reason.len()
+            );
+        }
+        assert!(
+            broken[0]
+                .reason
+                .starts_with("params: /properties/x provider other attached: fake [2J/pattern"),
+            "{broken:?}"
+        );
+        assert!(broken[1].reason.ends_with('…'), "{broken:?}");
     }
 
     #[test]

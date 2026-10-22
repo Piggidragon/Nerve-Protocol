@@ -35,6 +35,8 @@ pub const MAX_TEXT_BYTES: usize = 16 * 1024;
 /// them in turn, so this bounds the work per argument; a longer choice is
 /// more than a model can read anyway.
 pub const MAX_ENUM_VALUES: usize = 256;
+/// The most characters of a reason [`brief`] keeps.
+pub const BRIEF_MAX: usize = 300;
 
 /// What a schema describes, which sets how deep it may nest and what its
 /// root must be.
@@ -75,6 +77,21 @@ impl fmt::Display for SchemaError {
 }
 
 impl std::error::Error for SchemaError {}
+
+/// A reason for leaving out a schema as a node or a center repeats it (a
+/// status line, an answer, the Overview): one line, cut to [`BRIEF_MAX`]
+/// characters. The pointer and the reason hold property names and keywords
+/// of the schema as they are, and those are the publisher's choice.
+pub fn brief(text: &str) -> String {
+    let one: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    match one.char_indices().nth(BRIEF_MAX) {
+        Some((end, _)) => format!("{}…", &one[..end]),
+        None => one,
+    }
+}
 
 /// Which argument does not fit and what was expected there. `field` is a
 /// dotted path (`sudo.sealed`, `items[2]`), empty for the arguments as a
@@ -446,17 +463,18 @@ fn node<'a>(
             ));
         }
     }
-    // An enum's own values are in it, so they are held to the type, the
-    // bounds and the const without looking each one up in the enum again.
-    let holds = |x: &Value| keeps(m, x) && m.get("const").is_none_or(|c| same(c, x));
     let off = |word: &str, x: &Value| {
         fail(
             word,
             format!("{x} does not keep to the schema's other keywords"),
         )
     };
+    // An enum's own values are in it, so they are held to the type and the
+    // bounds without looking each one up in the enum again. Next to a const
+    // they need not equal it, as in JSON Schema; the const must be one of
+    // them, which the check of the const below asks.
     if let Some(Value::Array(e)) = m.get("enum")
-        && let Some(x) = e.iter().find(|x| !holds(x))
+        && let Some(x) = e.iter().find(|x| !keeps(m, x))
     {
         return Err(off("enum", x));
     }
@@ -981,6 +999,9 @@ mod tests {
             json!({"type": "integer", "minimum": 1, "enum": [1, 2]}),
             json!({"type": ["integer", "null"], "minimum": 1, "enum": [1, null]}),
             json!({"type": "string", "maxLength": 3, "const": "abc"}),
+            // Next to a const, the other enum values need not equal it.
+            json!({"type": "integer", "enum": [1, 2], "const": 1}),
+            json!({"enum": ["x", "y"], "const": "x"}),
         ];
         for s in inner {
             assert_eq!(check(&with(s.clone()), Role::Params), Ok(()), "{s}");
@@ -1186,6 +1207,11 @@ mod tests {
                 "const",
                 json!({"type": "string", "maxLength": 2, "const": "abc"}),
                 "does not keep to",
+            ),
+            (
+                "const",
+                json!({"type": "integer", "enum": [1, 2], "const": 3}),
+                "3 does not keep to",
             ),
             (
                 "minLength",
@@ -1396,6 +1422,13 @@ mod tests {
             json!({"type": "number", "enum": [1.0], "const": 1}),
             json!(1),
         );
+        // With both, a value is the const and in the enum.
+        ok(
+            json!({"type": "integer", "enum": [1, 2], "const": 1}),
+            json!(1),
+        );
+        let s = with(json!({"type": "integer", "enum": [1, 2], "const": 1}));
+        assert!(validate(&s, &json!({"a": 2})).is_err());
         // Not the same value, or not the same kind of value.
         let s = with(json!({"type": "number", "enum": [0.5, 1, 2]}));
         assert!(validate(&s, &json!({"a": 1.5})).is_err());
@@ -1768,6 +1801,31 @@ mod tests {
             reason: "the schema is over 16 KiB".into(),
         };
         assert_eq!(e.to_string(), "the schema is over 16 KiB");
+    }
+
+    /// A reason holds the schema's own names, so the short form a node or a
+    /// center repeats is one line and cut.
+    #[test]
+    fn a_brief_reason_is_one_short_line() {
+        let name = "x\nLOCKED (panic): fake\u{1b}[2J";
+        let s = json!({"type": "object", "properties": {name: {"type": "string", "pattern": "a"}}});
+        let e = check(&s, Role::Params).unwrap_err().to_string();
+        assert!(e.contains('\n'), "{e}");
+        let b = brief(&e);
+        assert!(!b.chars().any(char::is_control), "{b}");
+        assert!(
+            b.starts_with("/properties/x LOCKED (panic): fake [2J/pattern: "),
+            "{b}"
+        );
+
+        let long = "/".repeat(4000);
+        let s = json!({"type": "object", "properties": {"a": {"type": "string", long: 1}}});
+        let e = check(&s, Role::Params).unwrap_err().to_string();
+        assert!(e.chars().count() > 8000, "{}", e.len());
+        let b = brief(&e);
+        assert_eq!(b.chars().count(), BRIEF_MAX + 1);
+        assert!(b.ends_with('…'), "{b}");
+        assert_eq!(brief("short"), "short");
     }
 
     #[test]

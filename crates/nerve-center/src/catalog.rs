@@ -138,12 +138,14 @@ fn bad_name(cap: &str, action: &str) -> Option<String> {
     None
 }
 
-/// Why the state or an event's data of `cap` is outside the subset.
+/// Why the state or an event's data of `cap` is outside the subset. Each
+/// reason is brief, as on the node: it holds the node's own names, and the
+/// Overview and the log repeat it.
 fn cap_outside_subset(cap: &nerve_proto::Capability) -> Option<String> {
     if !cap.state.is_null()
         && let Err(e) = schema::check(&cap.state, Role::Result)
     {
-        return Some(format!("state: {e}"));
+        return Some(schema::brief(&format!("state: {e}")));
     }
     cap.events.iter().find_map(|(name, ev)| {
         if ev.data.is_null() {
@@ -151,7 +153,7 @@ fn cap_outside_subset(cap: &nerve_proto::Capability) -> Option<String> {
         }
         schema::check(&ev.data, Role::Result)
             .err()
-            .map(|e| format!("event {name}: {e}"))
+            .map(|e| schema::brief(&format!("event {name}: {e}")))
     })
 }
 
@@ -159,12 +161,12 @@ fn cap_outside_subset(cap: &nerve_proto::Capability) -> Option<String> {
 /// arguments with, in the words the node uses for its providers.
 fn outside_subset(params: &Value, result: &Value) -> Option<String> {
     if let Err(e) = schema::check(params, Role::Params) {
-        return Some(format!("params: {e}"));
+        return Some(schema::brief(&format!("params: {e}")));
     }
     if !result.is_null()
         && let Err(e) = schema::check(result, Role::Result)
     {
-        return Some(format!("result: {e}"));
+        return Some(schema::brief(&format!("result: {e}")));
     }
     None
 }
@@ -396,6 +398,61 @@ mod tests {
             reason("door.open")
         );
         assert_eq!(reason("bell"), reason("door.open"));
+    }
+
+    /// A reason holds the node's own names, so it is kept to one short line
+    /// for the Overview and the log.
+    #[test]
+    fn a_reason_is_one_short_line() {
+        let long = "/".repeat(4000);
+        let mut lamp = cap(
+            "lamp",
+            "",
+            &[(
+                "dim",
+                Effect::Actuate,
+                json!({"type": "object", "properties": {
+                    "x\nfake\u{1b}[2J": {"type": "string", "pattern": "a"}}}),
+            )],
+        );
+        lamp.actions.insert(
+            "get".into(),
+            nerve_proto::descriptor::Action {
+                effect: Effect::Read,
+                summary: String::new(),
+                params: Value::Null,
+                result: json!({"type": "object", long.clone(): 1}),
+            },
+        );
+        let mut door = cap("door", "", &[("open", Effect::Actuate, path())]);
+        door.state = json!({"type": "object", long.clone(): 1});
+        let mut bell = cap("bell", "", &[]);
+        bell.events.insert(
+            "rang".into(),
+            nerve_proto::descriptor::EventDecl {
+                summary: "It rang.".into(),
+                implicit: false,
+                data: json!({"type": "object", long: 1}),
+            },
+        );
+        let c = Catalog::build(&desc("box", vec![lamp, door, bell]));
+        assert_eq!(names(&c).1, ["bell", "door.open", "lamp.dim", "lamp.get"]);
+        for b in &c.broken {
+            assert!(!b.reason.chars().any(char::is_control), "{b:?}");
+            assert!(
+                b.reason.chars().count() <= schema::BRIEF_MAX + 1,
+                "{}: {}",
+                b.name,
+                b.reason.len()
+            );
+        }
+        assert!(
+            c.broken[2]
+                .reason
+                .starts_with("params: /properties/x fake [2J/pattern"),
+            "{:?}",
+            c.broken
+        );
     }
 
     /// The tools are built by asking for every unit of every node under the

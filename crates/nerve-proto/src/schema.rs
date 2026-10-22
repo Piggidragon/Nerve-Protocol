@@ -1111,6 +1111,11 @@ mod tests {
                 "leave no integer",
             ),
             (
+                "minimum",
+                json!({"type": "integer", "minimum": -1e21, "maximum": -1e20}),
+                "leave no integer",
+            ),
+            (
                 "enum",
                 json!({"type": "integer", "minimum": 5, "enum": [5, 1]}),
                 "1 does not keep to",
